@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Nexus OS Virtual File Manager — Ultimate Master Edition
-Zero-Lag Caching, Async Importing, Deep Smart Views, and Live Console.
+Nexus OS Virtual File Manager — Master Professional Edition
+Timeline Diary, Deep Smart Views, Zero-Lag Async Engine, and Custom Tags.
 """
 from __future__ import annotations
 import hashlib, os, shutil, sqlite3, sys, zipfile, time, csv
@@ -12,11 +12,11 @@ from collections import defaultdict
 
 from PySide6.QtCore import (
     Qt, QThread, Signal, QModelIndex, QAbstractTableModel, 
-    QFileInfo, QUrl, QSize, QMimeData, QPropertyAnimation, QEasingCurve, QTimer
+    QFileInfo, QUrl, QSize, QMimeData, QPropertyAnimation, QEasingCurve, QTimer, QDate
 )
 from PySide6.QtGui import (
     QFont, QPixmap, QImage, QAction, QPainter, QIcon, QDragEnterEvent, QDropEvent, 
-    QColor, QBrush, QKeySequence, QShortcut, QDrag, QKeyEvent, QTextCursor
+    QColor, QBrush, QKeySequence, QShortcut, QDrag, QKeyEvent, QTextCursor, QTextCharFormat
 )
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QToolBar, QFileDialog, QMessageBox,
@@ -26,7 +26,8 @@ from PySide6.QtWidgets import (
     QStatusBar, QSizePolicy, QFormLayout, QDockWidget, QToolButton,
     QStackedWidget, QListWidget, QListWidgetItem, QListView, QTabWidget, 
     QSlider, QStyle, QGraphicsOpacityEffect, QScrollArea, QDialog,
-    QGraphicsView, QGraphicsScene, QTextBrowser, QTableWidget, QTableWidgetItem, QCheckBox
+    QGraphicsView, QGraphicsScene, QTextBrowser, QTableWidget, QTableWidgetItem, QCheckBox,
+    QCalendarWidget
 )
 
 try:
@@ -75,7 +76,6 @@ def get_category_for_ext(ext):
         if ext in exts: return cat
     return "Others"
 
-# Dynamic Map for Hierarchical Smart Views
 SMART_PROTOCOLS = {
     "tags://": ["custom_tags"],
     "y_c_m_e://": ["year", "category", "month", "extension"],
@@ -106,6 +106,12 @@ QProgressBar::chunk { background-color: #2ea043; border-radius: 5px; }
 QTableView::indicator, QTreeWidget::indicator, QTableWidget::indicator { width: 16px; height: 16px; }
 QTableView::indicator:unchecked, QTableWidget::indicator:unchecked { background-color: #0d1117; border: 2px solid #58a6ff; border-radius: 3px; }
 QTableView::indicator:checked, QTableWidget::indicator:checked { background-color: #2ea043; border: 2px solid #2ea043; border-radius: 3px; }
+QCalendarWidget QWidget { alternate-background-color: #161b22; }
+QCalendarWidget QAbstractItemView:enabled { color: #c9d1d9; background-color: #0d1117; selection-background-color: #58a6ff; selection-color: white; border: none; }
+QCalendarWidget QToolButton { color: #c9d1d9; background-color: #21262d; border-radius: 4px; padding: 5px; }
+QCalendarWidget QToolButton:hover { background-color: #30363d; }
+QCalendarWidget QMenu { background-color: #161b22; color: #c9d1d9; }
+QCalendarWidget QSpinBox { background-color: #0d1117; color: #c9d1d9; }
 """
 
 def ensure_dirs(): 
@@ -220,6 +226,102 @@ class NexusDB:
     def close(self):
         try: self.conn.close()
         except Exception: pass
+
+# ---------------- Full Screen Timeline Diary Engine ----------------
+class TimelineDiaryDialog(QDialog):
+    def __init__(self, db_path, parent=None):
+        super().__init__(parent)
+        self.db_path = db_path
+        self.setWindowTitle("Nexus Timeline Diary")
+        self.setStyleSheet(FUTURISTIC_THEME)
+        self.showMaximized()
+        
+        layout = QHBoxLayout(self)
+        
+        # Left Side: Custom Calendar
+        cal_layout = QVBoxLayout()
+        self.calendar = QCalendarWidget()
+        self.calendar.setGridVisible(True)
+        self.calendar.setVerticalHeaderFormat(QCalendarWidget.NoVerticalHeader)
+        self.calendar.currentPageChanged.connect(self.highlight_days)
+        self.calendar.clicked.connect(self.load_diary)
+        
+        # Style Calendar slightly larger
+        font = self.calendar.font()
+        font.setPointSize(12)
+        self.calendar.setFont(font)
+        
+        cal_layout.addWidget(self.calendar)
+        layout.addLayout(cal_layout, 1)
+        
+        # Right Side: Feed/Diary
+        self.diary_browser = QTextBrowser()
+        layout.addWidget(self.diary_browser, 2)
+        
+        # Initialize
+        today = QDate.currentDate()
+        self.highlight_days(today.year(), today.month())
+        self.calendar.setSelectedDate(today)
+        self.load_diary(today)
+        
+    def highlight_days(self, year, month):
+        self.calendar.setDateTextFormat(QDate(), QTextCharFormat())
+        conn = sqlite3.connect(self.db_path)
+        cur = conn.cursor()
+        cur.execute("SELECT DISTINCT SUBSTR(modified, 9, 2) FROM virtual_fs WHERE is_folder=0 AND in_trash=0 AND modified LIKE ?", (f"{year}-{month:02d}-%",))
+        days = [r[0] for r in cur.fetchall()]
+        conn.close()
+        
+        fmt = QTextCharFormat()
+        fmt.setBackground(QColor("#2ea043"))
+        fmt.setForeground(QColor("white"))
+        fmt.setFontWeight(QFont.Bold)
+        
+        for d in days:
+            try:
+                day_int = int(d)
+                self.calendar.setDateTextFormat(QDate(year, month, day_int), fmt)
+            except ValueError:
+                pass
+
+    def load_diary(self, date):
+        dt_str = date.toString("yyyy-MM-dd")
+        conn = sqlite3.connect(self.db_path)
+        cur = conn.cursor()
+        cur.execute("SELECT SUBSTR(modified, 12, 8), name, parent_path, size, category FROM virtual_fs WHERE modified LIKE ? AND is_folder=0 AND in_trash=0 ORDER BY modified ASC", (f"{dt_str}%",))
+        entries = cur.fetchall()
+        conn.close()
+        
+        html = f"<h1 style='color:#58a6ff; text-align:center;'>📖 System Timeline: {date.toString('dddd, MMMM d, yyyy')}</h1><hr>"
+        
+        if not entries:
+            html += "<h3 style='color:#8b949e; text-align:center;'><br><br>No system activity recorded on this day.</h3>"
+        else:
+            html += f"<p style='color:#c9d1d9; text-align:center;'><b>{len(entries)}</b> files were modified or logged.</p><br>"
+            html += "<ul style='list-style-type: none; padding-left: 0;'>"
+            
+            cat_colors = {
+                "Images": "#a371f7",
+                "Videos": "#f85149",
+                "Audio": "#ff7b72",
+                "Documents": "#d2a8ff",
+                "Code": "#79c0ff",
+                "Others": "#8b949e"
+            }
+            
+            for time_str, name, pp, size, cat in entries:
+                c_color = cat_colors.get(cat, "#8b949e")
+                html += f"""
+                <li style='margin-bottom: 15px; background-color: rgba(33, 38, 45, 0.6); padding: 12px; border-left: 5px solid {c_color}; border-radius: 6px;'>
+                    <span style='color: #58a6ff; font-size: 15px;'><b>🕒 {time_str}</b></span><br>
+                    <span style='font-size: 16px; color: white;'>Action registered on <b style='color: {c_color};'>{name}</b></span> 
+                    <span style='color: #8b949e; font-size: 13px;'>({human_size(size)})</span><br>
+                    <span style='color: #8b949e; font-size: 13px;'>Path: {pp}</span>
+                </li>
+                """
+            html += "</ul>"
+            
+        self.diary_browser.setHtml(html)
 
 # ---------------- Background Engine Threads ----------------
 class SpaceScannerThread(QThread):
@@ -389,8 +491,7 @@ class DataLoaderThread(QThread):
                 folder_age = {}; temp_tracker = {}
                 for pp, y, m, c in stats:
                     if pp not in temp_tracker or c > temp_tracker[pp]:
-                        temp_tracker[pp] = c
-                        folder_age[pp] = (y, m)
+                        temp_tracker[pp] = c; folder_age[pp] = (y, m)
                 cur.execute("SELECT parent_path, COUNT(id), SUM(size) FROM virtual_fs WHERE is_folder=0 AND in_trash=0 GROUP BY parent_path")
                 totals = {r[0]: (r[1], r[2]) for r in cur.fetchall()}
 
@@ -409,13 +510,11 @@ class DataLoaderThread(QThread):
                         cnt, sz = totals.get(pp, (0,0))
                         folders.append((-1, f"y_m_f://{target_year}/{target_month}/", folder_name, "", "", 0, cnt, sz))
                 elif len(parts) >= 3:
-                    folder_name = parts[2]
-                    target_year, target_month = parts[0], parts[1]
+                    folder_name = parts[2]; target_year, target_month = parts[0], parts[1]
                     matched_pp = None
                     for pp, age in folder_age.items():
                         if age == (target_year, target_month) and (pp.strip("/").split("/")[-1] if pp.strip("/") else "Root_Files") == folder_name:
-                            matched_pp = pp
-                            break
+                            matched_pp = pp; break
                     if matched_pp:
                         cur.execute(f"SELECT id, name, size, extension, real_path, modified, color_tag, secondary_name, is_hidden FROM virtual_fs WHERE parent_path=? AND is_folder=0 AND in_trash=0 {h_q}", (matched_pp,))
                         files = cur.fetchall()
@@ -431,8 +530,7 @@ class DataLoaderThread(QThread):
                     where_clauses = ["is_folder=0", "in_trash=0", f"{target_col} != ''"]
                     params = []
                     for i in range(depth):
-                        where_clauses.append(f"{cols[i]}=?")
-                        params.append(parts[i])
+                        where_clauses.append(f"{cols[i]}=?"); params.append(parts[i])
                         
                     query = f"SELECT {target_col}, COUNT(id), SUM(size) FROM virtual_fs WHERE {' AND '.join(where_clauses)} GROUP BY {target_col}"
                     cur.execute(query, tuple(params))
@@ -470,10 +568,8 @@ class DataLoaderThread(QThread):
                 
             if not self.is_cancelled:
                 self.data_ready.emit(folders, files)
-        except Exception as e: 
-            print("DB Load Error:", e)
-        finally: 
-            conn.close()
+        except Exception as e: print("DB Load Error:", e)
+        finally: conn.close()
 
 class CompilerThread(QThread):
     progress = Signal(int, int, str)
@@ -519,7 +615,9 @@ class CompilerThread(QThread):
             modified_rows = []
             for r in rows:
                 if self.is_cancelled: 
-                    src_conn.close(); tgt_conn.close(); return
+                    src_conn.close()
+                    tgt_conn.close()
+                    return
                 r_list = list(r)
                 if is_smart_view: 
                     r_list[1] = "/"
@@ -533,11 +631,15 @@ class CompilerThread(QThread):
             batch_size = 1000
             for i in range(0, total, batch_size):
                 if self.is_cancelled: 
-                    src_conn.close(); tgt_conn.close(); return
+                    src_conn.close()
+                    tgt_conn.close()
+                    return
                 tgt_cur.executemany(insert_q, modified_rows[i:i+batch_size])
                 tgt_conn.commit()
                 self.progress.emit(int(40 + (i/total)*60), 100, f"Compiled {min(i+batch_size, total)}/{total} records...")
 
+            tgt_cur.execute("CREATE INDEX idx_vfs_parent ON virtual_fs(parent_path);")
+            tgt_conn.commit()
             src_conn.close()
             tgt_conn.close()
             self.finished.emit(self.target_db)
@@ -549,9 +651,10 @@ class MaterializeThread(QThread):
     finished = Signal(str)
     error = Signal(str)
     
-    def __init__(self, items, physical_dest, parent=None):
+    def __init__(self, db_path, virtual_root, physical_dest, parent=None):
         super().__init__(parent)
-        self.items = items
+        self.db_path = db_path
+        self.virtual_root = virtual_root
         self.physical_dest = physical_dest
         self.is_cancelled = False
         
@@ -560,28 +663,34 @@ class MaterializeThread(QThread):
         
     def run(self):
         try:
-            total = len(self.items)
+            conn = sqlite3.connect(self.db_path)
+            cur = conn.cursor()
+            cur.execute("SELECT parent_path, name, real_path, is_folder FROM virtual_fs WHERE parent_path LIKE ? AND in_trash=0", (f"{self.virtual_root}%",))
+            items = cur.fetchall()
+            total = len(items)
+            
             if total == 0: 
-                self.error.emit("No files to materialize.")
+                self.error.emit("No files found to export.")
                 return
             
-            for i, item in enumerate(self.items):
-                if self.is_cancelled: return
-                typ, v_path, db_id = item[:3]
+            for i, (pp, name, real_path, is_folder) in enumerate(items):
+                if self.is_cancelled: 
+                    conn.close()
+                    return
+                    
+                rel_path = pp[len(self.virtual_root):]
+                dest_dir = os.path.join(self.physical_dest, rel_path.lstrip('/').replace('/', os.sep))
+                os.makedirs(dest_dir, exist_ok=True)
                 
-                rp = v_path if typ == "file" else ""
-                name = os.path.basename(rp) if rp else v_path.strip("/").split("/")[-1]
+                if is_folder:
+                    os.makedirs(os.path.join(dest_dir, name), exist_ok=True)
+                elif real_path and os.path.exists(real_path):
+                    dest_file = os.path.join(dest_dir, name)
+                    if not os.path.exists(dest_file):
+                        shutil.copy2(real_path, dest_file)
+                self.progress.emit(i+1, total, f"Exporting: {name}")
                 
-                if typ == "file" and rp and os.path.exists(rp):
-                    dest_file = os.path.join(self.physical_dest, name)
-                    if not os.path.exists(dest_file): 
-                        shutil.copy2(rp, dest_file)
-                elif typ == "folder":
-                    dest_dir = os.path.join(self.physical_dest, name)
-                    os.makedirs(dest_dir, exist_ok=True)
-                
-                self.progress.emit(i+1, total, f"Materializing: {name}")
-                
+            conn.close()
             self.finished.emit(self.physical_dest)
         except Exception as e: 
             self.error.emit(str(e))
@@ -678,7 +787,11 @@ class SpaceAnalyzerDialog(QDialog):
         
         self.table = QTableWidget(0, 5)
         self.table.setHorizontalHeaderLabels(["Select", "Type", "Name / Location", "Size", "ID"])
-        self.table.setColumnWidth(0, 60); self.table.setColumnWidth(1, 120); self.table.setColumnWidth(2, 450); self.table.setColumnWidth(3, 100); self.table.setColumnHidden(4, True)
+        self.table.setColumnWidth(0, 60)
+        self.table.setColumnWidth(1, 120)
+        self.table.setColumnWidth(2, 450)
+        self.table.setColumnWidth(3, 100)
+        self.table.setColumnHidden(4, True)
         self.table.verticalHeader().setVisible(False)
         layout.addWidget(self.table)
         
@@ -1269,6 +1382,9 @@ class NexusVirtualManager(QMainWindow):
         act_new_file = QAction("📄 File", self)
         act_new_file.triggered.connect(self.create_virtual_file)
         
+        act_timeline = QAction("📅 Timeline Diary", self)
+        act_timeline.triggered.connect(lambda: TimelineDiaryDialog(self.active_db_path, self).exec())
+        
         act_analyzer = QAction("🧹 Space Analyzer", self)
         act_analyzer.triggered.connect(lambda: SpaceAnalyzerDialog(self.active_db_path, self).exec())
         
@@ -1294,7 +1410,7 @@ class NexusVirtualManager(QMainWindow):
         tb.addSeparator()
         tb.addActions([act_new_folder, act_new_file])
         tb.addSeparator()
-        tb.addActions([act_analyzer, act_bulk_del, act_load_ext])
+        tb.addActions([act_timeline, act_analyzer, act_bulk_del, act_load_ext])
         tb.addSeparator()
         tb.addActions([self.act_view_mode, self.act_toggle_sidebar, act_toggle_log, act_help])
         
