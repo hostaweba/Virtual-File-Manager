@@ -763,26 +763,25 @@ class InternalTreeWidget(QTreeWidget):
             event.acceptProposedAction()
 
 # ---------------- Dialogs ----------------
-
 import csv, os, sqlite3, subprocess, sys
 from collections import defaultdict
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QMessageBox, 
-    QLineEdit, QFileDialog, QListWidget, QListWidgetItem, QSplitter, QWidget, QMenu, QInputDialog, QComboBox
+    QLineEdit, QFileDialog, QListWidget, QListWidgetItem, QSplitter, QWidget, QMenu, QInputDialog, QComboBox, QScrollArea
 )
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 
 class HierarchyConfigDialog(QDialog):
     def __init__(self, current_levels, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Configure Hierarchy Depth")
+        self.setWindowTitle("Configure Hierarchy Names")
         self.resize(500, 150)
         layout = QVBoxLayout(self)
-        layout.addWidget(QLabel("<b>Define column names (Comma separated):</b>"))
-        layout.addWidget(QLabel("<small><i>Add as many levels as you need (e.g. Publisher, Topic, Chapter, Item)</i></small>"))
+        layout.addWidget(QLabel("<b>Define preferred column names (Comma separated):</b>"))
+        layout.addWidget(QLabel("<small><i>Columns are spawned infinitely. These names apply to the first few levels.</i></small>"))
         self.txt_levels = QLineEdit(", ".join(current_levels))
         layout.addWidget(self.txt_levels)
-        btn_save = QPushButton("Save Configuration")
+        btn_save = QPushButton("Save Names")
         btn_save.clicked.connect(self.accept)
         layout.addWidget(btn_save)
         
@@ -796,11 +795,11 @@ class NexusTagLibraryDialog(QDialog):
         self.main_app = parent
         self.tag_cache = {}  
         
-        self.hierarchy_levels = ["Publisher", "Topic", "Chapter"]
-        self.base_v_path = "/" 
+        self.hierarchy_levels = ["Publisher", "Topic", "Chapter", "Section"]
+        self.base_v_path = "/"  # CHANGED: Start at the Root, don't force a blank folder!
         
-        self.setWindowTitle("Nexus OS - Universal Tag Engine")
-        self.resize(1100, 650)
+        self.setWindowTitle("Nexus OS - Auto-Expanding Universal Tag Engine")
+        self.resize(1200, 700)
         
         if self.main_app and hasattr(self.main_app, 'theme_combo'):
             self.setStyleSheet(THEMES.get(self.main_app.theme_combo.currentText(), THEMES["Dark Nexus"]))
@@ -809,10 +808,36 @@ class NexusTagLibraryDialog(QDialog):
         self.main_layout = QVBoxLayout(self)
         self.main_layout.addLayout(self.top_toolbar)
         
-        self.splitter = QSplitter(Qt.Horizontal)
-        self.main_layout.addWidget(self.splitter, stretch=1)
+        self.main_splitter = QSplitter(Qt.Horizontal)
+        self.column_scroll_area = QScrollArea()
+        self.column_scroll_area.setWidgetResizable(True)
+        self.column_scroll_area.setFrameShape(QScrollArea.NoFrame)
+        self.column_scroll_widget = QWidget()
+        self.column_container_layout = QHBoxLayout(self.column_scroll_widget)
+        self.column_container_layout.setAlignment(Qt.AlignLeft)
+        self.column_scroll_area.setWidget(self.column_scroll_widget)
         
-        self._rebuild_dynamic_ui()
+        self.tag_search_box = QLineEdit(); self.tag_search_box.setPlaceholderText("Search tags...")
+        self.tag_list = QListWidget()
+        self.tag_list.itemClicked.connect(self.on_tag_clicked)
+        self.tag_list.itemDoubleClicked.connect(lambda item: self.main_app.nav_to_path(f"tags://{item.text()}/") if self.main_app else None)
+        self.tag_search_box.textChanged.connect(lambda text: self._filter_list(self.tag_list, text))
+        
+        tag_widget = QWidget()
+        tag_layout = QVBoxLayout(tag_widget)
+        tag_layout.setContentsMargins(0, 0, 0, 0)
+        tag_layout.addWidget(QLabel("<b>🏷️ Tags</b>"))
+        tag_layout.addWidget(self.tag_search_box)
+        tag_layout.addWidget(self.tag_list)
+        
+        self.main_splitter.addWidget(self.column_scroll_area)
+        self.main_splitter.addWidget(tag_widget)
+        self.main_splitter.setStretchFactor(0, 4) 
+        self.main_splitter.setStretchFactor(1, 1)
+        self.main_layout.addWidget(self.main_splitter, stretch=1)
+        
+        self.dynamic_lists = [] 
+        
         self._populate_base_contexts()
         self.refresh_memory_cache()
 
@@ -831,11 +856,11 @@ class NexusTagLibraryDialog(QDialog):
         self.top_toolbar.addWidget(self.btn_map_global)
         
         self.top_toolbar.addSpacing(15)
-        self.global_search_box = QLineEdit(); self.global_search_box.setPlaceholderText("🔍 Global search...")
+        self.global_search_box = QLineEdit(); self.global_search_box.setPlaceholderText("🔍 Filter visible columns...")
         self.global_search_box.textChanged.connect(self.run_global_search)
         self.top_toolbar.addWidget(self.global_search_box, stretch=1)
         
-        self.btn_config = QPushButton("⚙️ Columns")
+        self.btn_config = QPushButton("⚙️ Custom Names")
         self.btn_config.clicked.connect(self.configure_hierarchy)
         self.btn_import = QPushButton("📥 Import")
         self.btn_import.clicked.connect(self.import_csv)
@@ -846,60 +871,68 @@ class NexusTagLibraryDialog(QDialog):
         self.top_toolbar.addWidget(self.btn_import)
         self.top_toolbar.addWidget(self.btn_export)
 
-    def _rebuild_dynamic_ui(self):
-        while self.splitter.count():
-            widget = self.splitter.widget(0)
-            widget.setParent(None)
-            widget.deleteLater()
-
-        self.dynamic_lists = []
-        for i, level_name in enumerate(self.hierarchy_levels):
-            search_box = QLineEdit(); search_box.setPlaceholderText(f"Search {level_name}...")
-            lst = QListWidget()
-            lst.setContextMenuPolicy(Qt.CustomContextMenu)
-            lst.customContextMenuRequested.connect(lambda pos, l=lst: self.show_context_menu(l, pos))
-            lst.itemClicked.connect(lambda item, idx=i: self.on_level_clicked(idx, item))
-            lst.itemDoubleClicked.connect(lambda item: self.jump_to_virtual_or_real_path(item, force_real=False))
-            search_box.textChanged.connect(lambda text, l=lst: self._filter_list(l, text))
-            
-            self.dynamic_lists.append(lst)
-            self.splitter.addWidget(self._create_section(f"{i+1}. {level_name}", search_box, lst))
-
-        self.tag_search_box = QLineEdit(); self.tag_search_box.setPlaceholderText("Search tags...")
-        self.tag_list = QListWidget()
-        self.tag_list.itemClicked.connect(self.on_tag_clicked)
-        self.tag_list.itemDoubleClicked.connect(lambda item: self.main_app.nav_to_path(f"tags://{item.text()}/") if self.main_app else None)
-        self.tag_search_box.textChanged.connect(lambda text: self._filter_list(self.tag_list, text))
-        self.splitter.addWidget(self._create_section("🏷️ Tags", self.tag_search_box, self.tag_list))
-
-    def _create_section(self, title, search_box, list_widget):
-        layout = QVBoxLayout()
-        layout.addWidget(QLabel(f"<b>{title}</b>"))
-        layout.addWidget(search_box)
-        layout.addWidget(list_widget)
-        widget = QWidget(); widget.setLayout(layout)
-        return widget
-
     def configure_hierarchy(self):
         dlg = HierarchyConfigDialog(self.hierarchy_levels, self)
         if dlg.exec():
             self.hierarchy_levels = dlg.get_levels()
-            self._rebuild_dynamic_ui()
             self.refresh_memory_cache()
 
+    def _add_column(self, level_index, title):
+        """Dynamically spawns a new column interface."""
+        search_box = QLineEdit()
+        search_box.setPlaceholderText(f"Search {title}...")
+        
+        lst = QListWidget()
+        lst.setContextMenuPolicy(Qt.CustomContextMenu)
+        lst.customContextMenuRequested.connect(lambda pos, l=lst: self.show_context_menu(l, pos))
+        lst.itemClicked.connect(lambda item, idx=level_index: self.on_level_clicked(idx, item))
+        lst.itemDoubleClicked.connect(lambda item: self.jump_to_virtual_or_real_path(item, force_real=False))
+        search_box.textChanged.connect(lambda text, l=lst: self._filter_list(l, text))
+
+        layout = QVBoxLayout()
+        layout.setContentsMargins(0, 0, 5, 0)
+        layout.addWidget(QLabel(f"<b>{title}</b>"))
+        layout.addWidget(search_box)
+        layout.addWidget(lst)
+
+        widget = QWidget()
+        widget.setLayout(layout)
+        widget.setMinimumWidth(220) # Prevents columns from becoming unreadably thin
+        widget.setMaximumWidth(300)
+
+        self.column_container_layout.addWidget(widget)
+
+        self.dynamic_lists.append({
+            'widget': widget,
+            'list': lst,
+            'search': search_box
+        })
+
     # --- UNIVERSAL Data Engine ---
+
     def _populate_base_contexts(self):
         self.combo_base.blockSignals(True)
         self.combo_base.clear()
-        self.combo_base.addItem("/")
-        self.combo_base.addItem("/CSV_Library/")
+        self.combo_base.addItem("/") # Always provide the root
+        
+        existing_bases = set(["/"])
+        
         try:
             with sqlite3.connect(self.db_path) as conn:
                 cur = conn.cursor()
-                cur.execute("SELECT parent_path, name FROM virtual_fs WHERE is_folder=1 AND parent_path='/'")
-                for pp, name in cur.fetchall():
-                    self.combo_base.addItem(f"{pp}{name}/".replace("//", "/"))
+                # Dynamically fetch ALL top-level folders. No hardcoding!
+                cur.execute("SELECT name FROM virtual_fs WHERE is_folder=1 AND parent_path='/'")
+                for (name,) in cur.fetchall():
+                    path = f"/{name}/"
+                    if path not in existing_bases:
+                        self.combo_base.addItem(path)
+                        existing_bases.add(path)
         except Exception: pass
+        
+        # Ensure current view is selected, or add it if missing to prevent blank UI
+        if self.base_v_path not in existing_bases:
+            self.combo_base.addItem(self.base_v_path)
+            
         self.combo_base.setCurrentText(self.base_v_path)
         self.combo_base.blockSignals(False)
 
@@ -914,77 +947,117 @@ class NexusTagLibraryDialog(QDialog):
         try:
             with sqlite3.connect(self.db_path, timeout=10) as conn:
                 cur = conn.cursor()
-                # UNIVERSAL FIX: Removed 'is_folder=1'. Now loads BOTH tagged files and folders!
                 cur.execute("SELECT parent_path, name, custom_tags, is_folder FROM virtual_fs WHERE parent_path LIKE ?", (f"{self.base_v_path}%",))
                 for pp, name, tags, is_folder in cur.fetchall():
-                    # Smart Pathing: Folders get trailing slashes, Files do not.
                     full_path = f"{pp}{name}/" if is_folder else f"{pp}{name}"
                     full_path = full_path.replace("//", "/")
                     tag_list = [t.strip() for t in str(tags).split(',')] if tags else []
-                    
-                    # We store it if it has tags OR if it's a folder (to preserve navigation structure)
                     if tag_list or is_folder:
                         self.tag_cache[full_path] = tag_list
         except Exception as e: print(f"DB Load Error: {e}")
         
-        for lst in self.dynamic_lists: lst.clear()
+        # Reset UI to just Column 0
+        while self.dynamic_lists:
+            col_data = self.dynamic_lists.pop()
+            col_data['widget'].setParent(None)
+            col_data['widget'].deleteLater()
+            
+        title = self.hierarchy_levels[0] if len(self.hierarchy_levels) > 0 else "Level 1"
+        self._add_column(0, title)
         self._populate_level(0, self.base_v_path)
         self._populate_all_tags()
 
-    def _populate_level(self, level_index, prefix_path):
-        if level_index >= len(self.dynamic_lists): return
+    def _get_children(self, prefix_path):
+        """Helper to find all immediate children of a given prefix path."""
         items = set()
         for path in self.tag_cache.keys():
             if path.startswith(prefix_path) and path != prefix_path:
                 remainder = path[len(prefix_path):].strip('/')
                 if remainder: items.add(remainder.split('/')[0])
+        return items
+
+    def _populate_level(self, level_index, prefix_path):
+        if level_index >= len(self.dynamic_lists): return
+        items = self._get_children(prefix_path)
                     
-        lst = self.dynamic_lists[level_index]
+        lst = self.dynamic_lists[level_index]['list']
         lst.clear()
         for name in sorted(list(items)):
             item = QListWidgetItem(name)
             
-            # Universal Identification: Check if this name represents a folder path or a file path
             test_folder = f"{prefix_path}{name}/"
             test_file = f"{prefix_path}{name}"
             
             if test_folder in self.tag_cache or any(p.startswith(test_folder) for p in self.tag_cache.keys()):
                 item.setData(Qt.UserRole, test_folder)
             else:
-                item.setData(Qt.UserRole, test_file) # It's an end-of-line file
+                item.setData(Qt.UserRole, test_file) 
+                item.setIcon(self.style().standardIcon(self.style().SP_FileIcon)) # Visual hint for files
                 
             lst.addItem(item)
 
     def _populate_all_tags(self):
         all_tags = set(tag for tags in self.tag_cache.values() for tag in tags if tag)
         self.tag_list.clear()
-        for t in sorted(list(all_tags)):
-            self.tag_list.addItem(QListWidgetItem(t))
+        for t in sorted(list(all_tags)): self.tag_list.addItem(QListWidgetItem(t))
 
     def on_level_clicked(self, level_index, item):
         v_path = item.data(Qt.UserRole)
-        for i in range(level_index + 1, len(self.dynamic_lists)): self.dynamic_lists[i].clear()
         
-        # Only populate next level if it's a folder (ends with /)
-        if v_path.endswith('/'):
-            self._populate_level(level_index + 1, v_path)
+        # 1. Destroy any columns deeper than the current click
+        while len(self.dynamic_lists) > level_index + 1:
+            col_data = self.dynamic_lists.pop()
+            col_data['widget'].setParent(None)
+            col_data['widget'].deleteLater()
             
-        for lst in self.dynamic_lists:
+        # 2. If it's a folder and has children, spawn the NEXT column
+        if v_path.endswith('/'):
+            children = self._get_children(v_path)
+            if children:
+                next_level = level_index + 1
+                title = self.hierarchy_levels[next_level] if next_level < len(self.hierarchy_levels) else f"Level {next_level + 1}"
+                self._add_column(next_level, title)
+                self._populate_level(next_level, v_path)
+                
+                # Smooth auto-scroll to the newly spawned column
+                QTimer.singleShot(50, lambda: self.column_scroll_area.horizontalScrollBar().setValue(self.column_scroll_area.horizontalScrollBar().maximum()))
+                
+        # 3. Reset any active search filters in visible columns
+        for col in self.dynamic_lists:
+            lst = col['list']
             for row in range(lst.count()): lst.item(row).setHidden(False)
 
     def on_tag_clicked(self, item):
+        """Reverse Filtering: Expands columns to show exact paths to this tag."""
         target_tag = item.text()
         valid_paths = [p for p, tags in self.tag_cache.items() if target_tag in tags]
         base_depth = len([p for p in self.base_v_path.split('/') if p])
         
-        for i, lst in enumerate(self.dynamic_lists):
+        # Determine maximum depth required to show the deepest tagged item
+        max_depth = 0
+        for vp in valid_paths:
+            parts = [p for p in vp.split('/') if p]
+            depth = len(parts) - base_depth
+            if depth > max_depth: max_depth = depth
+            
+        # Add columns up to max_depth
+        while len(self.dynamic_lists) > max_depth:
+            col = self.dynamic_lists.pop()
+            col['widget'].deleteLater()
+            
+        for i in range(len(self.dynamic_lists), max_depth):
+            title = self.hierarchy_levels[i] if i < len(self.hierarchy_levels) else f"Level {i + 1}"
+            self._add_column(i, title)
+            
+        # Populate each column with valid filtered nodes
+        for i in range(max_depth):
+            lst = self.dynamic_lists[i]['list']
             lst.clear()
             level_nodes = {}
             for vp in valid_paths:
                 parts = [p for p in vp.split('/') if p]
                 if len(parts) > base_depth + i:
                     name = parts[base_depth + i]
-                    # Restore proper trailing slash if it's not the final leaf
                     is_folder = (len(parts) > base_depth + i + 1) or vp.endswith('/')
                     node_v_path = "/" + "/".join(parts[:base_depth + i + 1]) + ("/" if is_folder else "")
                     level_nodes[name] = node_v_path
@@ -1001,7 +1074,8 @@ class NexusTagLibraryDialog(QDialog):
     def run_global_search(self, text):
         query = text.lower()
         if not query: return self.refresh_memory_cache()
-        for lst in self.dynamic_lists + [self.tag_list]:
+        for col in self.dynamic_lists:
+            lst = col['list']
             for i in range(lst.count()):
                 item = lst.item(i)
                 item.setHidden(query not in item.text().lower())
@@ -1036,7 +1110,6 @@ class NexusTagLibraryDialog(QDialog):
         menu = QMenu(self)
         action_edit = menu.addAction("🏷️ Edit Tags")
         
-        # Only allow mapping physical directories to FOLDERS, not files
         if item.data(Qt.UserRole).endswith('/'):
             menu.addSeparator()
             action_link = menu.addAction("🔗 Map THIS Folder to Physical OS")
@@ -1078,19 +1151,15 @@ class NexusTagLibraryDialog(QDialog):
         name = parts[-1]
         parent_path = "/" + "/".join(parts[:-1]) + "/" if len(parts) > 1 else "/"
         
-        # 1. Virtual Navigation (DEFAULT ACTION)
         if not force_real:
             if self.main_app:
-                if is_folder:
-                    self.main_app.nav_to_path(v_path)
+                if is_folder: self.main_app.nav_to_path(v_path)
                 else:
-                    # SMART FILE JUMP: Navigate to parent folder and type the file name in the filter!
                     self.main_app.nav_to_path(parent_path)
                     self.main_app.local_filter.setText(name)
                 self.close()
             return
             
-        # 2. Native OS Navigation (VIA RIGHT CLICK ONLY)
         real_abs_path = None
         try:
             with sqlite3.connect(self.db_path) as conn:
@@ -1142,19 +1211,27 @@ class NexusTagLibraryDialog(QDialog):
         reply = QMessageBox.question(self, "Physical Sync", "Do you want to actually generate physical folders on your hard drive for this data structure?", QMessageBox.Yes | QMessageBox.No)
         create_real = (reply == QMessageBox.Yes)
         
+        # Smart Targeting: If at Root, isolate CSVs to a dedicated folder
+        target_v_path = self.base_v_path
+        if target_v_path == "/": 
+            target_v_path = "/CSV_Library/"
+            
         base_real_dir = None
         if create_real:
             dest = QFileDialog.getExistingDirectory(self, "Select destination to securely create the Root folder")
             if not dest: return
-            base_real_dir = os.path.join(dest, self.base_v_path.strip('/')).replace('\\', '/')
+            base_real_dir = os.path.join(dest, target_v_path.strip('/')).replace('\\', '/')
             os.makedirs(base_real_dir, exist_ok=True)
 
         try:
             with sqlite3.connect(self.db_path, timeout=20) as conn:
                 cur = conn.cursor()
-                if self.base_v_path != "/":
-                    parts = [p for p in self.base_v_path.split('/') if p]
-                    cur.execute("INSERT OR IGNORE INTO virtual_fs (parent_path, name, is_folder) VALUES (?, ?, 1)", ("/" + "/".join(parts[:-1]) + "/" if len(parts)>1 else "/", parts[-1]))
+                
+                # Ensure the target folder actually exists in the DB
+                if target_v_path != "/":
+                    parts = [p for p in target_v_path.split('/') if p]
+                    cur.execute("INSERT OR IGNORE INTO virtual_fs (parent_path, name, is_folder) VALUES (?, ?, 1)", 
+                                ("/" + "/".join(parts[:-1]) + "/" if len(parts)>1 else "/", parts[-1]))
                 
                 with open(path, 'r', encoding='utf-8') as f:
                     reader = csv.reader(f)
@@ -1165,7 +1242,7 @@ class NexusTagLibraryDialog(QDialog):
                         parts = raw_path.replace('\\', '/').strip('/').split('/')
                         if not parts: continue
                         
-                        curr = self.base_v_path
+                        curr = target_v_path # Use the targeted path!
                         for i, part in enumerate(parts):
                             is_last = (i == len(parts) - 1)
                             cur.execute("SELECT id FROM virtual_fs WHERE parent_path=? AND name=? AND is_folder=1", (curr, part))
@@ -1184,16 +1261,22 @@ class NexusTagLibraryDialog(QDialog):
                             curr += part + "/"
                             
                             if create_real and base_real_dir:
-                                rel = curr[len(self.base_v_path):]
+                                rel = curr[len(target_v_path):]
                                 real_p = os.path.join(base_real_dir, rel).replace('\\', '/')
                                 os.makedirs(real_p, exist_ok=True)
                                 cur.execute("UPDATE virtual_fs SET real_path=? WHERE id=?", (real_p, db_id))
                                 if final_tags:
                                     with open(os.path.join(real_p, "tag.txt"), "w", encoding='utf-8') as f_tag: f_tag.write(final_tags)
                 conn.commit()
+            
+            # Instantly switch to the newly populated library
+            self.base_v_path = target_v_path 
+            
+            # REFRESH the ComboBox dynamically!
+            self._populate_base_contexts()
             self.refresh_memory_cache()
             if self.main_app: self.main_app.refresh_all()
-            QMessageBox.information(self, "Success", "Database updated successfully.")
+            QMessageBox.information(self, "Success", f"Database updated successfully inside {target_v_path}")
         except Exception as e: QMessageBox.critical(self, "Import Error", str(e))
 
     def export_csv(self):
