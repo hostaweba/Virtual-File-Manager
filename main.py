@@ -764,126 +764,441 @@ class InternalTreeWidget(QTreeWidget):
 
 # ---------------- Dialogs ----------------
 
-class CSVLibraryDialog(QDialog):
+import csv, os, sqlite3, subprocess, sys
+from collections import defaultdict
+from PySide6.QtWidgets import (
+    QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QMessageBox, 
+    QLineEdit, QFileDialog, QListWidget, QListWidgetItem, QSplitter, QWidget, QMenu, QInputDialog, QComboBox
+)
+from PySide6.QtCore import Qt
+
+class HierarchyConfigDialog(QDialog):
+    """Dialog to define custom column names and depth."""
+    def __init__(self, current_levels, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Configure Hierarchy Depth")
+        self.resize(500, 150)
+        layout = QVBoxLayout(self)
+        
+        layout.addWidget(QLabel("<b>Define column names (Comma separated):</b>"))
+        layout.addWidget(QLabel("<small><i>Add as many levels as you need (e.g. Publisher, Topic, Chapter, Section)</i></small>"))
+        
+        self.txt_levels = QLineEdit(", ".join(current_levels))
+        layout.addWidget(self.txt_levels)
+        
+        btn_save = QPushButton("Save Configuration")
+        btn_save.clicked.connect(self.accept)
+        layout.addWidget(btn_save)
+        
+    def get_levels(self):
+        return [l.strip() for l in self.txt_levels.text().split(',') if l.strip()]
+
+class NexusTagLibraryDialog(QDialog):
     def __init__(self, db_path, parent=None):
         super().__init__(parent)
         self.db_path = db_path
         self.main_app = parent
-        self.setWindowTitle("CSV Library & Tag Explorer")
-        self.resize(1000, 600)
-        layout = QVBoxLayout(self)
-
-        btn_import = QPushButton("📥 Import CSV Tree")
-        btn_import.clicked.connect(self.import_csv)
-        layout.addWidget(btn_import)
-
-        # Dedicated Filters
-        filter_layout = QHBoxLayout()
-        self.f_pub = QLineEdit(); self.f_pub.setPlaceholderText("Filter Publisher...")
-        self.f_top = QLineEdit(); self.f_top.setPlaceholderText("Filter Topic...")
-        self.f_chap = QLineEdit(); self.f_chap.setPlaceholderText("Filter Chapter...")
-        self.f_tag = QLineEdit(); self.f_tag.setPlaceholderText("Filter Tags...")
+        self.tag_cache = {}  
         
-        for f in [self.f_pub, self.f_top, self.f_chap, self.f_tag]:
-            f.textChanged.connect(self.apply_filters)
-            filter_layout.addWidget(f)
-        layout.addLayout(filter_layout)
-
-        # 4-Column Structured Table
-        self.table = QTableWidget(0, 5)
-        self.table.setHorizontalHeaderLabels(["Publisher", "Topic", "Chapter", "Tags", "Virtual Path"])
-        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.table.setColumnHidden(4, True) # Hide system path
-        self.table.cellDoubleClicked.connect(self.on_row_double_click)
-        layout.addWidget(self.table)
+        # --- Configurable State ---
+        self.hierarchy_levels = ["Publisher", "Topic", "Chapter"] # Fully dynamic
+        self.base_v_path = "/CSV_Library/" # Default base context
         
-        self.load_data()
+        self.setWindowTitle("Nexus OS - Master Tag Engine & Library")
+        self.resize(1100, 650)
+        
+        if self.main_app and hasattr(self.main_app, 'theme_combo'):
+            self.setStyleSheet(THEMES.get(self.main_app.theme_combo.currentText(), THEMES["Dark Nexus"]))
 
-    def import_csv(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Select CSV", "", "CSV Files (*.csv)")
-        if not path: return
+        self._build_toolbar()
+        self.main_layout = QVBoxLayout(self)
+        self.main_layout.addLayout(self.top_toolbar)
+        
+        self.splitter = QSplitter(Qt.Horizontal)
+        self.main_layout.addWidget(self.splitter, stretch=1)
+        
+        self._rebuild_dynamic_ui()
+        self._populate_base_contexts()
+        self.refresh_memory_cache()
+
+    def _build_toolbar(self):
+        self.top_toolbar = QHBoxLayout()
+        
+        self.top_toolbar.addWidget(QLabel("<b>Base View:</b>"))
+        self.combo_base = QComboBox()
+        self.combo_base.setEditable(True)
+        self.combo_base.setMinimumWidth(180)
+        self.combo_base.currentTextChanged.connect(self.change_base_context)
+        self.top_toolbar.addWidget(self.combo_base)
+        
+        self.btn_map_global = QPushButton("🔗 Map View to OS Folder")
+        self.btn_map_global.setStyleSheet("font-weight: bold; color: #58a6ff;")
+        self.btn_map_global.clicked.connect(self.map_global_base_to_os)
+        self.top_toolbar.addWidget(self.btn_map_global)
+        
+        self.top_toolbar.addSpacing(15)
+        
+        self.global_search_box = QLineEdit(); self.global_search_box.setPlaceholderText("🔍 Global search...")
+        self.global_search_box.textChanged.connect(self.run_global_search)
+        self.top_toolbar.addWidget(self.global_search_box, stretch=1)
+        
+        self.btn_config = QPushButton("⚙️ Columns")
+        self.btn_config.clicked.connect(self.configure_hierarchy)
+        self.btn_import = QPushButton("📥 Import")
+        self.btn_import.clicked.connect(self.import_csv)
+        self.btn_export = QPushButton("📤 Export")
+        self.btn_export.clicked.connect(self.export_csv)
+
+        self.top_toolbar.addWidget(self.btn_config)
+        self.top_toolbar.addWidget(self.btn_import)
+        self.top_toolbar.addWidget(self.btn_export)
+
+    def _rebuild_dynamic_ui(self):
+        while self.splitter.count():
+            widget = self.splitter.widget(0)
+            widget.setParent(None)
+            widget.deleteLater()
+
+        self.dynamic_lists = []
+        
+        for i, level_name in enumerate(self.hierarchy_levels):
+            search_box = QLineEdit(); search_box.setPlaceholderText(f"Search {level_name}...")
+            lst = QListWidget()
+            lst.setContextMenuPolicy(Qt.CustomContextMenu)
+            lst.customContextMenuRequested.connect(lambda pos, l=lst: self.show_context_menu(l, pos))
+            lst.itemClicked.connect(lambda item, idx=i: self.on_level_clicked(idx, item))
+            
+            # Double click defaults to VIRTUAL navigation
+            lst.itemDoubleClicked.connect(lambda item: self.jump_to_virtual_or_real_path(item, force_real=False))
+            
+            search_box.textChanged.connect(lambda text, l=lst: self._filter_list(l, text))
+            
+            self.dynamic_lists.append(lst)
+            self.splitter.addWidget(self._create_section(f"{i+1}. {level_name}", search_box, lst))
+
+        # Static Tag Column
+        self.tag_search_box = QLineEdit(); self.tag_search_box.setPlaceholderText("Search tags...")
+        self.tag_list = QListWidget()
+        self.tag_list.itemClicked.connect(self.on_tag_clicked)
+        self.tag_list.itemDoubleClicked.connect(lambda item: self.main_app.nav_to_path(f"tags://{item.text()}/") if self.main_app else None)
+        self.tag_search_box.textChanged.connect(lambda text: self._filter_list(self.tag_list, text))
+        self.splitter.addWidget(self._create_section("🏷️ Tags", self.tag_search_box, self.tag_list))
+
+    def _create_section(self, title, search_box, list_widget):
+        layout = QVBoxLayout()
+        layout.addWidget(QLabel(f"<b>{title}</b>"))
+        layout.addWidget(search_box)
+        layout.addWidget(list_widget)
+        widget = QWidget(); widget.setLayout(layout)
+        return widget
+
+    def configure_hierarchy(self):
+        dlg = HierarchyConfigDialog(self.hierarchy_levels, self)
+        if dlg.exec():
+            self.hierarchy_levels = dlg.get_levels()
+            self._rebuild_dynamic_ui()
+            self.refresh_memory_cache()
+
+    # --- Data & Context Engine ---
+    def _populate_base_contexts(self):
+        self.combo_base.blockSignals(True)
+        self.combo_base.clear()
+        self.combo_base.addItem("/")
+        self.combo_base.addItem("/CSV_Library/")
         try:
-            # Added timeout=20 and 'with' context manager to prevent locking
+            with sqlite3.connect(self.db_path) as conn:
+                cur = conn.cursor()
+                cur.execute("SELECT parent_path, name FROM virtual_fs WHERE is_folder=1 AND parent_path='/' AND name != 'CSV_Library'")
+                for pp, name in cur.fetchall():
+                    self.combo_base.addItem(f"{pp}{name}/".replace("//", "/"))
+        except Exception: pass
+        self.combo_base.setCurrentText(self.base_v_path)
+        self.combo_base.blockSignals(False)
+
+    def change_base_context(self, text):
+        if not text.endswith('/'): text += '/'
+        if not text.startswith('/'): text = '/' + text
+        self.base_v_path = text
+        self.refresh_memory_cache()
+
+    def refresh_memory_cache(self):
+        self.tag_cache.clear()
+        try:
+            with sqlite3.connect(self.db_path, timeout=10) as conn:
+                cur = conn.cursor()
+                cur.execute("SELECT parent_path, name, custom_tags FROM virtual_fs WHERE is_folder=1 AND parent_path LIKE ?", (f"{self.base_v_path}%",))
+                for pp, name, tags in cur.fetchall():
+                    full_path = f"{pp}{name}/".replace("//", "/")
+                    tag_list = [t.strip() for t in str(tags).split(',')] if tags else []
+                    if tag_list: self.tag_cache[full_path] = tag_list
+        except Exception as e: print(f"DB Load Error: {e}")
+        
+        for lst in self.dynamic_lists: lst.clear()
+        self._populate_level(0, self.base_v_path)
+        self._populate_all_tags()
+
+    def _populate_level(self, level_index, prefix_path):
+        if level_index >= len(self.dynamic_lists): return
+        items = set()
+        for path in self.tag_cache.keys():
+            if path.startswith(prefix_path) and path != prefix_path:
+                remainder = path[len(prefix_path):].strip('/')
+                if remainder:
+                    items.add(remainder.split('/')[0])
+                    
+        lst = self.dynamic_lists[level_index]
+        lst.clear()
+        for name in sorted(list(items)):
+            item = QListWidgetItem(name)
+            item.setData(Qt.UserRole, f"{prefix_path}{name}/")
+            lst.addItem(item)
+
+    def _populate_all_tags(self):
+        all_tags = set(tag for tags in self.tag_cache.values() for tag in tags if tag)
+        self.tag_list.clear()
+        for t in sorted(list(all_tags)):
+            self.tag_list.addItem(QListWidgetItem(t))
+
+    # --- Interaction Engine ---
+    def on_level_clicked(self, level_index, item):
+        v_path = item.data(Qt.UserRole)
+        for i in range(level_index + 1, len(self.dynamic_lists)): self.dynamic_lists[i].clear()
+        self._populate_level(level_index + 1, v_path)
+        
+        for lst in self.dynamic_lists:
+            for row in range(lst.count()): lst.item(row).setHidden(False)
+
+    def on_tag_clicked(self, item):
+        """Smart Reverse Filtering: Populates ALL columns with exact folders matching the tag."""
+        target_tag = item.text()
+        valid_paths = [p for p, tags in self.tag_cache.items() if target_tag in tags]
+        
+        base_depth = len([p for p in self.base_v_path.split('/') if p])
+        
+        for i, lst in enumerate(self.dynamic_lists):
+            lst.clear()
+            level_nodes = {} # Use dict to avoid duplicates and store correct v_path
+            
+            for vp in valid_paths:
+                parts = [p for p in vp.split('/') if p]
+                if len(parts) > base_depth + i:
+                    name = parts[base_depth + i]
+                    # Reconstruct the precise virtual path for this exact node
+                    node_v_path = "/" + "/".join(parts[:base_depth + i + 1]) + "/"
+                    level_nodes[name] = node_v_path
+            
+            for name in sorted(level_nodes.keys()):
+                l_item = QListWidgetItem(name)
+                l_item.setData(Qt.UserRole, level_nodes[name])
+                lst.addItem(l_item)
+
+    def _filter_list(self, list_widget, text):
+        query = text.lower()
+        for i in range(list_widget.count()):
+            item = list_widget.item(i)
+            item.setHidden(query not in item.text().lower())
+
+    def run_global_search(self, text):
+        query = text.lower()
+        if not query: return self.refresh_memory_cache()
+        for lst in self.dynamic_lists + [self.tag_list]:
+            for i in range(lst.count()):
+                item = lst.item(i)
+                item.setHidden(query not in item.text().lower())
+
+    # --- Context Menus & NATIVE OS Syncing ---
+    def map_global_base_to_os(self):
+        real_p = QFileDialog.getExistingDirectory(self, f"Select the real Root Folder for '{self.base_v_path}'")
+        if not real_p: return
+        
+        real_p = real_p.replace('\\', '/')
+        try:
+            with sqlite3.connect(self.db_path, timeout=10) as conn:
+                cur = conn.cursor()
+                if self.base_v_path != "/":
+                    parts = [p for p in self.base_v_path.split('/') if p]
+                    name = parts[-1]
+                    pp = "/" + "/".join(parts[:-1]) + "/" if len(parts) > 1 else "/"
+                    cur.execute("UPDATE virtual_fs SET real_path=? WHERE parent_path=? AND name=?", (real_p, pp, name))
+
+                cur.execute("SELECT id, parent_path, name FROM virtual_fs WHERE parent_path LIKE ?", (f"{self.base_v_path}%",))
+                for db_id, pp, name in cur.fetchall():
+                    full_v = f"{pp}{name}/".replace("//", "/")
+                    rel_path = full_v[len(self.base_v_path):]
+                    new_real = os.path.join(real_p, rel_path).replace('\\', '/').rstrip('/')
+                    cur.execute("UPDATE virtual_fs SET real_path=? WHERE id=?", (new_real, db_id))
+                conn.commit()
+            QMessageBox.information(self, "Success", f"Globally mapped '{self.base_v_path}' and all subfolders to:\n{real_p}")
+        except Exception as e: QMessageBox.critical(self, "Error", str(e))
+
+    def show_context_menu(self, list_widget, pos):
+        item = list_widget.itemAt(pos)
+        if not item: return
+        menu = QMenu(self)
+        action_edit = menu.addAction("🏷️ Edit Tags")
+        menu.addSeparator()
+        action_link = menu.addAction("🔗 Map THIS Folder to Physical OS")
+        action_open = menu.addAction("🚀 Open in Native OS Explorer")
+        
+        action = menu.exec(list_widget.viewport().mapToGlobal(pos))
+        if action == action_edit: self.edit_tags_for_item(item)
+        elif action == action_link: self.link_specific_path(item)
+        elif action == action_open: self.jump_to_virtual_or_real_path(item, force_real=True)
+
+    def link_specific_path(self, item):
+        v_path = item.data(Qt.UserRole)
+        real_p = QFileDialog.getExistingDirectory(self, f"Select Real Folder mapped to {v_path}")
+        if not real_p: return
+        
+        real_p = real_p.replace('\\', '/')
+        try:
+            with sqlite3.connect(self.db_path, timeout=10) as conn:
+                cur = conn.cursor()
+                cur.execute("SELECT id, parent_path, name FROM virtual_fs WHERE parent_path LIKE ? OR (parent_path=? AND name=?)", 
+                            (f"{v_path}%", "/" + "/".join(v_path.strip('/').split('/')[:-1]) + "/", v_path.strip('/').split('/')[-1]))
+                
+                for db_id, pp, name in cur.fetchall():
+                    full_v = f"{pp}{name}/".replace("//", "/")
+                    rel = full_v[len(v_path):]
+                    new_real = os.path.join(real_p, rel).replace('\\', '/').rstrip('/')
+                    cur.execute("UPDATE virtual_fs SET real_path=? WHERE id=?", (new_real, db_id))
+                conn.commit()
+            QMessageBox.information(self, "Mapped", f"Successfully mapped '{v_path}'")
+        except Exception as e: QMessageBox.critical(self, "Error", str(e))
+
+    def jump_to_virtual_or_real_path(self, item, force_real=False):
+        v_path = item.data(Qt.UserRole)
+        if not v_path: return
+        
+        # 1. Virtual Navigation (DEFAULT ACTION)
+        if not force_real:
+            if self.main_app:
+                self.main_app.nav_to_path(v_path)
+                self.close()
+            return
+            
+        # 2. Native OS Navigation (VIA RIGHT CLICK ONLY)
+        real_abs_path = None
+        parts = [p for p in v_path.strip('/').split('/')]
+        name = parts[-1]
+        parent_path = "/" + "/".join(parts[:-1]) + "/" if len(parts) > 1 else "/"
+        
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                res = conn.cursor().execute("SELECT real_path FROM virtual_fs WHERE parent_path=? AND name=?", (parent_path, name)).fetchone()
+                if res and res[0]: real_abs_path = res[0]
+        except Exception: pass
+
+        if real_abs_path and os.path.exists(real_abs_path):
+            try:
+                if sys.platform == "win32": os.startfile(real_abs_path)
+                elif sys.platform == "darwin": subprocess.Popen(["open", real_abs_path])
+                else: subprocess.Popen(["xdg-open", real_abs_path])
+            except Exception as e: print(f"OS Open Error: {e}")
+        else:
+            QMessageBox.warning(self, "Not Mapped", "This virtual folder has not been linked to a physical folder on your OS.")
+
+    def edit_tags_for_item(self, item):
+        v_path = item.data(Qt.UserRole)
+        parts = [p for p in v_path.split('/') if p]
+        name = parts[-1]
+        parent_path = "/" + "/".join(parts[:-1]) + "/" if len(parts) > 1 else "/"
+        
+        with sqlite3.connect(self.db_path, timeout=10) as conn:
+            cur = conn.cursor()
+            res = cur.execute("SELECT id, custom_tags, real_path FROM virtual_fs WHERE parent_path=? AND name=? AND is_folder=1", (parent_path, name)).fetchone()
+            existing_tags = res[1] if res and res[1] else ""
+            real_path = res[2] if res and res[2] else None
+            
+            new_tags, ok = QInputDialog.getText(self, "Edit Tags", f"Tags for {name} (Comma separated):", QLineEdit.Normal, existing_tags)
+            if ok:
+                if res: cur.execute("UPDATE virtual_fs SET custom_tags=? WHERE id=?", (new_tags.strip(), res[0]))
+                else: cur.execute("INSERT INTO virtual_fs (parent_path, name, is_folder, custom_tags, modified) VALUES (?, ?, 1, ?, '2023-01-01 12:00:00')", (parent_path, name, new_tags.strip()))
+                conn.commit()
+
+                if real_path and os.path.exists(real_path):
+                    try:
+                        with open(os.path.join(real_path, "tag.txt"), "w", encoding='utf-8') as f: f.write(new_tags.strip())
+                    except Exception: pass
+                
+        self.refresh_memory_cache()
+        if self.main_app: self.main_app.refresh_all()
+
+    # --- File Operations ---
+    def import_csv(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Import Tags", "", "CSV Files (*.csv)")
+        if not path: return
+        
+        reply = QMessageBox.question(self, "Physical Sync", "Do you want to actually generate physical folders on your hard drive for this data structure?", QMessageBox.Yes | QMessageBox.No)
+        create_real = (reply == QMessageBox.Yes)
+        
+        base_real_dir = None
+        if create_real:
+            dest = QFileDialog.getExistingDirectory(self, "Select destination to securely create the 'CSV_Library' root folder")
+            if not dest: return
+            base_real_dir = os.path.join(dest, "CSV_Library").replace('\\', '/')
+            os.makedirs(base_real_dir, exist_ok=True)
+
+        try:
             with sqlite3.connect(self.db_path, timeout=20) as conn:
                 cur = conn.cursor()
-                # Create a dedicated root for CSV imports
-                cur.execute("INSERT OR IGNORE INTO virtual_fs (parent_path, name, is_folder) VALUES ('/', 'CSV_Library', 1)")
+                
+                # Enforce Virtual Existance of Root Concept
+                if self.base_v_path != "/":
+                    parts = [p for p in self.base_v_path.split('/') if p]
+                    cur.execute("INSERT OR IGNORE INTO virtual_fs (parent_path, name, is_folder) VALUES (?, ?, 1)", ("/" + "/".join(parts[:-1]) + "/" if len(parts)>1 else "/", parts[-1]))
                 
                 with open(path, 'r', encoding='utf-8') as f:
                     reader = csv.reader(f)
                     for row in reader:
-                        if len(row) < 2: continue
-                        raw_path, tags = row[0], row[1]
-                        if raw_path.lower() == "path": continue # Skip header
+                        if len(row) < 2 or row[0].lower() == "path": continue
                         
+                        raw_path, tags = row[0], row[1]
                         parts = raw_path.replace('\\', '/').strip('/').split('/')
                         if not parts: continue
                         
-                        curr = "/CSV_Library/"
+                        curr = self.base_v_path
                         for i, part in enumerate(parts):
                             is_last = (i == len(parts) - 1)
                             cur.execute("SELECT id FROM virtual_fs WHERE parent_path=? AND name=? AND is_folder=1", (curr, part))
                             existing = cur.fetchone()
                             
-                            if not existing:                                           
-                                cur.execute("INSERT INTO virtual_fs (parent_path, name, is_folder, custom_tags, modified) VALUES (?, ?, ?, ?, ?)",
-                                            (curr, part, 1, tags if is_last else '', now_ts()))
-                                            
-                            elif is_last and tags:
-                                cur.execute("UPDATE virtual_fs SET custom_tags=? WHERE id=?", (tags, existing[0]))
+                            final_tags = tags if is_last else ''
+                            db_id = None
+                            
+                            if existing:
+                                db_id = existing[0]
+                                if is_last and tags: cur.execute("UPDATE virtual_fs SET custom_tags=? WHERE id=?", (tags, db_id))
+                            else:
+                                cur.execute("INSERT INTO virtual_fs (parent_path, name, is_folder, custom_tags, modified) VALUES (?, ?, 1, ?, '2023-01-01 12:00:00')", (curr, part, final_tags))
+                                db_id = cur.lastrowid
+                            
                             curr += part + "/"
+                            
+                            if create_real and base_real_dir:
+                                rel = curr[len(self.base_v_path):]
+                                real_p = os.path.join(base_real_dir, rel).replace('\\', '/')
+                                os.makedirs(real_p, exist_ok=True)
+                                cur.execute("UPDATE virtual_fs SET real_path=? WHERE id=?", (real_p, db_id))
+                                if final_tags:
+                                    with open(os.path.join(real_p, "tag.txt"), "w", encoding='utf-8') as f_tag: f_tag.write(final_tags)
                 conn.commit()
-
-            QMessageBox.information(self, "Success", "CSV Directory Tree Imported Successfully.")
-            self.load_data()
+            self.refresh_memory_cache()
             if self.main_app: self.main_app.refresh_all()
-        except Exception as e:
-            QMessageBox.critical(self, "Error", str(e))
+            QMessageBox.information(self, "Success", "Database updated successfully.")
+        except Exception as e: QMessageBox.critical(self, "Import Error", str(e))
 
-    def load_data(self):
-        self.table.setRowCount(0)
+    def export_csv(self):
+        path, _ = QFileDialog.getSaveFileName(self, "Export Tags", "", "CSV Files (*.csv)")
+        if not path: return
         try:
-            # Added timeout=20 and 'with' context manager here as well
-            with sqlite3.connect(self.db_path, timeout=20) as conn:
-                cur = conn.cursor()
-                cur.execute("SELECT parent_path, name, custom_tags FROM virtual_fs WHERE parent_path LIKE '/CSV_Library/%' AND custom_tags != ''")
-                for pp, name, tags in cur.fetchall():
-                    full_path = pp + name + "/"
-                    parts = full_path.strip('/').split('/')
-                    
-                    pub = parts[1] if len(parts) > 1 else ""
-                    top = parts[2] if len(parts) > 2 else ""
-                    chap = parts[3] if len(parts) > 3 else ""
-                    if len(parts) > 4: chap = "/".join(parts[3:]) # Handles deeper directory levels
-                    
-                    row = self.table.rowCount()
-                    self.table.insertRow(row)
-                    self.table.setItem(row, 0, QTableWidgetItem(pub))
-                    self.table.setItem(row, 1, QTableWidgetItem(top))
-                    self.table.setItem(row, 2, QTableWidgetItem(chap))
-                    self.table.setItem(row, 3, QTableWidgetItem(tags))
-                    self.table.setItem(row, 4, QTableWidgetItem(pp)) # Keep track of the location
-        except Exception as e:
-            print(f"Error loading CSV data: {e}")
-
-    def apply_filters(self):
-        p_f = self.f_pub.text().lower(); t_f = self.f_top.text().lower()
-        c_f = self.f_chap.text().lower(); tg_f = self.f_tag.text().lower()
-        
-        for r in range(self.table.rowCount()):
-            match = True
-            if p_f and p_f not in self.table.item(r, 0).text().lower(): match = False
-            if t_f and t_f not in self.table.item(r, 1).text().lower(): match = False
-            if c_f and c_f not in self.table.item(r, 2).text().lower(): match = False
-            if tg_f and tg_f not in self.table.item(r, 3).text().lower(): match = False
-            self.table.setRowHidden(r, not match)
-
-    def on_row_double_click(self, row, col):
-        v_path = self.table.item(row, 4).text()
-        if self.main_app:
-            self.main_app.nav_to_path(v_path)
-            self.close()
+            with open(path, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                writer.writerow(['Path', 'Tags'])
+                for v_path, tags in self.tag_cache.items():
+                    if tags: writer.writerow([v_path.replace(self.base_v_path, ''), ', '.join(tags)])
+            QMessageBox.information(self, "Success", "Tags exported successfully.")
+        except Exception as e: QMessageBox.critical(self, "Error", str(e))
 
 
 class TimelineDiaryDialog(QDialog):
@@ -1259,7 +1574,7 @@ class NexusVirtualManager(QMainWindow):
         
         # --- NEW: CSV Library Action ---
         act_csv_lib = QAction("📚 CSV Tag Library", self)
-        act_csv_lib.triggered.connect(lambda: CSVLibraryDialog(self.active_db_path, self).exec())
+        act_csv_lib.triggered.connect(lambda: NexusTagLibraryDialog(self.active_db_path, self).exec())
         
         self.act_view_mode = QAction("🖼 Grid View", self)
         self.act_view_mode.triggered.connect(self.toggle_view_mode)
