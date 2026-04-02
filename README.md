@@ -1,103 +1,95 @@
-# Nexus OS — Virtual File Manager
 
-Nexus OS is an advanced, SQLite-powered virtual file manager. It features Deep Smart Views for dynamic file categorization without altering physical paths. Packed with a zero-lag UI, native media viewer, bulk renamer, space analyzer, custom tagging, and the ability to seamlessly materialize virtual structures directly to your real OS.
 
----
+# 🌌 Nexus OS Virtual File Manager
+
+Nexus OS is a high-performance, SQLite-backed virtual file management system. It decouples your file organization from your physical hard drive, allowing you to build, tag, map, and explore massive directory structures virtually without altering your host OS—until you want to. 
+
+Featuring an asynchronous rendering engine, Auto-Expanding Miller Columns for tag exploration, and a built-in Media Engine, Nexus OS acts as a completely isolated sandbox for your data.
 
 ## ✨ Key Features
 
-### 🧠 Dynamic Smart Views
+### 🗂️ Virtual Sandbox & OS Bridge
+* **Virtual File System (VFS):** Create folders, files, and hierarchies in a local SQLite database (`nexus_vfs.db`) without touching your host OS.
+* **Physical OS Mapping:** Right-click any virtual folder to securely map it to a physical path on your hard drive. 
+* **Materialize to OS:** Select any virtual file/folder structure and "Materialize" it to physically copy the files and recreate the exact folder tree on your Windows, Mac, or Linux machine.
+* **Import Real Files/Folders:** Drag and drop or use the import dialog to ingest physical files into the virtual sandbox.
 
-Instantly restructure your entire file system without moving a single physical file. Access dynamically generated hierarchies:
+### 📚 Auto-Expanding Tag Library (Miller Columns)
+* **Infinite Depth Navigation:** Navigate deeply nested folders through a dynamic, horizontally expanding Miller Column interface.
+* **Universal Tag Engine:** Add custom tags to files and folders.
+* **Smart Reverse-Filtering:** Click any tag in the master list to instantly reconstruct the exact directory paths that lead to that tag across all columns.
+* **CSV Tree Import/Export:** Import complex directory structures and tags via CSV. Optionally command Nexus to instantly generate the physical folders on your real hard drive.
 
-* **Statistical Clustering:** `Year ➔ Month ➔ Original Folder`
-* **Deep Hierarchies:** `Year ➔ Category ➔ Month ➔ Extension` or `Category ➔ Year ➔ Month`
-* **Custom Tags:** Tag files with custom labels (e.g., `#urgent`, `#project_x`) and browse them through the `🏷️ By Custom Tags` view.
+### 🧠 Deep Smart Views & Analytics
+* **Dynamic Protocols:** Navigate your VFS using smart URIs like `tags://` (sort by custom tags) or `y_m_f://` (sort by Year ➔ Month ➔ Folder).
+* **Timeline Diary:** An interactive calendar view that tracks exactly when files were added, modified, or logged in the system.
+* **Advanced Space Analyzer:** Asynchronously scans the database to flag Junk Files (`.tmp`, `.bak`, `.cache`), Huge Files (>500MB), and Exact Duplicates.
+* **Rich Dashboards:** Matplotlib-powered charts showing storage ratios, file distribution by extension, and modification timelines.
 
-### ⚡ Zero-Lag Asynchronous Engine
+### 🎞️ Integrated Nexus Media Engine
+* **Native Previews:** Instantly preview Images, Text, Code, Audio, and Video files directly within the Inspector dock.
+* **Theater Mode (`Ctrl+O`):** A dedicated pop-out media player with playlist support, zoom controls, and media scrubbing for uninterrupted consumption.
 
-Built for massive file processing. The background `DataLoaderThread` and chunked UI rendering system ensure the interface never freezes, even when displaying or filtering thousands of files. View caching guarantees instantaneous back/forward navigation.
-
-### 🎞️ Nexus Media Engine
-
-Press `Ctrl+O` on any file to open the dedicated Nexus Viewer.
-
-* **Images:** High-performance rendering with panning and Ctrl+Scroll zoom.
-* **Text/Code:** Built-in syntax preview.
-* **Media:** Full audio and video playback with volume and timeline controls.
-* **Context-Aware:** Automatically loads the surrounding directory into a playlist for seamless Left/Right arrow navigation.
-
-### 📤 Materialize to OS
-
-Select any Virtual Folder or dynamically generated Smart View and export it. Nexus OS will physically recreate your custom virtual hierarchy on your actual Windows/Mac/Linux drive and copy the files into it.
-
-### 🛠️ Advanced Professional Tools
-
-* **Space & Junk Analyzer:** Scan your database for massive files (>500MB), duplicates, and temporary junk files (`.tmp`, `.cache`, `.bak`).
-* **Bulk Serial Renamer:** Select multiple items and press `F2` to cleanly rename them sequentially (e.g., `Vacation (1).jpg`, `Vacation (2).jpg`).
-* **Bulk Deleter:** Purge thousands of files instantly by extension or naming pattern.
-* **Database Compiler:** Right-click any folder or view to extract it into its own isolated, portable SQLite `.db` file.
-* **SHA-256 Hashing:** Instantly compute cryptographic checksums for data integrity verification.
+### 🚀 Zero-Lag Async Engine
+* Built with `QThread` and an asynchronous chunk-rendering system. Nexus OS can handle thousands of virtual files in a single directory without freezing the UI.
 
 ---
 
-## 🚀 Installation & Setup
+## 🛠️ Installation & Requirements
 
-**Prerequisites:**
-Ensure you have Python 3.8+ installed on your system.
+Nexus OS is built on **Python 3.8+** and uses the **PySide6** framework for its GUI. 
 
-**1. Install Required Dependencies:**
-Open your terminal or command prompt and run:
-
+### Core Dependencies
 ```bash
-pip install PySide6 pandas matplotlib
-
+pip install PySide6
 ```
 
-**2. Run the Application:**
+### Optional (Highly Recommended) Dependencies
+For the interactive Analytics Dashboard (Charts) and Advanced Data Export:
+```bash
+pip install pandas matplotlib
+```
 
+### Running the App
 ```bash
 python nexus_os.py
-
 ```
+*(The app will automatically generate a `nexus_data` folder in its current directory to store the main `nexus_vfs.db` and any compiled view databases.)*
 
 ---
 
 ## ⌨️ Keyboard Shortcuts
 
-### System Navigation
+| Shortcut | Action |
+| :--- | :--- |
+| `Backspace` | Navigate Back in History |
+| `Shift + Backspace` | Navigate Forward in History |
+| `Alt + Up` | Go Up One Directory |
+| `Ctrl + F` | Focus Global Search |
+| `Ctrl + N` | Create New Virtual File |
+| `Ctrl + Shift + N` | Create New Virtual Folder |
+| `F2` | Rename (Select multiple files to Bulk Rename sequentially!) |
+| `Delete` | Send to Virtual Trash / Permanently Delete |
+| `Ctrl + C / X / V` | Copy, Cut, Paste (Virtual Sandbox) |
+| `Ctrl + O` | Open selected files in the Nexus Media Viewer |
+| `Enter` | Open selected folder or launch file in Host OS |
 
-* **Enter:** Open selected folder or execute the real OS file natively.
-* **Ctrl + O:** Open selected file in the Nexus Media Engine.
-* **Ctrl + F:** Focus the Global Search bar.
-* **Backspace:** Go Back.
-* **Shift + Backspace:** Go Forward.
-* **Alt + Up:** Go up one directory level.
-
-### File Operations
-
-* **Ctrl + N:** Create a new Virtual File.
-* **Ctrl + Shift + N:** Create a new Virtual Folder.
-* **F2:** Rename item (Select multiple items for Bulk Serial Renaming).
-* **Delete:** Send to Virtual Trash (Permanently deletes if inside the Trash view).
-* **Ctrl + C / X / V:** Copy, Cut, and Paste virtual files.
-* **Shift + F10:** Open Context Menu.
-
-### Nexus Media Engine
-
-* **Spacebar:** Play / Pause audio and video.
-* **Left / Right Arrows:** Navigate to the Previous / Next file in the directory.
-* **Up / Down Arrows:** Increase / Decrease media volume.
-* **Ctrl + Scroll Wheel:** Zoom in/out on images.
-* **Escape:** Close the viewer safely.
+### Media Viewer Controls
+* `Spacebar`: Play / Pause Media
+* `Left / Right Arrow`: Previous / Next Item in Playlist
+* `Up / Down Arrow`: Volume Control
+* `Escape`: Close Viewer
 
 ---
 
-## 📊 Analytics & Inspector
+## ⚙️ Architecture Highlights
 
-Toggle the Inspector panel from the toolbar to access:
+* **WAL Mode SQLite:** The underlying database utilizes `PRAGMA journal_mode=WAL` for high-concurrency read/write access without locking up the UI.
+* **RAM Caching:** Navigating previously visited directories is instantaneous due to dictionary-based RAM caching of the database tree.
+* **Modular Multi-threading:** Database loading, space analyzing, hash calculation (SHA-256), and file materialization are all strictly offloaded to isolated QThreads.
+* **QStackedWidgets & QSplitters:** The UI is designed dynamically, tearing down and rebuilding QListWidgets on the fly to support the infinite-depth Tag Library.
 
-* **Properties:** Edit names, assign colors, apply custom tags, and view the real physical path of your virtual files.
-* **Text Analytics:** View real-time calculations of folder sizes, total item counts, and system allocation percentages.
-* **Data Visualization:** Leverage Matplotlib to view line charts (modifications over time), bar charts (extension distributions), and storage pie charts.
+---
 
+## 📋 License & Disclaimer
+*Nexus OS Virtual File Manager* is a customized data engine. Always ensure you have backups of your physical files before utilizing the "Bulk Operations" or "Materialize" features.
