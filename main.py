@@ -162,12 +162,13 @@ class NexusDB:
                 custom_tags TEXT DEFAULT ''
             );
         """)
+        # ADD 'hash_verified' to this list to safely upgrade the database!
         for col in [
             "color_tag TEXT DEFAULT ''", "secondary_name TEXT DEFAULT ''", 
             "is_hidden INTEGER DEFAULT 0", "in_trash INTEGER DEFAULT 0", 
             "is_favorite INTEGER DEFAULT 0", "sha256 TEXT DEFAULT ''",
             "category TEXT DEFAULT 'Others'", "year TEXT DEFAULT ''", "month TEXT DEFAULT ''",
-            "custom_tags TEXT DEFAULT ''"
+            "custom_tags TEXT DEFAULT ''", "hash_verified INTEGER DEFAULT 0"
         ]:
             try: c.execute(f"ALTER TABLE virtual_fs ADD COLUMN {col};")
             except sqlite3.OperationalError: pass
@@ -225,6 +226,39 @@ class NexusDB:
         except Exception: pass
 
 # ---------------- Background Threads ----------------
+class BulkHashCalculator(QThread):
+    progress = Signal(int, int, str)
+    finished = Signal(int)
+    def __init__(self, db_path, target_v_path, parent=None):
+        super().__init__(parent)
+        self.db_path = db_path
+        self.target_v_path = target_v_path
+        self.is_cancelled = False
+    def cancel(self): self.is_cancelled = True
+    def run(self):
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cur = conn.cursor()
+                cur.execute("SELECT id, real_path, name FROM virtual_fs WHERE parent_path LIKE ? AND is_folder=0", (f"{self.target_v_path}%",))
+                files = cur.fetchall()
+                total = len(files)
+                computed = 0
+                for i, (db_id, rp, name) in enumerate(files):
+                    if self.is_cancelled: break
+                    if not rp or not os.path.exists(rp): continue
+                    self.progress.emit(i+1, total, f"Hashing {name[:20]}...")
+                    try:
+                        sha = hashlib.sha256()
+                        with open(rp, 'rb') as f:
+                            for block in iter(lambda: f.read(4096), b""): sha.update(block)
+                        cur.execute("UPDATE virtual_fs SET sha256=? WHERE id=?", (sha.hexdigest(), db_id))
+                        computed += 1
+                    except Exception: pass
+                conn.commit()
+            self.finished.emit(computed)
+        except Exception: pass
+
+
 class DataLoaderThread(QThread):
     data_ready = Signal(list, list) 
     def __init__(self, db_path, target_path, show_hidden, parent=None):
@@ -318,46 +352,63 @@ class DataLoaderThread(QThread):
         except Exception as e: print("DB Load Error:", e)
         finally: conn.close()
 
+
+class SizeTableWidgetItem(QTableWidgetItem):
+    def __init__(self, size_bytes):
+        # Display the friendly string (KB, MB, GB)
+        super().__init__(human_size(size_bytes))
+        # Store the raw integer for perfect sorting
+        self.size_bytes = size_bytes
+        self.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+
+    def __lt__(self, other):
+        # When clicking the column header, compare the raw bytes!
+        if isinstance(other, SizeTableWidgetItem):
+            return self.size_bytes < other.size_bytes
+        return super().__lt__(other)
+
 class SpaceScannerThread(QThread):
     progress = Signal(int, int, str)
-    found = Signal(str, str, int, str, int) 
+    # Signal now includes Ext and Hash: (typ, name, path, ext, size, modified, hash, id)
+    found = Signal(str, str, str, str, int, str, str, int) 
     finished_scan = Signal()
-    def __init__(self, db_path, parent=None):
+    
+    def __init__(self, db_path, scan_roots=["/"], parent=None):
         super().__init__(parent)
         self.db_path = db_path
+        self.scan_roots = scan_roots
         self.is_cancelled = False
+        
     def cancel(self): self.is_cancelled = True
+    
     def run(self):
         try:
             conn = sqlite3.connect(self.db_path)
             cur = conn.cursor()
-            self.progress.emit(10, 100, "Scanning for Junk Files...")
-            if self.is_cancelled: return
             
-            # Scan Junk
-            cur.execute("SELECT id, name, parent_path, size, modified FROM virtual_fs WHERE is_folder=0 AND in_trash=0 AND (extension IN ('.tmp', '.bak', '.log', '.cache') OR name LIKE '%cache%')")
+            path_cond = " OR ".join(["parent_path LIKE ?"] * len(self.scan_roots))
+            path_params = tuple(f"{p}%" for p in self.scan_roots)
+            
+            self.progress.emit(10, 100, "Scanning for Junk...")
+            cur.execute(f"SELECT id, name, parent_path, extension, size, modified, sha256 FROM virtual_fs WHERE is_folder=0 AND in_trash=0 AND ({path_cond}) AND (extension IN ('.tmp', '.bak', '.log', '.cache') OR name LIKE '%cache%')", path_params)
             for r in cur.fetchall():
                 if self.is_cancelled: return
-                self.found.emit("Junk File", f"[{r[2]}] {r[1]}", r[3] or 0, r[4] or "Unknown", r[0])
+                self.found.emit("Junk File", r[1], r[2], r[3] or "", r[4] or 0, r[5] or "Unknown", r[6] or "", r[0])
             
-            # Scan Huge Files
             self.progress.emit(40, 100, "Scanning for Huge Files...")
-            if self.is_cancelled: return
-            cur.execute("SELECT id, name, parent_path, size, modified FROM virtual_fs WHERE is_folder=0 AND in_trash=0 AND size > 524288000 ORDER BY size DESC")
+            cur.execute(f"SELECT id, name, parent_path, extension, size, modified, sha256 FROM virtual_fs WHERE is_folder=0 AND in_trash=0 AND ({path_cond}) AND size > 524288000 ORDER BY size DESC", path_params)
             for r in cur.fetchall():
                 if self.is_cancelled: return
-                self.found.emit("Huge File (>500MB)", f"[{r[2]}] {r[1]}", r[3] or 0, r[4] or "Unknown", r[0])
+                self.found.emit("Huge File (>500MB)", r[1], r[2], r[3] or "", r[4] or 0, r[5] or "Unknown", r[6] or "", r[0])
             
-            # Scan Duplicates
             self.progress.emit(70, 100, "Scanning for Duplicates...")
-            if self.is_cancelled: return
-            cur.execute("SELECT size, extension, COUNT(*) as c FROM virtual_fs WHERE is_folder=0 AND in_trash=0 AND size > 0 GROUP BY size, extension HAVING c > 1")
+            cur.execute(f"SELECT size, extension, COUNT(*) as c FROM virtual_fs WHERE is_folder=0 AND in_trash=0 AND ({path_cond}) AND size > 0 GROUP BY size, extension HAVING c > 1", path_params)
             for size, ext, count in cur.fetchall():
                 if self.is_cancelled: return
-                cur.execute("SELECT id, name, parent_path, modified FROM virtual_fs WHERE size=? AND extension=? AND is_folder=0 AND in_trash=0", (size, ext))
+                cur.execute(f"SELECT id, name, parent_path, extension, modified, sha256 FROM virtual_fs WHERE size=? AND extension=? AND is_folder=0 AND in_trash=0 AND ({path_cond})", (size, ext) + path_params)
                 files = cur.fetchall()
-                for f in files[1:]: # Keep the first one, flag the rest
-                    self.found.emit("Duplicate File", f"[{f[2]}] {f[1]}", size or 0, f[3] or "Unknown", f[0])
+                for f in files[1:]: 
+                    self.found.emit("Duplicate File", f[1], f[2], f[3] or "", size or 0, f[4] or "Unknown", f[5] or "", f[0])
             
             self.progress.emit(100, 100, "Scan Complete.")
         finally:
@@ -462,8 +513,9 @@ class CompilerThread(QThread):
                 tgt_cur.executemany(f"INSERT INTO virtual_fs VALUES ({','.join(['?']*18)})", modified_rows[i:i+batch_size])
                 tgt_conn.commit()
                 self.progress.emit(int(40 + (i/total)*60), 100, f"Compiled {min(i+batch_size, total)}/{total} records...")
-            tgt_cur.execute("CREATE INDEX idx_vfs_parent ON virtual_fs(parent_path);")
-            tgt_conn.commit()
+            
+            # (Redundant index creation line removed to fix the error!)
+            
             src_conn.close()
             tgt_conn.close()
             self.finished.emit(self.target_db)
@@ -522,24 +574,35 @@ class ExportZipThread(QThread):
             conn = sqlite3.connect(str(self.db_path))
             cur = conn.cursor()
             all_files_to_zip = []
-            for typ, v_path, real_path, db_id in self.items_to_export:
+            
+            # FIXED: Unpacking exactly 3 values (Type, Path/Real_Path, Database_ID)
+            for typ, path_val, db_id in self.items_to_export: 
                 if self.is_cancelled: return
-                if typ == "file" and real_path and os.path.exists(real_path):
-                    all_files_to_zip.append((real_path, v_path.split("/")[-1] if v_path else os.path.basename(real_path)))
+                
+                if typ == "file":
+                    cur.execute("SELECT real_path, name FROM virtual_fs WHERE id=?", (db_id,))
+                    res = cur.fetchone()
+                    if res and res[0] and os.path.exists(res[0]):
+                        # Zip it using its virtual name so it looks clean in the archive
+                        all_files_to_zip.append((res[0], res[1]))
                 elif typ == "folder":
-                    cur.execute("SELECT parent_path, name, real_path, is_folder FROM virtual_fs WHERE parent_path LIKE ?", (f"{v_path}%",))
+                    cur.execute("SELECT parent_path, name, real_path, is_folder FROM virtual_fs WHERE parent_path LIKE ? AND in_trash=0", (f"{path_val}%",))
                     for pp, n, rp, is_f in cur.fetchall():
                         if not is_f and rp and os.path.exists(rp):
-                            all_files_to_zip.append((rp, f"{v_path.strip('/').split('/')[-1]}/{pp[len(v_path):]}{n}".replace("//", "/")))
+                            rel_dest = f"{path_val.strip('/').split('/')[-1]}/{pp[len(path_val):]}{n}".replace("//", "/")
+                            all_files_to_zip.append((rp, rel_dest))
+                            
             total = len(all_files_to_zip)
             if total == 0: 
                 self.error.emit("No physical files found to zip.")
                 return
+                
             with zipfile.ZipFile(self.zip_filepath, 'w', zipfile.ZIP_DEFLATED) as zf:
                 for i, (real_os_path, zip_virtual_path) in enumerate(all_files_to_zip):
                     if self.is_cancelled: return
                     self.progress.emit(i+1, total, f"Compressing: {zip_virtual_path}")
                     zf.write(real_os_path, arcname=zip_virtual_path)
+                    
             conn.close()
             self.finished.emit(self.zip_filepath)
         except Exception as e: self.error.emit(str(e))
@@ -869,20 +932,26 @@ class PaginatingChartWidget(QWidget):
         values = [v for k, v in page_data]
         
         chart_type = self.type_cb.currentText()
-        accent = "#58a6ff"
+        
+        # --- NEW: Vibrant Color Palette ---
+        color_palette = ["#58a6ff", "#3fb950", "#e3b341", "#a371f7", "#f85149", "#d2a8ff", 
+                         "#79c0ff", "#2ea043", "#ff7b72", "#bc8cff", "#f2cc60"]
+        
+        # Cycle through colors based on the number of items on the page
+        chart_colors = [color_palette[i % len(color_palette)] for i in range(len(keys))]
         
         self.fig.patch.set_facecolor('#0d1117')
         self.ax.set_facecolor('#0d1117')
         self.ax.tick_params(colors='white')
         
         if chart_type == "Horizontal Bar":
-            self.ax.barh(keys, values, color=accent)
+            self.ax.barh(keys, values, color=chart_colors)
             self.ax.invert_yaxis() # Put highest value at the top
         elif chart_type == "Pie":
-            self.ax.pie(values, labels=keys, autopct='%1.1f%%', textprops={'color': "white"})
+            self.ax.pie(values, labels=keys, autopct='%1.1f%%', colors=chart_colors, textprops={'color': "white"})
             self.ax.axis("equal")
         elif chart_type == "Scatter":
-            self.ax.scatter(values, keys, color=accent, s=80)
+            self.ax.scatter(values, keys, c=chart_colors, s=100, edgecolors='white', linewidth=0.5, alpha=0.9)
             self.ax.invert_yaxis()
 
         if chart_type != "Pie":
@@ -901,18 +970,21 @@ class NexusTagLibraryDialog(QDialog):
         self.tag_cache = {}  
         self.base_v_path = "/" 
         
+
         # --- 1. Load Custom Names Persistently ---
         self.settings = QSettings("NexusOS", "TagLibraryConfig")
         saved_levels = self.settings.value("hierarchy_levels")
         if saved_levels:
             self.hierarchy_levels = list(saved_levels)
         else:
-            self.hierarchy_levels = ["Parent Folder", "Level 1", "Level 2", "Level 3"]
+            self.hierarchy_levels = ["Parent Folder", "Level 1", "Level 2", "Level 3", "Level 4", "Level 5"]
             
-        # Extract dynamic names for the UI
+        # Extract dynamic names for the UI (Expanded to 5 levels)
         self.l0_name = self.hierarchy_levels[0] if len(self.hierarchy_levels) > 0 else "Parent Folder"
         self.l1_name = self.hierarchy_levels[1] if len(self.hierarchy_levels) > 1 else "Level 1"
         self.l2_name = self.hierarchy_levels[2] if len(self.hierarchy_levels) > 2 else "Level 2"
+        self.l3_name = self.hierarchy_levels[3] if len(self.hierarchy_levels) > 3 else "Level 3"
+        self.l4_name = self.hierarchy_levels[4] if len(self.hierarchy_levels) > 4 else "Level 4"
         
         self.setWindowTitle("Nexus OS - Universal Tag Engine & Analytics")
         self.resize(1300, 800)
@@ -968,7 +1040,7 @@ class NexusTagLibraryDialog(QDialog):
         
         self.tabs.addTab(self.browser_tab, "📂 Library Browser")
 
-        # Tabs 2-6: Built-in Analytics 
+        # Tabs 2-8: Built-in Analytics 
         self.dashboard_tab = QWidget()
         self.dashboard_layout = QGridLayout(self.dashboard_tab)
         
@@ -976,16 +1048,21 @@ class NexusTagLibraryDialog(QDialog):
         self.l0_chart_tab = PaginatingChartWidget(f"Volume by {self.l0_name}", self)
         self.l1_chart_tab = PaginatingChartWidget(f"Volume by {self.l1_name}", self)
         self.l2_chart_tab = PaginatingChartWidget(f"Volume by {self.l2_name}", self)
+        self.l3_chart_tab = PaginatingChartWidget(f"Volume by {self.l3_name}", self)
+        self.l4_chart_tab = PaginatingChartWidget(f"Volume by {self.l4_name}", self)
         
         self.tabs.addTab(self.dashboard_tab, "🏠 Executive Dashboard")
         self.tabs.addTab(self.tag_chart_tab, "🏷 Tag Analytics")
         self.tabs.addTab(self.l0_chart_tab, f"🗂 {self.l0_name} Analytics")
         self.tabs.addTab(self.l1_chart_tab, f"📂 {self.l1_name} Analytics")
         self.tabs.addTab(self.l2_chart_tab, f"📁 {self.l2_name} Analytics")
+        self.tabs.addTab(self.l3_chart_tab, f"📄 {self.l3_name} Analytics")
+        self.tabs.addTab(self.l4_chart_tab, f"📑 {self.l4_name} Analytics")
 
         self.dynamic_lists = [] 
         self._populate_base_contexts()
         self.refresh_memory_cache()
+
 
     def _build_toolbar(self):
         self.top_toolbar = QHBoxLayout()
@@ -1051,66 +1128,130 @@ class NexusTagLibraryDialog(QDialog):
         self._populate_all_tags()
 
     def update_analytics_data(self):
-        tags_data, l0_data, l1_data, l2_data = {}, {}, {}, {}
+        tags_data, l0_data, l1_data, l2_data, l3_data, l4_data = {}, {}, {}, {}, {}, {}
         total_items = 0
+        total_folders = 0
+        total_files = 0
+        multi_tagged_items = 0
+        total_tags_applied = 0
         
         base_depth = len([p for p in self.base_v_path.split('/') if p])
         
         for path, tags in self.tag_cache.items():
             total_items += 1
+            
+            # Count Folders vs Files
+            if path.endswith('/'):
+                total_folders += 1
+            else:
+                total_files += 1
+                
+            # Advanced Tag Metrics
+            valid_tags = [t for t in tags if t]
+            total_tags_applied += len(valid_tags)
+            if len(valid_tags) > 1:
+                multi_tagged_items += 1
+                
             parts = [p for p in path.split('/') if p]
             
             relative_parts = parts[base_depth:]
             
+            # Expanded Deep Level Tracking
             if len(relative_parts) > 0: 
                 l0_data[relative_parts[0]] = l0_data.get(relative_parts[0], 0) + 1
             if len(relative_parts) > 1: 
                 l1_data[relative_parts[1]] = l1_data.get(relative_parts[1], 0) + 1
             if len(relative_parts) > 2: 
                 l2_data[relative_parts[2]] = l2_data.get(relative_parts[2], 0) + 1
+            if len(relative_parts) > 3: 
+                l3_data[relative_parts[3]] = l3_data.get(relative_parts[3], 0) + 1
+            if len(relative_parts) > 4: 
+                l4_data[relative_parts[4]] = l4_data.get(relative_parts[4], 0) + 1
             
-            for t in tags:
-                if t: tags_data[t] = tags_data.get(t, 0) + 1
+            for t in valid_tags:
+                tags_data[t] = tags_data.get(t, 0) + 1
 
+        # Send Data to Charts
         self.tag_chart_tab.update_data(tags_data)
         self.l0_chart_tab.update_data(l0_data)
         self.l1_chart_tab.update_data(l1_data)
         self.l2_chart_tab.update_data(l2_data)
+        self.l3_chart_tab.update_data(l3_data)
+        self.l4_chart_tab.update_data(l4_data)
         
+        # Clear old dashboard widgets
         for i in reversed(range(self.dashboard_layout.count())): 
             item = self.dashboard_layout.itemAt(i)
             if item.widget(): item.widget().setParent(None)
 
+        avg_tags = round(total_tags_applied / total_items, 2) if total_items > 0 else 0
+
+        # The Expanded Metrics Array
         metrics = [
             ("TOTAL VIRTUAL ITEMS", total_items),
+            ("VIRTUAL FOLDERS", total_folders),
+            ("VIRTUAL FILES", total_files),
             ("UNIQUE TAGS", len(tags_data)),
+            ("MULTI-TAGGED ITEMS", multi_tagged_items),
+            ("AVG TAGS PER ITEM", avg_tags),
             (f"TOTAL {self.l0_name.upper()}S", len(l0_data)),
             (f"TOTAL {self.l1_name.upper()}S", len(l1_data)),
-            (f"TOTAL {self.l2_name.upper()}S", len(l2_data))
+            (f"TOTAL {self.l2_name.upper()}S", len(l2_data)),
+            (f"TOTAL {self.l3_name.upper()}S", len(l3_data)),
+            (f"TOTAL {self.l4_name.upper()}S", len(l4_data))
         ]
         
+        # Vibrant color palette for the tiles
+        colors = ["#58a6ff", "#3fb950", "#e3b341", "#a371f7", "#f85149", "#d2a8ff", 
+                  "#79c0ff", "#2ea043", "#ff7b72", "#bc8cff", "#f2cc60"]
+  
         row, col = 0, 0
-        for title, val in metrics:
+        for idx, (title, val) in enumerate(metrics):
+            accent_color = colors[idx % len(colors)]
+            
             card = QFrame()
-            card.setStyleSheet("background: #161b22; border: 1px solid #30363d; border-radius: 8px; border-top: 4px solid #58a6ff;")
+            # INCREASED HEIGHT to 130 to prevent cutting off text
+            card.setMinimumSize(220, 130)
+            card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+            
+            card.setStyleSheet(f"""
+                QFrame {{
+                    background: #161b22; 
+                    border: 1px solid #30363d; 
+                    border-radius: 8px; 
+                    border-top: 5px solid {accent_color};
+                }}
+            """)
+            
             c_lay = QVBoxLayout(card)
             
             lbl_title = QLabel(title)
             lbl_title.setStyleSheet("color: #8b949e; font-size: 11px; font-weight: bold; border: none;")
-            lbl_val = QLabel(str(val))
-            lbl_val.setStyleSheet("color: #58a6ff; font-size: 32px; font-weight: bold; border: none;")
+            lbl_title.setWordWrap(True)
+            # FORCE the label to reserve enough space for two lines of text
+            lbl_title.setMinimumHeight(30)
             
-            c_lay.addWidget(lbl_title)
+            lbl_val = QLabel(str(val))
+            # Slightly scaled down font size from 38 to 34 to give more breathing room
+            lbl_val.setStyleSheet(f"color: {accent_color}; font-size: 34px; font-weight: bold; border: none;")
+            lbl_val.setAlignment(Qt.AlignCenter)
+            
+            c_lay.addWidget(lbl_title, alignment=Qt.AlignTop | Qt.AlignLeft)
+            c_lay.addStretch()
             c_lay.addWidget(lbl_val)
             c_lay.addStretch()
             
             self.dashboard_layout.addWidget(card, row, col)
+            
             col += 1
-            if col > 2: 
+            if col > 3: 
                 col = 0
                 row += 1
                 
-        self.dashboard_layout.setRowStretch(row, 1)
+        for i in range(4):
+            self.dashboard_layout.setColumnStretch(i, 1)
+        for i in range(row + 1):
+            self.dashboard_layout.setRowStretch(i, 1)
 
     def _add_column(self, level_index, title):
         search_box = QLineEdit()
@@ -1240,6 +1381,7 @@ class NexusTagLibraryDialog(QDialog):
             
         while len(self.dynamic_lists) > max_depth:
             col = self.dynamic_lists.pop()
+            col['widget'].setParent(None)
             col['widget'].deleteLater()
             
         for i in range(len(self.dynamic_lists), max_depth):
@@ -1256,10 +1398,80 @@ class NexusTagLibraryDialog(QDialog):
                     name = parts[base_depth + i]
                     is_folder = (len(parts) > base_depth + i + 1) or vp.endswith('/')
                     node_v_path = "/" + "/".join(parts[:base_depth + i + 1]) + ("/" if is_folder else "")
-                    level_nodes[name] = node_v_path
+                    level_nodes[name] = (node_v_path, is_folder)
             
             for name in sorted(level_nodes.keys()):
-                l_item = QListWidgetItem(name); l_item.setData(Qt.UserRole, level_nodes[name]); lst.addItem(l_item)
+                node_v_path, is_folder = level_nodes[name]
+                l_item = QListWidgetItem(name)
+                l_item.setData(Qt.UserRole, node_v_path)
+                
+                # Corrected: Use QStyle.SP_DirIcon and QStyle.SP_FileIcon
+                if is_folder:
+                    l_item.setIcon(self.style().standardIcon(QStyle.SP_DirIcon))
+                else:
+                    l_item.setIcon(self.style().standardIcon(QStyle.SP_FileIcon))
+                
+                if node_v_path in self.tag_cache and target_tag in self.tag_cache[node_v_path]:
+                    l_item.setForeground(QBrush(QColor("#58a6ff")))
+                    font = l_item.font()
+                    font.setBold(True)
+                    l_item.setFont(font)
+                    
+                lst.addItem(l_item)
+
+    def run_global_search(self, text):
+        query = text.lower()
+        if not query: 
+            return self.refresh_memory_cache()
+            
+        valid_paths = [p for p in self.tag_cache.keys() if query in p.lower()]
+        base_depth = len([p for p in self.base_v_path.split('/') if p])
+        
+        max_depth = 0
+        for vp in valid_paths:
+            parts = [p for p in vp.split('/') if p]
+            depth = len(parts) - base_depth
+            if depth > max_depth: max_depth = depth
+            
+        while len(self.dynamic_lists) > max_depth:
+            col = self.dynamic_lists.pop()
+            col['widget'].setParent(None)
+            col['widget'].deleteLater()
+            
+        for i in range(len(self.dynamic_lists), max_depth):
+            title = self.hierarchy_levels[i] if i < len(self.hierarchy_levels) else f"Level {i + 1}"
+            self._add_column(i, title)
+            
+        for i in range(max_depth):
+            lst = self.dynamic_lists[i]['list']
+            lst.clear()
+            level_nodes = {}
+            for vp in valid_paths:
+                parts = [p for p in vp.split('/') if p]
+                if len(parts) > base_depth + i:
+                    name = parts[base_depth + i]
+                    is_folder = (len(parts) > base_depth + i + 1) or vp.endswith('/')
+                    node_v_path = "/" + "/".join(parts[:base_depth + i + 1]) + ("/" if is_folder else "")
+                    level_nodes[name] = (node_v_path, is_folder)
+            
+            for name in sorted(level_nodes.keys()):
+                node_v_path, is_folder = level_nodes[name]
+                l_item = QListWidgetItem(name)
+                l_item.setData(Qt.UserRole, node_v_path)
+                
+                # Corrected: Use QStyle.SP_DirIcon and QStyle.SP_FileIcon
+                if is_folder:
+                    l_item.setIcon(self.style().standardIcon(QStyle.SP_DirIcon))
+                else:
+                    l_item.setIcon(self.style().standardIcon(QStyle.SP_FileIcon))
+                
+                if query in name.lower():
+                    l_item.setForeground(QBrush(QColor("#2ea043")))
+                    font = l_item.font()
+                    font.setBold(True)
+                    l_item.setFont(font)
+                    
+                lst.addItem(l_item)
 
     def _filter_list(self, list_widget, text):
         query = text.lower()
@@ -1267,14 +1479,6 @@ class NexusTagLibraryDialog(QDialog):
             item = list_widget.item(i)
             item.setHidden(query not in item.text().lower())
 
-    def run_global_search(self, text):
-        query = text.lower()
-        if not query: return self.refresh_memory_cache()
-        for col in self.dynamic_lists:
-            lst = col['list']
-            for i in range(lst.count()):
-                item = lst.item(i)
-                item.setHidden(query not in item.text().lower())
 
     def map_global_base_to_os(self):
         real_p = QFileDialog.getExistingDirectory(self, f"Select the real Root Folder for '{self.base_v_path}'")
@@ -1303,19 +1507,120 @@ class NexusTagLibraryDialog(QDialog):
         item = list_widget.itemAt(pos)
         if not item: return
         menu = QMenu(self)
-        action_edit = menu.addAction("🏷️ Edit Tags")
         
-        if item.data(Qt.UserRole).endswith('/'):
-            menu.addSeparator()
-            action_link = menu.addAction("🔗 Map THIS Folder to Physical OS")
-        else: action_link = None
+        v_path = item.data(Qt.UserRole)
+        is_folder = v_path.endswith('/')
         
+        # --- Native OS Operations ---
         action_open = menu.addAction("🚀 Open in Native OS Explorer")
+        if is_folder:
+            action_link = menu.addAction("🔗 Map THIS Folder to Physical OS")
+        else: 
+            action_link = None
+            
+        menu.addSeparator()
+        
+        # --- Metadata & Clipboard ---
+        action_edit = menu.addAction("🏷️ Edit Tags")
+        action_copy_v = menu.addAction("📋 Copy Virtual Path")
+        action_copy_r = menu.addAction("📋 Copy Local OS Path")
+        
+        menu.addSeparator()
+        
+        # --- Information ---
+        action_props = menu.addAction("ℹ️ Properties")
+        
+        # Execute Menu
         action = menu.exec(list_widget.viewport().mapToGlobal(pos))
         
-        if action == action_edit: self.edit_tags_for_item(item)
-        elif action == action_link: self.link_specific_path(item)
-        elif action == action_open: self.jump_to_virtual_or_real_path(item, force_real=True)
+        # Handle Actions
+        if action == action_edit: 
+            self.edit_tags_for_item(item)
+        elif action == action_link: 
+            self.link_specific_path(item)
+        elif action == action_open: 
+            self.jump_to_virtual_or_real_path(item, force_real=True)
+        elif action == action_copy_v: 
+            QApplication.clipboard().setText(v_path)
+            if self.main_app: self.main_app.status.showMessage("Virtual path copied to clipboard.", 3000)
+        elif action == action_copy_r:
+            real_p = self._get_real_path_for_item(item)
+            if real_p: 
+                QApplication.clipboard().setText(real_p)
+                if self.main_app: self.main_app.status.showMessage("Physical OS path copied to clipboard.", 3000)
+            else: 
+                QMessageBox.warning(self, "Copy Failed", "This item has no mapped physical path on your hard drive.")
+        elif action == action_props:
+            self.show_item_properties(item)
+
+    # --- NEW HELPER METHODS (Add these right below show_context_menu) ---
+
+    def _get_real_path_for_item(self, item):
+        v_path = item.data(Qt.UserRole)
+        is_folder = v_path.endswith('/')
+        parts = [p for p in v_path.split('/') if p]
+        if not parts: return None
+        name = parts[-1]
+        parent_path = "/" + "/".join(parts[:-1]) + "/" if len(parts) > 1 else "/"
+        
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                res = conn.cursor().execute("SELECT real_path FROM virtual_fs WHERE parent_path=? AND name=? AND is_folder=?", (parent_path, name, 1 if is_folder else 0)).fetchone()
+                return res[0] if res and res[0] else None
+        except Exception:
+            return None
+
+    def show_item_properties(self, item):
+        v_path = item.data(Qt.UserRole)
+        is_folder = v_path.endswith('/')
+        
+        parts = [p for p in v_path.split('/') if p]
+        name = parts[-1] if parts else ""
+        parent_path = "/" + "/".join(parts[:-1]) + "/" if len(parts) > 1 else "/"
+            
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"Properties: {name}")
+        dlg.setMinimumWidth(500)
+        
+        if self.main_app and hasattr(self.main_app, 'theme_combo'):
+            dlg.setStyleSheet(THEMES.get(self.main_app.theme_combo.currentText(), THEMES["Dark Nexus"]))
+            
+        layout = QFormLayout(dlg)
+        
+        layout.addRow("Virtual Path:", QLineEdit(v_path))
+        
+        try:
+            with sqlite3.connect(self.db_path, timeout=10) as conn:
+                cur = conn.cursor()
+                res = cur.execute("SELECT id, size, extension, modified, real_path, custom_tags, color_tag, secondary_name FROM virtual_fs WHERE parent_path=? AND name=? AND is_folder=?", (parent_path, name, 1 if is_folder else 0)).fetchone()
+                
+                if res:
+                    db_id, size, ext, mod, real_p, tags, color, sec_name = res
+                    layout.addRow("Type:", QLabel("Directory (Virtual Folder)" if is_folder else "Virtual File"))
+                    if not is_folder:
+                        layout.addRow("Extension:", QLabel(str(ext)))
+                        layout.addRow("Size:", QLabel(human_size(size or 0)))
+                    layout.addRow("Modified Date:", QLabel(str(mod)))
+                    
+                    # Target Path in a ReadOnly LineEdit so user can copy it easily
+                    txt_real = QLineEdit(str(real_p) if real_p else "Disconnected / Virtual Only")
+                    txt_real.setReadOnly(True)
+                    layout.addRow("Local Target OS Path:", txt_real)
+                    
+                    layout.addRow("Custom Tags:", QLabel(str(tags) if tags else "None"))
+                    layout.addRow("Color Label:", QLabel(str(color) if color else "None"))
+                    layout.addRow("Secondary Name:", QLabel(str(sec_name) if sec_name else "None"))
+                    layout.addRow("Database ID:", QLabel(str(db_id)))
+                else:
+                    layout.addRow("Status:", QLabel("Virtual Container (Not explicitly tracked in DB)"))
+        except Exception as e:
+            layout.addRow("Error:", QLabel(str(e)))
+                
+        btn_close = QPushButton("Close")
+        btn_close.clicked.connect(dlg.accept)
+        layout.addRow("", btn_close)
+        
+        dlg.exec()
 
     def link_specific_path(self, item):
         v_path = item.data(Qt.UserRole)
@@ -1345,14 +1650,20 @@ class NexusTagLibraryDialog(QDialog):
         parts = [p for p in v_path.strip('/').split('/')]
         name = parts[-1]
         parent_path = "/" + "/".join(parts[:-1]) + "/" if len(parts) > 1 else "/"
-        
+ 
         if not force_real:
             if self.main_app:
                 if is_folder: self.main_app.nav_to_path(v_path)
                 else:
                     self.main_app.nav_to_path(parent_path)
                     self.main_app.local_filter.setText(name)
-                self.close()
+                
+                # Bring the main window to the front so the user sees the jump
+                self.main_app.raise_()
+                self.main_app.activateWindow()
+                
+            # Hide the tag library instead of destroying it
+            self.hide() 
             return
             
         real_abs_path = None
@@ -1536,51 +1847,116 @@ class TimelineDiaryDialog(QDialog):
             html += "</ul>"
         self.diary_browser.setHtml(html)
 
+
+
 class SpaceAnalyzerDialog(QDialog):
     def __init__(self, db_path, parent=None):
         super().__init__(parent)
         self.db_path = db_path
-        self.setWindowTitle("Advanced Space & Junk Analyzer")
-        self.resize(1000, 600)
+        self.scan_roots = ["/"] 
+        self.setWindowTitle("Advanced Space & Integrity Analyzer")
+        
+        # --- Increased width to 1350 to perfectly fit all 9 columns ---
+        self.resize(1350, 700) 
+        self.setMinimumSize(1100, 500)
+        # ----------------------------------------------------------------------
+        
         layout = QVBoxLayout(self)
+
+
         
-        # Enhanced Table with Modified Date
-        self.table = QTableWidget(0, 6)
-        self.table.setHorizontalHeaderLabels(["Select", "Type", "Name / Location", "Size", "Modified Date", "ID"])
-        self.table.setColumnWidth(0, 50); self.table.setColumnWidth(1, 130); self.table.setColumnWidth(2, 400); self.table.setColumnWidth(3, 100); self.table.setColumnWidth(4, 150); self.table.setColumnHidden(5, True)
+        folder_lay = QHBoxLayout()
+        self.lbl_path = QLabel(f"<b>Scanning:</b> {', '.join(self.scan_roots)}")
+        self.lbl_path.setWordWrap(True)
+        btn_choose = QPushButton("📂 Set Scan Folders")
+        btn_choose.clicked.connect(self.select_scan_folder)
+        folder_lay.addWidget(self.lbl_path, stretch=1)
+        folder_lay.addWidget(btn_choose)
+        layout.addLayout(folder_lay)
+        
+        # Setup Table (Now 9 Columns)
+        self.table = QTableWidget(0, 9)
+        self.table.setHorizontalHeaderLabels(["Select", "Type", "Name", "Location", "Ext", "Size", "Modified Date", "SHA-256", "ID"])
+        self.table.setSortingEnabled(True) 
+        
+        self.table.setColumnWidth(0, 50)   # Select
+        self.table.setColumnWidth(1, 140)  # Type
+        self.table.setColumnWidth(2, 220)  # Name
+        self.table.setColumnWidth(3, 260)  # Location
+        self.table.setColumnWidth(4, 70)   # Ext
+        self.table.setColumnWidth(5, 90)   # Size
+        self.table.setColumnWidth(6, 140)  # Modified
+        self.table.setColumnWidth(7, 240)  # Hash
+        self.table.setColumnHidden(8, True)# ID
+        
         self.table.verticalHeader().setVisible(False)
-        
-        # Full Drag & Shift+Click Support
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         layout.addWidget(self.table)
         
-        # Toolbar
-        btn_lay = QHBoxLayout()
+        sel_lay = QHBoxLayout()
         self.btn_select_all = QPushButton("☑ Check All")
         self.btn_select_all.clicked.connect(self.toggle_select_all)
-        
         self.btn_check_hl = QPushButton("✓ Check Highlighted")
         self.btn_check_hl.clicked.connect(lambda: self.set_highlighted_state(Qt.Checked))
-        
         self.btn_uncheck_hl = QPushButton("✗ Uncheck Highlighted")
         self.btn_uncheck_hl.clicked.connect(lambda: self.set_highlighted_state(Qt.Unchecked))
-
-        self.btn_refresh = QPushButton("🔄 Scan Database")
-        self.btn_refresh.clicked.connect(self.scan)
         
-        self.btn_delete = QPushButton("🗑️ Delete Checked Items")
+        self.btn_mark_safe = QPushButton("🛡️ Mark Safe (Ignore)")
+        self.btn_mark_safe.setStyleSheet("color: #3fb950; font-weight: bold;")
+        self.btn_mark_safe.clicked.connect(lambda: self.update_safety_status(True))
+        
+        self.btn_unmark_safe = QPushButton("❌ Unmark Safe")
+        self.btn_unmark_safe.setStyleSheet("color: #e3b341;")
+        self.btn_unmark_safe.clicked.connect(lambda: self.update_safety_status(False))
+
+        sel_lay.addWidget(self.btn_select_all)
+        sel_lay.addWidget(self.btn_check_hl)
+        sel_lay.addWidget(self.btn_uncheck_hl)
+        sel_lay.addStretch()
+        sel_lay.addWidget(self.btn_mark_safe)
+        sel_lay.addWidget(self.btn_unmark_safe)
+        layout.addLayout(sel_lay)
+
+        scan_lay = QHBoxLayout()
+        self.btn_refresh = QPushButton("🔄 Scan Junk")
+        self.btn_refresh.clicked.connect(self.scan)
+        self.btn_scan_hash = QPushButton("🧬 Exact Duplicates")
+        self.btn_scan_hash.clicked.connect(self.scan_hash_duplicates)
+        self.btn_scan_corrupt = QPushButton("⚠️ Scan Corrupted")
+        self.btn_scan_corrupt.setStyleSheet("color: #e3b341; font-weight: bold;")
+        self.btn_scan_corrupt.clicked.connect(self.scan_corrupt_files)
+        
+        self.btn_view_safe = QPushButton("👁️ View Safe Files")
+        self.btn_view_safe.clicked.connect(self.view_safe_files)
+        
+        self.btn_delete = QPushButton("🗑️ Delete Checked")
         self.btn_delete.setStyleSheet("background-color: #8b0000; font-weight: bold; color: white;")
         self.btn_delete.clicked.connect(self.delete_selected)
         
-        btn_lay.addWidget(self.btn_select_all)
-        btn_lay.addWidget(self.btn_check_hl)
-        btn_lay.addWidget(self.btn_uncheck_hl)
-        btn_lay.addStretch()
-        btn_lay.addWidget(self.btn_refresh)
-        btn_lay.addWidget(self.btn_delete)
-        layout.addLayout(btn_lay)
-        self.scan()
+        scan_lay.addWidget(self.btn_refresh)
+        scan_lay.addWidget(self.btn_scan_hash)
+        scan_lay.addWidget(self.btn_scan_corrupt)
+        scan_lay.addStretch()
+        scan_lay.addWidget(self.btn_view_safe)
+        scan_lay.addWidget(self.btn_delete)
+        layout.addLayout(scan_lay)
+
+    def select_scan_folder(self):
+        current_str = ", ".join(self.scan_roots)
+        path_str, ok = QInputDialog.getText(self, "Select Folders", "Enter Virtual Paths (comma separated):", QLineEdit.Normal, current_str)
+        if ok and path_str.strip():
+            raw_paths = [p.strip() for p in path_str.split(',')]
+            clean_paths = []
+            for p in raw_paths:
+                if not p: continue
+                if not p.endswith('/'): p += '/'
+                if not p.startswith('/'): p = '/' + p
+                clean_paths.append(p)
+            
+            if clean_paths:
+                self.scan_roots = clean_paths
+                self.lbl_path.setText(f"<b>Scanning:</b> {', '.join(self.scan_roots)}")
 
     def toggle_select_all(self):
         self.select_all_state = not getattr(self, 'select_all_state', False)
@@ -1594,43 +1970,159 @@ class SpaceAnalyzerDialog(QDialog):
             item = self.table.item(r, 0)
             if item: item.setCheckState(state)
 
+    def update_safety_status(self, is_safe):
+        rows_to_remove = []
+        ids_to_update = []
+        for r in range(self.table.rowCount()):
+            # ID is now at index 8
+            if self.table.item(r, 0).checkState() == Qt.Checked:
+                rows_to_remove.append(r)
+                ids_to_update.append(int(self.table.item(r, 8).text()))
+                
+        if not ids_to_update: return
+        
+        val = 1 if is_safe else 0
+        with sqlite3.connect(self.db_path) as conn:
+            conn.cursor().executemany("UPDATE virtual_fs SET hash_verified=? WHERE id=?", [(val, i) for i in ids_to_update])
+            conn.commit()
+            
+        for r in sorted(rows_to_remove, reverse=True):
+            self.table.removeRow(r)
+            
+        action = "Marked Safe" if is_safe else "Unmarked Safe"
+        QMessageBox.information(self, action, f"{len(ids_to_update)} items updated.")
+
+    def get_path_conditions(self):
+        cond = " OR ".join(["parent_path LIKE ?"] * len(self.scan_roots))
+        params = tuple(f"{p}%" for p in self.scan_roots)
+        return cond, params
+
+    def view_safe_files(self):
+        self.table.setSortingEnabled(False)
+        self.table.setRowCount(0)
+        cond, params = self.get_path_conditions()
+        
+        with sqlite3.connect(self.db_path) as conn:
+            cur = conn.cursor()
+            cur.execute(f"SELECT id, name, parent_path, extension, size, modified, sha256 FROM virtual_fs WHERE hash_verified=1 AND ({cond})", params)
+            files = cur.fetchall()
+            for f in files:
+                self._add_row_with_state("🛡️ Verified Safe", f[1], f[2], f[3] or "", f[4] or 0, f[5], f[6] or "", f[0], Qt.Unchecked)
+        
+        self.table.setSortingEnabled(True)
+        if self.table.rowCount() == 0: QMessageBox.information(self, "Result", "No files are currently marked as safe in these locations.")
+
     def scan(self):
-        self.table.setRowCount(0); self.btn_refresh.setEnabled(False); self.btn_delete.setEnabled(False)
-        self.scanner = SpaceScannerThread(self.db_path, self)
+        self.table.setSortingEnabled(False)
+        self.table.setRowCount(0)
+        self.btn_refresh.setEnabled(False)
+        
+        self.scanner = SpaceScannerThread(self.db_path, self.scan_roots, self)
         self.scanner.found.connect(self._add_row)
-        self.prog_dlg = QProgressDialog("Scanning Database for Junk...", "Cancel", 0, 100, self)
+        
+        self.prog_dlg = QProgressDialog(f"Scanning directories...", "Cancel", 0, 100, self)
         self.prog_dlg.setWindowModality(Qt.WindowModal)
         self.scanner.progress.connect(lambda v, t, txt: (self.prog_dlg.setValue(v), self.prog_dlg.setLabelText(txt)))
         self.prog_dlg.canceled.connect(self.scanner.cancel)
-        self.scanner.finished_scan.connect(lambda: (self.prog_dlg.close(), self.btn_refresh.setEnabled(True), self.btn_delete.setEnabled(True)))
+        self.scanner.finished_scan.connect(self.on_scan_finished)
         self.scanner.start()
         self.prog_dlg.show()
 
-    def _add_row(self, typ, desc, size, modified, db_id):
+    def on_scan_finished(self):
+        self.prog_dlg.close()
+        self.btn_refresh.setEnabled(True)
+        self.table.setSortingEnabled(True)
+
+    def scan_hash_duplicates(self):
+        self.table.setSortingEnabled(False)
+        self.table.setRowCount(0)
+        cond, params = self.get_path_conditions()
+        
+        with sqlite3.connect(self.db_path) as conn:
+            cur = conn.cursor()
+            cur.execute(f"SELECT sha256, COUNT(*) as c FROM virtual_fs WHERE is_folder=0 AND in_trash=0 AND ({cond}) AND sha256 IS NOT NULL AND sha256 != '' GROUP BY sha256 HAVING c > 1", params)
+            duplicates = cur.fetchall()
+            for sha, count in duplicates:
+                cur.execute(f"SELECT id, name, parent_path, extension, size, modified FROM virtual_fs WHERE sha256=? AND ({cond}) AND is_folder=0 AND in_trash=0", (sha,) + params)
+                files = cur.fetchall()
+                for idx, f in enumerate(files):
+                    chk_state = Qt.Checked if idx > 0 else Qt.Unchecked
+                    self._add_row_with_state("Exact Duplicate", f[1], f[2], f[3] or "", f[4] or 0, f[5], sha, f[0], chk_state)
+        self.table.setSortingEnabled(True)
+        if self.table.rowCount() == 0: QMessageBox.information(self, "Result", "No exact SHA-256 duplicates found.")
+
+    def scan_corrupt_files(self):
+        self.table.setSortingEnabled(False)
+        self.table.setRowCount(0)
+        cond, params = self.get_path_conditions()
+        
+        with sqlite3.connect(self.db_path) as conn:
+            cur = conn.cursor()
+            cur.execute(f"""
+                SELECT name, size FROM virtual_fs 
+                WHERE is_folder=0 AND in_trash=0 AND ({cond}) AND sha256 IS NOT NULL AND sha256 != '' AND hash_verified=0
+                GROUP BY name, size HAVING COUNT(DISTINCT sha256) > 1
+            """, params)
+            combos = cur.fetchall()
+            for name, size in combos:
+                cur.execute(f"SELECT id, name, parent_path, extension, modified, sha256 FROM virtual_fs WHERE name=? AND size=? AND ({cond}) AND is_folder=0 AND in_trash=0 AND sha256 IS NOT NULL AND hash_verified=0", (name, size) + params)
+                files = cur.fetchall()
+                for f in files:
+                    self._add_row_with_state("⚠️ Corruption Risk", f[1], f[2], f[3] or "", size, f[4], f[5] or "", f[0], Qt.Unchecked)
+        self.table.setSortingEnabled(True)
+        if self.table.rowCount() == 0: QMessageBox.information(self, "Result", "No corrupted files found based on hash conflicts.")
+
+    def _add_row(self, typ, name, location, ext, size, modified, sha256, db_id):
+        self._add_row_with_state(typ, name, location, ext, size, modified, sha256, db_id, Qt.Unchecked)
+
+    def _add_row_with_state(self, typ, name, location, ext, size, modified, sha256, db_id, chk_state):
         row = self.table.rowCount()
         self.table.insertRow(row)
+        
         chk = QTableWidgetItem()
-        chk.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled); chk.setCheckState(Qt.Unchecked)
+        chk.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
+        chk.setCheckState(chk_state)
+        
+        type_item = QTableWidgetItem(typ)
+        name_item = QTableWidgetItem(name)
+        loc_item = QTableWidgetItem(location)
+        ext_item = QTableWidgetItem(ext)
+        
+        # Leverage the custom sorting class here!
+        size_item = SizeTableWidgetItem(size or 0)
+        
+        date_item = QTableWidgetItem(str(modified))
+        hash_item = QTableWidgetItem(str(sha256))
+        id_item = QTableWidgetItem(str(db_id))
+
         self.table.setItem(row, 0, chk)
-        self.table.setItem(row, 1, QTableWidgetItem(typ))
-        self.table.setItem(row, 2, QTableWidgetItem(desc))
-        
-        size_item = QTableWidgetItem(human_size(size))
-        size_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        self.table.setItem(row, 3, size_item)
-        
-        self.table.setItem(row, 4, QTableWidgetItem(str(modified)))
-        self.table.setItem(row, 5, QTableWidgetItem(str(db_id)))
+        self.table.setItem(row, 1, type_item)
+        self.table.setItem(row, 2, name_item)
+        self.table.setItem(row, 3, loc_item)
+        self.table.setItem(row, 4, ext_item)
+        self.table.setItem(row, 5, size_item)
+        self.table.setItem(row, 6, date_item)
+        self.table.setItem(row, 7, hash_item)
+        self.table.setItem(row, 8, id_item)
 
     def delete_selected(self):
-        ids_to_delete = [int(self.table.item(r, 5).text()) for r in range(self.table.rowCount()) if self.table.item(r, 0).checkState() == Qt.Checked]
-        if not ids_to_delete: return
-        if QMessageBox.question(self, "Confirm", f"Permanently delete {len(ids_to_delete)} flagged items from Nexus DB?", QMessageBox.Yes | QMessageBox.No) == QMessageBox.Yes:
+        # ID is at index 8
+        ids = [int(self.table.item(r, 8).text()) for r in range(self.table.rowCount()) if self.table.item(r, 0).checkState() == Qt.Checked]
+        if not ids: return
+        if QMessageBox.question(self, "Confirm", f"Permanently delete {len(ids)} flagged items?", QMessageBox.Yes | QMessageBox.No) == QMessageBox.Yes:
             with sqlite3.connect(self.db_path) as conn:
-                conn.cursor().executemany("DELETE FROM virtual_fs WHERE id=?", [(i,) for i in ids_to_delete])
+                conn.cursor().executemany("DELETE FROM virtual_fs WHERE id=?", [(i,) for i in ids])
                 conn.commit()
-            if self.parent(): self.parent().clear_cache(); self.parent().refresh_all()
-            self.scan(); QMessageBox.information(self, "Success", "Items deleted successfully.")
+            if self.parent(): 
+                self.parent().clear_cache()
+                self.parent().refresh_all()
+            
+            rows_to_remove = [r for r in range(self.table.rowCount()) if self.table.item(r, 0).checkState() == Qt.Checked]
+            for r in sorted(rows_to_remove, reverse=True):
+                self.table.removeRow(r)
+                
+            QMessageBox.information(self, "Success", "Items deleted.")
+
 
 class BulkDeleterDialog(QDialog):
     def __init__(self, db_path, parent=None):
@@ -1780,6 +2272,13 @@ class NexusVirtualManager(QMainWindow):
         self.current_prefix = "/"
         self.active_db_path = str(DB_FILE)
         
+        # --- Persistent Storage Settings ---
+        self.settings = QSettings("NexusOS", "VirtualManager")
+        self.max_storage_gb = float(self.settings.value("max_storage_gb", 100.0))
+        self.max_virtual_storage = self.max_storage_gb * 1024 * 1024 * 1024
+        # ----------------------------------------
+
+        
         self.history_back, self.history_forward = [], []
         self.v_clipboard = {"action": None, "items": []}
         self._current_drag_items, self._icon_cache, self._workers = [], {}, []
@@ -1849,7 +2348,14 @@ class NexusVirtualManager(QMainWindow):
         act_load_ext.triggered.connect(self.load_external_db)
         
         act_csv_lib = QAction("📚 Tag Library", self)
-        act_csv_lib.triggered.connect(lambda: NexusTagLibraryDialog(self.active_db_path, self).exec())
+        act_csv_lib.triggered.connect(self.open_tag_library)
+
+        act_set_storage = QAction("💾 Set Storage", self)
+        act_set_storage.triggered.connect(self.set_storage_capacity)
+        
+        act_select_all = QAction("☑ Select All", self)
+        act_select_all.triggered.connect(self.cmd_select_all)
+        act_select_all.setShortcut("Ctrl+A")
         
         self.act_view_mode = QAction("🖼 Grid View", self)
         self.act_view_mode.triggered.connect(self.toggle_view_mode)
@@ -1874,8 +2380,11 @@ class NexusVirtualManager(QMainWindow):
         
         tb.addActions([act_timeline, act_analyzer, act_bulk_del, act_load_ext, act_csv_lib])
         tb.addSeparator()
+ 
+        tb.addActions([act_timeline, act_analyzer, act_bulk_del, act_load_ext, act_csv_lib, act_set_storage])
+        tb.addSeparator()
         
-        tb.addActions([self.act_view_mode, self.act_toggle_sidebar, act_toggle_log])
+        tb.addActions([self.act_view_mode, act_select_all, self.act_toggle_sidebar, act_toggle_log])
         
         empty = QWidget()
         empty.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
@@ -1957,7 +2466,9 @@ class NexusVirtualManager(QMainWindow):
         self.folder_tree = InternalTreeWidget()
         self.folder_tree.setHeaderHidden(True)
         self.folder_tree.itemExpanded.connect(self.on_folder_expand)
-        self.folder_tree.itemClicked.connect(self.on_tree_click)
+        self.folder_tree.itemClicked.connect(self.on_tree_click)    
+        self.folder_tree.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.folder_tree.customContextMenuRequested.connect(self.on_tree_context_menu)     
         self.tree_dock.setWidget(self.folder_tree)
         self.addDockWidget(Qt.LeftDockWidgetArea, self.tree_dock)
 
@@ -2008,22 +2519,34 @@ class NexusVirtualManager(QMainWindow):
         props_container = QWidget()
         ed_layout = QFormLayout(props_container)
         self.ed_name = QLineEdit()
+        
+        self.ed_v_path = QLineEdit()
+        self.ed_v_path.setReadOnly(True)
+        
         self.ed_target = QLineEdit()
         self.ed_target.setReadOnly(True)
         self.ed_custom_tags = QLineEdit()
         self.ed_custom_tags.setPlaceholderText("tag1, tag2")
         self.ed_secondary = QLineEdit()
+        
+        self.ed_sha = QLineEdit()
+        self.ed_sha.setReadOnly(True)
+        self.ed_sha.setPlaceholderText("Not Computed")
+        
         self.ed_tag = QComboBox()
         self.ed_tag.addItems(["None", "Red", "Green", "Blue", "Gold"])
         self.btn_save_ed = QPushButton("Apply Properties")
         self.btn_save_ed.clicked.connect(self.save_properties_editor)
-        self.btn_calc_hash = QPushButton("Compute SHA-256")
+        self.btn_calc_hash = QPushButton("Compute & Store SHA-256")
         self.btn_calc_hash.clicked.connect(self.compute_checksum)
+        
         ed_layout.addRow("Name:", self.ed_name)
         ed_layout.addRow("Sec Name:", self.ed_secondary)
+        ed_layout.addRow("Virtual Path:", self.ed_v_path)
         ed_layout.addRow("Target:", self.ed_target)
         ed_layout.addRow("Labels:", self.ed_custom_tags)
         ed_layout.addRow("Color:", self.ed_tag)
+        ed_layout.addRow("SHA-256:", self.ed_sha)
         ed_layout.addRow("", self.btn_save_ed)
         ed_layout.addRow("", self.btn_calc_hash)
         self.right_tabs.addTab(props_container, "Properties")
@@ -2068,6 +2591,8 @@ class NexusVirtualManager(QMainWindow):
         self.setStatusBar(self.status)
 
     def _setup_shortcuts(self):
+        QShortcut(QKeySequence("Shift+Delete"), self, self.cmd_delete_permanent)
+        QShortcut(QKeySequence("Ctrl+H"), self, self.toggle_hidden_files)
         QShortcut(QKeySequence("Ctrl+C"), self, self.cmd_copy); QShortcut(QKeySequence("Ctrl+X"), self, self.cmd_cut)
         QShortcut(QKeySequence("Ctrl+V"), self, self.cmd_paste); QShortcut(QKeySequence("Delete"), self, self.cmd_delete)
         QShortcut(QKeySequence("F2"), self, self.cmd_rename); QShortcut(QKeySequence("Ctrl+Shift+N"), self, self.create_folder)
@@ -2211,8 +2736,9 @@ class NexusVirtualManager(QMainWindow):
         self.loader_thread.data_ready.connect(lambda f, fl: self._start_ui_render(f, fl, cached=False))
         self.loader_thread.start()
 
-    def _start_ui_render(self, folders, files, cached=False):
-        if not cached: self.view_cache[self.current_prefix] = (folders, files) 
+    def _start_ui_render(self, folders, files, cached=False, is_search=False):
+        # Prevent search results from overwriting the folder cache!
+        if not cached and not is_search: self.view_cache[self.current_prefix] = (folders, files) 
         self.render_queue = folders + files; total = len(self.render_queue); self.table_rows_buffer = []
         
         if total > CHUNK_SIZE:
@@ -2223,12 +2749,31 @@ class NexusVirtualManager(QMainWindow):
         self.file_table.setUpdatesEnabled(False); self.file_grid.setUpdatesEnabled(False)
         self.render_timer.start(1) 
 
+    def run_global_search(self):
+        term = self.search_box.text().strip()
+        if not term: 
+            return self.load_directory(self.current_prefix)
+        cur = self.db.conn.cursor()
+        cur.execute(f"SELECT id, name, size, extension, real_path, modified, color_tag, secondary_name, is_hidden FROM virtual_fs WHERE (name LIKE ? OR secondary_name LIKE ? OR custom_tags LIKE ?) AND is_folder=0 AND in_trash=0", (f"%{term}%", f"%{term}%", f"%{term}%"))
+        # Pass is_search=True to protect the cache
+        self._start_ui_render([], cur.fetchall(), cached=False, is_search=True) 
+        self.sys_log(f"Global Search executed for: {term}")
+
     def _render_chunk(self):
         if not self.render_queue:
             self.render_timer.stop()
-            shared_model = NexusTableModel(["Name", "Size", "Type", "Location", "Tag"], self.table_rows_buffer)
+            # UPDATED: Expanded to 7 highly detailed columns
+            shared_model = NexusTableModel(["Name", "Ext", "Size", "Modified", "Type", "Location", "Tag"], self.table_rows_buffer)
             self.file_table.setModel(shared_model); self.file_grid.setModel(shared_model)
-            self.file_table.setColumnWidth(0, 350); self.file_table.setColumnWidth(1, 100); self.file_table.setColumnWidth(2, 100); self.file_table.setColumnWidth(3, 400)
+            
+            # Adjusted column widths for the new data
+            self.file_table.setColumnWidth(0, 260) # Name
+            self.file_table.setColumnWidth(1, 60)  # Ext
+            self.file_table.setColumnWidth(2, 90)  # Size
+            self.file_table.setColumnWidth(3, 140) # Modified
+            self.file_table.setColumnWidth(4, 120) # Type
+            self.file_table.setColumnWidth(5, 350) # Location
+            
             self.file_table.setUpdatesEnabled(True); self.file_grid.setUpdatesEnabled(True)
             if self.render_progress: self.render_progress.close()
             self.status.showMessage("Rendering complete.", 3000); self.update_statistics()
@@ -2243,22 +2788,18 @@ class NexusVirtualManager(QMainWindow):
             if len(item) == 8:
                 db_id, pp, f_name, c_tag, sec_n, is_h, count, size = item
                 v_path = f"{pp}{f_name}/" if not f_name.endswith("/") else f"{pp}{f_name}"
-                disp_name = f"{f_name}\n({count} items, {human_size(size)})" if count > 0 else f"{f_name}"
-                self.table_rows_buffer.append({"display": [disp_name, human_size(size), f"Virtual Folder ({count})", pp, c_tag], "sort_keys": [(0, f_name.lower()), (0, size), (0, count), (0, pp.lower()), (0, c_tag)], "user_data": ("folder", v_path, db_id), "color_tag": c_tag, "is_hidden": is_h, "icon": dir_icon})
+                disp_name = f"{f_name}\n({sec_n})" if sec_n else f"{f_name}"
+                # UPDATED: Added blank Ext/Date mapping for folders
+                self.table_rows_buffer.append({"display": [disp_name, "", human_size(size), "N/A", f"Virtual Folder ({count})", pp, c_tag], "sort_keys": [(0, f_name.lower()), (0, ""), (0, size), (0, ""), (0, count), (0, pp.lower()), (0, c_tag)], "user_data": ("folder", v_path, db_id), "color_tag": c_tag, "is_hidden": is_h, "icon": dir_icon})
             else:
                 db_id, n, s, ext, rp, mod, c_tag, sec_n, is_h = item[:9]
-                icon = self._get_native_icon(rp, False, ext); s_val = s if s else 0; ext_str = str(ext) if ext else "file"
+                icon = self._get_native_icon(rp, False, ext); s_val = s if s else 0; ext_str = str(ext) if ext else ""
                 disp_name = f"{n}\n({sec_n})" if sec_n else str(n)
-                self.table_rows_buffer.append({"display": [disp_name, human_size(s_val), ext_str, str(rp) if rp else "", c_tag], "sort_keys": [(1, str(n).lower()), (1, s_val), (1, ext_str.lower()), (1, str(rp).lower() if rp else ""), (1, c_tag)], "user_data": ("file", str(rp), db_id), "color_tag": c_tag, "is_hidden": is_h, "icon": icon})
+                # UPDATED: Injected precise Ext and Date strings
+                self.table_rows_buffer.append({"display": [disp_name, ext_str, human_size(s_val), str(mod), "Virtual File", str(rp) if rp else "", c_tag], "sort_keys": [(1, str(n).lower()), (1, ext_str.lower()), (1, s_val), (1, str(mod)), (1, "Virtual File"), (1, str(rp).lower() if rp else ""), (1, c_tag)], "user_data": ("file", str(rp), db_id), "color_tag": c_tag, "is_hidden": is_h, "icon": icon})
 
         if self.render_progress: self.render_progress.setValue(self.render_progress.maximum() - len(self.render_queue))
 
-    def run_global_search(self):
-        term = self.search_box.text().strip()
-        if not term: return self.load_directory(self.current_prefix)
-        cur = self.db.conn.cursor()
-        cur.execute(f"SELECT id, name, size, extension, real_path, modified, color_tag, secondary_name, is_hidden FROM virtual_fs WHERE (name LIKE ? OR secondary_name LIKE ? OR custom_tags LIKE ?) AND is_folder=0 AND in_trash=0", (f"%{term}%", f"%{term}%", f"%{term}%"))
-        self._start_ui_render([], cur.fetchall(), cached=False); self.sys_log(f"Global Search executed for: {term}")
 
     def _trigger_preview(self, typ, path, db_id, name):
         if db_id == -1: return 
@@ -2266,14 +2807,24 @@ class NexusVirtualManager(QMainWindow):
         if HAS_MULTIMEDIA and hasattr(self, 'player'): self.player.stop()
         self.preview_image.clear(); self.preview_text.clear()
         
+        row = self.db.conn.cursor().execute("SELECT real_path, size, extension, modified, secondary_name, custom_tags, sha256 FROM virtual_fs WHERE id = ?", (db_id,)).fetchone()
+        if not row: return
+        real_path, size, ext, mod, sec_n, custom_tags, sha256_val = row
+        
+        self.ed_v_path.setText(path) # -> FIXED: Virtual path is now populated!
+        self.ed_secondary.setText(str(sec_n) if sec_n else "")
+        self.ed_custom_tags.setText(str(custom_tags) if custom_tags else "")
+        self.ed_sha.setText(str(sha256_val) if sha256_val else "")
+        
         if typ == "folder": 
-            self.preview_stack.setCurrentIndex(1); self.ed_target.setText(f"Virtual Container: {path}"); self.preview_text.setPlainText(f"Directory Data:\n{path}")
+            self.preview_stack.setCurrentIndex(1)
+            self.ed_target.setText(f"Virtual Container: {path}")
+            self.preview_text.setPlainText(f"Directory Data:\n{path}")
+            self.btn_calc_hash.setEnabled(False)
             return
             
-        row = self.db.conn.cursor().execute("SELECT real_path, size, extension, modified, secondary_name, custom_tags FROM virtual_fs WHERE id = ?", (db_id,)).fetchone()
-        if not row: return
-        real_path, size, ext, mod, sec_n, custom_tags = row
-        self.ed_target.setText(real_path); ext = str(ext).lower(); self.ed_secondary.setText(str(sec_n) if sec_n else ""); self.ed_custom_tags.setText(str(custom_tags) if custom_tags else "")
+        self.btn_calc_hash.setEnabled(True)
+        self.ed_target.setText(real_path); ext = str(ext).lower()
         
         if real_path and os.path.exists(real_path):
             if ext in [".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp"]:
@@ -2328,10 +2879,24 @@ class NexusVirtualManager(QMainWindow):
 
     def compute_checksum(self):
         rp = self.ed_target.text()
+        db_id = self.btn_save_ed.property("db_id")
         if not rp or not os.path.exists(rp) or os.path.isdir(rp): return QMessageBox.warning(self, "Error", "Invalid or missing physical file.")
-        self.status.showMessage("Computing SHA-256 Hash..."); calc = HashCalculator(rp, self)
-        calc.finished.connect(lambda h: (self.sys_log(f"Calculated Hash for {os.path.basename(rp)}: {h}"), QMessageBox.information(self, "SHA-256 Checksum", f"File: {os.path.basename(rp)}\n\nHash:\n{h}")))
+        self.status.showMessage("Computing SHA-256 Hash...")
+        
+        calc = HashCalculator(rp, self)
+        calc.finished.connect(lambda h: self._on_hash_computed(h, db_id, rp))
         self._register_worker(calc); calc.start()
+
+    def _on_hash_computed(self, h, db_id, rp):
+        if db_id and db_id != -1:
+            with sqlite3.connect(self.db.path) as conn:
+                conn.cursor().execute("UPDATE virtual_fs SET sha256=? WHERE id=?", (h, db_id))
+                conn.commit()
+            self.ed_sha.setText(h)
+            self.clear_cache() # Clear cache so properties menus reflect the new hash
+            
+        self.sys_log(f"Calculated and saved Hash for {os.path.basename(rp)}: {h}")
+        QMessageBox.information(self, "SHA-256 Checksum", f"File: {os.path.basename(rp)}\n\nHash:\n{h}\n\n(Saved to Database)")
 
     # ---------- Operations & Integrations ----------
     def open_selected(self):
@@ -2380,18 +2945,48 @@ class NexusVirtualManager(QMainWindow):
 
     def show_properties(self, typ, path, db_id):
         cur = self.db.conn.cursor()
-        dlg = QDialog(self); dlg.setWindowTitle("Nexus Entity Properties"); dlg.setMinimumWidth(400); dlg.setStyleSheet(THEMES.get(self.theme_combo.currentText(), THEMES["Dark Nexus"]))
+        dlg = QDialog(self); dlg.setWindowTitle("Nexus Entity Properties"); dlg.setMinimumWidth(450); dlg.setStyleSheet(THEMES.get(self.theme_combo.currentText(), THEMES["Dark Nexus"]))
         layout = QFormLayout(dlg)
         
         if typ == "folder":
+            r = cur.execute("SELECT name, secondary_name, custom_tags, color_tag, real_path FROM virtual_fs WHERE id = ?", (db_id,)).fetchone()
             cnt, sz = cur.execute(f"SELECT COUNT(id), SUM(size) FROM virtual_fs WHERE parent_path LIKE ? AND is_folder=0", (f"{path}%",)).fetchone()
-            layout.addRow("Type:", QLabel("Virtual Folder")); layout.addRow("Location:", QLabel(path)); layout.addRow("Total Items:", QLabel(str(cnt or 0))); layout.addRow("Total Size:", QLabel(human_size(sz or 0)))
+            
+            if r:
+                n, sec_n, tags, color, real_p = r
+                layout.addRow("Folder Name:", QLabel(n))
+                layout.addRow("Secondary Name:", QLabel(sec_n if sec_n else "None"))
+                layout.addRow("Virtual Path:", QLineEdit(path))
+                
+                txt_real = QLineEdit(real_p if real_p else "Disconnected / Virtual Only")
+                txt_real.setReadOnly(True)
+                layout.addRow("Local Target:", txt_real)
+                
+                layout.addRow("Total Items:", QLabel(str(cnt or 0)))
+                layout.addRow("Total Size:", QLabel(human_size(sz or 0)))
+                layout.addRow("Custom Tags:", QLabel(tags if tags else "None"))
+                layout.addRow("Color Tag:", QLabel(color if color else "None"))
+            else:
+                layout.addRow("Location:", QLabel(path)); layout.addRow("Total Items:", QLabel(str(cnt or 0))); layout.addRow("Total Size:", QLabel(human_size(sz or 0)))
         else:
-            r = cur.execute("SELECT name, size, extension, modified, real_path, sha256, custom_tags FROM virtual_fs WHERE id = ?", (db_id,)).fetchone()
+            r = cur.execute("SELECT name, size, extension, modified, real_path, sha256, custom_tags, secondary_name FROM virtual_fs WHERE id = ?", (db_id,)).fetchone()
             if not r: return
-            n, s, e, m, fp, sha, tags = r
-            layout.addRow("File Name:", QLabel(n)); layout.addRow("Virtual Path:", QLabel(path)); layout.addRow("Local Target:", QLabel(fp if fp else "Disconnected")); layout.addRow("Size:", QLabel(human_size(s))); layout.addRow("Extension:", QLabel(e)); layout.addRow("Modified:", QLabel(m)); layout.addRow("Custom Tags:", QLabel(tags if tags else "None"))
-            if sha: layout.addRow("SHA-256:", QLineEdit(sha)) 
+            n, s, e, m, fp, sha, tags, sec_n = r
+            
+            layout.addRow("File Name:", QLabel(n))
+            layout.addRow("Secondary Name:", QLabel(sec_n if sec_n else "None"))
+            layout.addRow("Virtual Path:", QLineEdit(path))
+            
+            txt_real = QLineEdit(fp if fp else "Disconnected")
+            txt_real.setReadOnly(True)
+            layout.addRow("Local Target:", txt_real)
+            
+            layout.addRow("Size:", QLabel(human_size(s)))
+            layout.addRow("Extension:", QLabel(e))
+            layout.addRow("Modified:", QLabel(m))
+            layout.addRow("Custom Tags:", QLabel(tags if tags else "None"))
+            layout.addRow("SHA-256:", QLineEdit(sha if sha else "Not Computed"))
+            
         dlg.exec()
 
     def export_virtual_to_os(self):
@@ -2416,13 +3011,36 @@ class NexusVirtualManager(QMainWindow):
         self._register_worker(self.mat_thread); self.mat_thread.start()
 
     def export_csv(self, sel_items):
-        csv_path, _ = QFileDialog.getSaveFileName(self, "Export to CSV", "", "CSV Files (*.csv)")
+        csv_path, _ = QFileDialog.getSaveFileName(self, "Export Rich CSV Manifest", "", "CSV Files (*.csv)")
         if not csv_path: return
         try:
-            with open(csv_path, 'w', newline='', encoding='utf-8') as f:
-                writer = csv.writer(f); writer.writerow(["Type", "Virtual Path", "Database ID", "Real Physical Path"])
-                for typ, path, db_id in sel_items: writer.writerow([typ, path, db_id, path if typ == "file" else ""])
-            QMessageBox.information(self, "Success", "CSV Exported successfully."); self.sys_log(f"Exported selection to CSV: {csv_path}")
+            with sqlite3.connect(self.db.path) as conn:
+                cur = conn.cursor()
+                with open(csv_path, 'w', newline='', encoding='utf-8') as f:
+                    writer = csv.writer(f)
+                    # NEW: Comprehensive Audit Headers
+                    writer.writerow(["Type", "File/Folder Name", "Virtual Path", "Physical OS Path", "Size (Bytes)", "Extension", "Modified Date", "SHA-256 Hash", "Custom Tags", "Color Tag", "Secondary Name"])
+                    
+                    for typ, path_val, db_id in sel_items:
+                        if db_id == -1: continue
+                        
+                        if typ == "file":
+                            cur.execute("SELECT name, parent_path, real_path, size, extension, modified, sha256, custom_tags, color_tag, secondary_name FROM virtual_fs WHERE id=?", (db_id,))
+                            r = cur.fetchone()
+                            if r: writer.writerow(["File", r[0], r[1] + r[0], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9]])
+                        else:
+                            # Log the folder itself
+                            cur.execute("SELECT name, parent_path, modified, custom_tags, color_tag, secondary_name FROM virtual_fs WHERE id=?", (db_id,))
+                            r = cur.fetchone()
+                            if r: writer.writerow(["Folder", r[0], r[1] + r[0] + "/", "N/A (Virtual)", 0, "", r[2], "", r[3], r[4], r[5]])
+                            
+                            # Expand and log ALL contents of the selected folder for a full audit
+                            cur.execute("SELECT name, parent_path, real_path, size, extension, modified, sha256, custom_tags, color_tag, secondary_name FROM virtual_fs WHERE parent_path LIKE ? AND is_folder=0", (f"{path_val}%",))
+                            for r in cur.fetchall():
+                                writer.writerow(["File", r[0], r[1] + r[0], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9]])
+                                
+            QMessageBox.information(self, "Success", "Rich Database Manifest exported successfully.")
+            self.sys_log(f"Exported detailed CSV manifest to: {csv_path}")
         except Exception as e: QMessageBox.warning(self, "Error", str(e))
 
     def _get_selected_items(self):
@@ -2432,6 +3050,14 @@ class NexusVirtualManager(QMainWindow):
 
     def context_menu(self, pos, is_grid=False):
         menu = QMenu(self)
+
+        menu.addAction("☑ Select All (Ctrl+A)", self.cmd_select_all)
+        menu.addSeparator()
+                
+        if self.current_prefix.startswith("trash://"):
+            menu.addAction("🔥 Empty Trash", self.empty_trash)
+            menu.addSeparator()
+            
         if not self._is_smart_path(self.current_prefix) and self.active_db_path == str(DB_FILE) and not self.current_prefix.startswith("trash://"):
             menu.addAction("📂 Create Virtual Folder (Ctrl+Shift+N)", self.create_folder); menu.addAction("📥 Import Real Files", self.import_real_files); menu.addAction("📁 Import Real Folder", self.import_real_folder)
         
@@ -2443,6 +3069,10 @@ class NexusVirtualManager(QMainWindow):
                     menu.addAction("🚀 Open Native System App", lambda: self.open_local_file_system(sel_items[0][2]))
                     menu.addAction("📂 Show in OS Explorer", lambda: self.open_file_location(sel_items[0][2]))
                     menu.addAction("🎞 Open in Nexus Viewer (Ctrl+O)", self.open_selected_nexus)
+                elif sel_items[0][0] == "folder":
+                    # NEW: Option to hash entire folder contents!
+                    menu.addAction("🧬 Compute SHA-256 for all Contents", lambda: self.bulk_compute_hash(sel_items[0][1]))
+
                 menu.addAction("📋 Copy Virtual Path", lambda: QApplication.clipboard().setText(sel_items[0][1]))
                 menu.addAction("🏷 Set Secondary Name", self.cmd_set_secondary_name)
                 res = self.db.conn.cursor().execute("SELECT is_hidden, is_favorite FROM virtual_fs WHERE id=?", (sel_items[0][2],)).fetchone()
@@ -2450,8 +3080,19 @@ class NexusVirtualManager(QMainWindow):
                     menu.addAction("Unhide" if res[0] else "Hide", lambda: self.toggle_item_hidden(sel_items[0][2], not res[0]))
                     menu.addAction("Remove Favorite" if res[1] else "Add Favorite", lambda: self.toggle_item_fav(sel_items[0][2], not res[1]))
             
-            menu.addAction("Copy (Ctrl+C)", self.cmd_copy); menu.addAction("Cut (Ctrl+X)", self.cmd_cut); menu.addAction("Trash (Delete)", self.cmd_delete); menu.addAction("Rename (F2)", self.cmd_rename)
-            menu.addSeparator()
+            menu.addAction("Copy (Ctrl+C)", self.cmd_copy); menu.addAction("Cut (Ctrl+X)", self.cmd_delete) ; menu.addAction("Rename (F2)", self.cmd_rename)
+            
+            if self.current_prefix.startswith("trash://"):
+                menu.addAction("♻️ Restore from Trash", self.restore_from_trash)
+                menu.addAction("🧨 Permanent Delete (Shift+Del)", self.cmd_delete_permanent)
+            else:
+                menu.addAction("🗑️ Trash (Delete)", self.cmd_delete)
+                menu.addAction("🧨 Permanent Delete (Shift+Del)", self.cmd_delete_permanent)
+                
+            
+            menu.addSeparator()         
+            
+            
             if len(sel_items) == 1: menu.addAction("ℹ️ Properties", lambda: self.show_properties(sel_items[0][0], sel_items[0][1], sel_items[0][2])); menu.addSeparator()
                 
             tag_menu = menu.addMenu("🏷 Set Color Tag")
@@ -2512,13 +3153,20 @@ class NexusVirtualManager(QMainWindow):
         is_copy = (self.v_clipboard["action"] == "copy"); self.execute_internal_drop(self.current_prefix, is_copy)
         if not is_copy: self.v_clipboard = {"action": None, "items": []} 
 
-    def cmd_delete(self):
+    def cmd_delete_permanent(self):
+        self.cmd_delete(force_permanent=True)
+
+    def cmd_delete(self, force_permanent=False):
         items = self._get_selected_items()
         if not items: return
         clean_items = [i for i in items if i[2] != -1] 
         if not clean_items: return
-        is_permanent = self.current_prefix.startswith("trash://") or self.active_db_path != str(DB_FILE)
-        if QMessageBox.question(self, "Delete", "Permanently delete from Nexus OS?" if is_permanent else "Move selected to Virtual Trash?", QMessageBox.Yes|QMessageBox.No) != QMessageBox.Yes: return
+        
+        # Now respects Shift+Delete bypassing the Trash
+        is_permanent = force_permanent or self.current_prefix.startswith("trash://") or self.active_db_path != str(DB_FILE)
+        
+        msg = "Permanently delete from Nexus OS? (This cannot be undone!)" if is_permanent else "Move selected items to Virtual Trash?"
+        if QMessageBox.question(self, "Delete", msg, QMessageBox.Yes|QMessageBox.No) != QMessageBox.Yes: return
         
         with sqlite3.connect(self.db.path) as conn:
             cur = conn.cursor()
@@ -2533,7 +3181,18 @@ class NexusVirtualManager(QMainWindow):
                     else: cur.execute("UPDATE virtual_fs SET in_trash = 1 WHERE parent_path LIKE ? OR id = ?", (f"{path}%", db_id))
                 prog.setValue(i+1)
             conn.commit()
-        self.clear_cache(); self.refresh_all(); self.sys_log(f"Deleted {len(clean_items)} items.")
+            
+        self.clear_cache(); self.refresh_all(); self.sys_log(f"{'Permanently deleted' if is_permanent else 'Trashed'} {len(clean_items)} items.")
+
+    def empty_trash(self):
+        if QMessageBox.question(self, "Empty Trash", "Are you sure you want to permanently delete ALL items in the Virtual Trash?\n\nThis cannot be undone.", QMessageBox.Yes | QMessageBox.No) == QMessageBox.Yes:
+            with sqlite3.connect(self.db.path) as conn:
+                conn.cursor().execute("DELETE FROM virtual_fs WHERE in_trash=1")
+                conn.commit()
+            self.clear_cache()
+            self.refresh_all()
+            self.sys_log("Virtual Trash emptied.")
+            QMessageBox.information(self, "Trash Emptied", "All items in the Virtual Trash have been permanently deleted.")
 
     def cmd_rename(self):
         items = self._get_selected_items()
@@ -2682,9 +3341,9 @@ class NexusVirtualManager(QMainWindow):
         self.compiler.error.connect(lambda e: (self.compile_dlg.close(), QMessageBox.critical(self, "Compile Error", e)))
         self._register_worker(self.compiler); self.compiler.start()
 
-    def update_statistics(self):
+    def update_statistics(self):       
         stats = self.db.get_stats(self.current_prefix if not self._is_smart_path(self.current_prefix) else "")
-        usage_pct = (stats['used_bytes'] / MAX_VIRTUAL_STORAGE) * 100 if MAX_VIRTUAL_STORAGE else 0
+        usage_pct = (stats['used_bytes'] / self.max_virtual_storage) * 100 if self.max_virtual_storage else 0
         html = f"<h3 style='color:#58a6ff;'>System Analytics ({Path(self.active_db_path).name})</h3><hr><b>Total Virtual Files:</b> {stats['files']}<br><b>Total Virtual Folders:</b> {stats['folders']}<br><b>Simulated Storage Used:</b> {human_size(stats['used_bytes'])}<br><b>Average File Size:</b> {human_size(stats['avg_bytes'])}<br><b>System Allocation:</b> {usage_pct:.4f}%<br><hr><b>Oldest Mod Date:</b> {stats['oldest']}<br><b>Newest Mod Date:</b> {stats['newest']}<br><hr><h4 style='color:#58a6ff;'>Top Largest Managed Files:</h4><ul style='list-style-type: square; margin-left: -20px;'>"
         for f in stats['top_files'][:5]: html += f"<li>{f[0]} <span style='color:#8b949e;'>({human_size(f[1])})</span></li>"
         html += "</ul>"
@@ -2718,8 +3377,9 @@ class NexusVirtualManager(QMainWindow):
             else:
                 names = [d[0][:15] + ".." if len(d[0])>15 else d[0] for d in data]; sizes = [d[1] / (1024*1024) for d in data]
                 ax.barh(names, sizes, color='#a371f7'); ax.set_xlabel("Size (MB)", color=txt_c); ax.set_title(mode, color=txt_c); ax.invert_yaxis(); ax.grid(axis='x', color='#30363d', linestyle='--')
+        
         elif "Ratio" in mode:
-            labels = ['Used Storage', 'Free Space']; sizes = [stats['used_bytes'], max(0, MAX_VIRTUAL_STORAGE - stats['used_bytes'])]; colors = ['#d7ba7d', '#2ea043']
+            labels = ['Used Storage', 'Free Space']; sizes = [stats['used_bytes'], max(0, self.max_virtual_storage - stats['used_bytes'])]; colors = ['#d7ba7d', '#2ea043']         
             ax.pie(sizes, labels=labels, autopct='%1.1f%%', startangle=140, colors=colors, textprops={'color': txt_c}); ax.set_title(mode, color=txt_c)
 
         self.figure.tight_layout(); self.canvas.draw()
@@ -2754,7 +3414,133 @@ class NexusVirtualManager(QMainWindow):
             self.loader_thread.cancel(); self.loader_thread.quit(); self.loader_thread.wait()
         self.db.close()
         super().closeEvent(ev)
+        
+    def open_tag_library(self):
+        # Create the dialog only once, so it remembers your search and columns
+        if not hasattr(self, 'tag_library_instance') or self.tag_library_instance is None:
+            self.tag_library_instance = NexusTagLibraryDialog(self.active_db_path, self)
+        else:
+            # Refresh automatically if you switched databases
+            if self.tag_library_instance.db_path != self.active_db_path:
+                self.tag_library_instance.db_path = self.active_db_path
+                self.tag_library_instance.refresh_memory_cache()
+                
+        # Show it non-modally (so it stays alive in the background)
+        self.tag_library_instance.show()
+        self.tag_library_instance.raise_()
+        self.tag_library_instance.activateWindow()        
 
+    def on_tree_context_menu(self, pos):
+        item = self.folder_tree.itemAt(pos)
+        if not item: return
+        path = item.data(0, Qt.UserRole)
+        
+        # Only show menu for compiled isolated databases
+        if path and path.startswith("db://") and path != "db://main":
+            db_name = path.replace("db://", "")
+            db_file = VIEWS_DIR / db_name
+            
+            menu = QMenu(self)
+            act_rename = menu.addAction("✏️ Rename Database")
+            act_delete = menu.addAction("🗑️ Delete Database")
+            action = menu.exec(self.folder_tree.viewport().mapToGlobal(pos))
+            
+            if action == act_rename:
+                new_name, ok = QInputDialog.getText(self, "Rename Database", "New name (without .db):", QLineEdit.Normal, db_file.stem)
+                if ok and new_name.strip():
+                    new_file = VIEWS_DIR / f"{new_name.strip().replace(' ', '_')}.db"
+                    if new_file.exists():
+                        QMessageBox.warning(self, "Error", "A database with this name already exists.")
+                        return
+                    
+                    try:
+                        # Safely close connection if renaming the active database
+                        if self.active_db_path == str(db_file):
+                            self.db.close()
+                            db_file.rename(new_file)
+                            self.active_db_path = str(new_file)
+                            self.db = NexusDB(Path(self.active_db_path))
+                            self.status.showMessage(f"Renamed active database to {new_file.name}")
+                        else:
+                            db_file.rename(new_file)
+                            
+                        self.refresh_tree()
+                        self.sys_log(f"Renamed database '{db_name}' to '{new_file.name}'")
+                    except Exception as e:
+                        QMessageBox.critical(self, "Error", f"Failed to rename: {e}")
+                        
+            elif action == act_delete:
+                if QMessageBox.question(self, "Delete Database", f"Are you sure you want to permanently delete '{db_name}'?\nThis cannot be undone.", QMessageBox.Yes | QMessageBox.No) == QMessageBox.Yes:
+                    try:
+                        # Safely bounce user back to Main DB if they delete their current context
+                        if self.active_db_path == str(db_file):
+                            self.db.close()
+                            self.active_db_path = str(DB_FILE)
+                            self.db = NexusDB(Path(self.active_db_path))
+                            self.status.showMessage("Reconnected to Main System DB. Active isolated DB was deleted.")
+                            self.nav_to_path("/")
+                            
+                        if db_file.exists():
+                            os.remove(db_file)
+                            
+                        self.refresh_tree()
+                        self.sys_log(f"Deleted database '{db_name}'")
+                    except Exception as e:
+                        QMessageBox.critical(self, "Error", f"Failed to delete: {e}")
+
+    def toggle_hidden_files(self):
+        self.show_hidden = not self.show_hidden
+        self.status.showMessage(f"Hidden items are now {'VISIBLE' if self.show_hidden else 'HIDDEN'}.", 3000)
+        self.clear_cache()
+        self.load_directory(self.current_prefix)
+        
+    def bulk_compute_hash(self, folder_v_path):
+        self.hash_dlg = QProgressDialog(f"Scanning & Hashing files in {folder_v_path}...", "Cancel", 0, 100, self)
+        self.hash_dlg.setWindowModality(Qt.WindowModal); self.hash_dlg.show()
+        
+        self.bulk_hasher = BulkHashCalculator(self.active_db_path, folder_v_path, self)
+        self.bulk_hasher.progress.connect(lambda c,t,m: (self.hash_dlg.setMaximum(t), self.hash_dlg.setValue(c), self.hash_dlg.setLabelText(m)))
+        self.hash_dlg.canceled.connect(self.bulk_hasher.cancel)
+        self.bulk_hasher.finished.connect(lambda count: (self.hash_dlg.close(), QMessageBox.information(self, "Complete", f"Successfully computed and stored SHA-256 hashes for {count} files.")))
+        self._register_worker(self.bulk_hasher); self.bulk_hasher.start()        
+
+    def set_storage_capacity(self):
+        val, ok = QInputDialog.getDouble(self, "Virtual Capacity", "Enter maximum simulated storage in GB:", self.max_storage_gb, 1.0, 100000.0, 1)
+        if ok:
+            self.max_storage_gb = val
+            self.max_virtual_storage = val * 1024 * 1024 * 1024
+            self.settings.setValue("max_storage_gb", val)
+            self.update_statistics() # Refresh charts instantly
+            self.status.showMessage(f"Simulated storage limit permanently updated to {val} GB.", 4000)
+
+    def restore_from_trash(self):
+        items = self._get_selected_items()
+        if not items: return
+        clean_items = [i for i in items if i[2] != -1] 
+        if not clean_items: return
+        
+        with sqlite3.connect(self.db.path) as conn:
+            cur = conn.cursor()
+            for typ, path, db_id in clean_items:
+                if typ == "file": 
+                    cur.execute("UPDATE virtual_fs SET in_trash = 0 WHERE id = ?", (db_id,))
+                else: 
+                    cur.execute("UPDATE virtual_fs SET in_trash = 0 WHERE parent_path LIKE ? OR id = ?", (f"{path}%", db_id))
+            conn.commit()
+            
+        self.clear_cache()
+        self.refresh_all()
+        self.sys_log(f"Restored {len(clean_items)} items from Trash.")
+        self.status.showMessage(f"Restored {len(clean_items)} items to their original locations.", 4000)
+
+
+    def cmd_select_all(self):
+        if self.view_stack.currentIndex() == 0:
+            self.file_table.selectAll()
+        else:
+            self.file_grid.selectAll()
+        self.status.showMessage("All items selected.", 2000)       
+        
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     app.setApplicationName(APP_TITLE)
