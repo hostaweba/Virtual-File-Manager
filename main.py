@@ -63,6 +63,8 @@ from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
 from PySide6.QtWidgets import QSplitter 
 
+from PySide6.QtCore import QTimer, Qt
+from PySide6.QtWidgets import QRadioButton
 
 # ---------------- Constants & Themes ----------------
 APP_TITLE = "Nexus OS Data Engine"
@@ -1301,9 +1303,14 @@ class NexusTagLibraryDialog(QDialog):
         # Jump directly to the Tag search box
         QShortcut(QKeySequence("Ctrl+T"), self, self.tag_search_box.setFocus)
 
+        
+
     def _build_toolbar(self):
         self.top_toolbar = QHBoxLayout()
+
+        # --- 1. Base View Controls ---
         self.top_toolbar.addWidget(QLabel("<b>Base View:</b>"))
+        
         self.combo_base = QComboBox()
         self.combo_base.setEditable(True)
         self.combo_base.setMinimumWidth(180)
@@ -1315,23 +1322,47 @@ class NexusTagLibraryDialog(QDialog):
         self.btn_map_global.clicked.connect(self.map_global_base_to_os)
         self.top_toolbar.addWidget(self.btn_map_global)
         
-        self.top_toolbar.addSpacing(15)
-        self.global_search_box = QLineEdit(); self.global_search_box.setPlaceholderText("🔍 Global search ...")
-        self.global_search_box.textChanged.connect(self.run_global_search)
-        self.top_toolbar.addWidget(self.global_search_box, stretch=1)
- 
-        btn_refresh = QPushButton("🔄 Refresh Tag Data")
+        self.top_toolbar.addStretch() # Adds flexible space to push the next items to the right
+        
+        # --- 2. Global Search & Filters ---
+        self.radio_folders = QRadioButton("Folders")
+        self.radio_files = QRadioButton("Files")
+        self.radio_folders.setChecked(True)
+        
+        self.global_search_box = QLineEdit()
+        self.global_search_box.setPlaceholderText("Global Search ...")
+        self.global_search_box.setFixedWidth(250)
+        
+        
+        self.top_toolbar.addWidget(self.radio_folders)
+        self.top_toolbar.addWidget(self.radio_files)
+        self.top_toolbar.addWidget(self.global_search_box)
+        
+        # Search Debounce Timer
+        self.search_timer = QTimer(self)
+        self.search_timer.setSingleShot(True)
+        self.search_timer.setInterval(500) 
+        self.search_timer.timeout.connect(lambda: self.run_global_search(self.global_search_box.text()))
+        
+        self.global_search_box.textChanged.connect(self.search_timer.start)
+        self.global_search_box.returnPressed.connect(self.search_timer.stop)
+        self.global_search_box.returnPressed.connect(lambda: self.run_global_search(self.global_search_box.text()))
+        self.radio_folders.toggled.connect(lambda: self.run_global_search(self.global_search_box.text()))
+        
+        # --- 3. Action Buttons ---
+        btn_refresh = QPushButton("🔄 Refresh")
         btn_refresh.clicked.connect(self.full_refresh)
         
-        self.top_toolbar.addWidget(btn_refresh)
- 
         self.btn_config = QPushButton("⚙️ Custom Names")
         self.btn_config.clicked.connect(self.configure_hierarchy)
+        
         self.btn_import = QPushButton("📥 Import")
         self.btn_import.clicked.connect(self.import_csv)
+        
         self.btn_export = QPushButton("📤 Export")
         self.btn_export.clicked.connect(self.export_csv)
 
+        self.top_toolbar.addWidget(btn_refresh)
         self.top_toolbar.addWidget(self.btn_config)
         self.top_toolbar.addWidget(self.btn_import)
         self.top_toolbar.addWidget(self.btn_export)
@@ -1701,7 +1732,22 @@ class NexusTagLibraryDialog(QDialog):
         if not query: 
             return self.refresh_memory_cache()
             
-        valid_paths = [p for p in self.tag_cache.keys() if query in p.lower()]
+        valid_paths = set()
+        
+        # 1. Always search the fast memory cache (Folders & Tags)
+        for p in self.tag_cache.keys():
+            if query in p.lower():
+                valid_paths.add(p)
+                
+        # 2. If 'Include Files' is checked, pull files directly from the database
+        if self.radio_files.isChecked():
+            with sqlite3.connect(self.db_path) as conn:
+                cur = conn.cursor()
+                cur.execute("SELECT parent_path, name FROM virtual_fs WHERE is_folder=0 AND in_trash=0 AND name LIKE ?", (f"%{query}%",))
+                for pp, name in cur.fetchall():
+                    valid_paths.add(f"{pp}{name}")
+                    
+        valid_paths = list(valid_paths)
         base_depth = len([p for p in self.base_v_path.split('/') if p])
         
         max_depth = 0
@@ -1716,12 +1762,11 @@ class NexusTagLibraryDialog(QDialog):
             col['widget'].deleteLater()
             
         for i in range(len(self.dynamic_lists), max_depth):
-            title = self.hierarchy_levels[i] if i < len(self.hierarchy_levels) else f"Level {i + 1}"
+            title = self.hierarchy_levels[i] if hasattr(self, 'hierarchy_levels') and i < len(self.hierarchy_levels) else f"Level {i + 1}"
             self._add_column(i, title)
             
         for i in range(max_depth):
             lst = self.dynamic_lists[i]['list']
-            # ---  Block signals to prevent race condition crashes ---
             lst.blockSignals(True)
             lst.clear()
             
@@ -1744,6 +1789,7 @@ class NexusTagLibraryDialog(QDialog):
                 else:
                     l_item.setIcon(self.style().standardIcon(QStyle.SP_FileIcon))
                 
+                # Highlight the exact matches in green
                 if query in name.lower():
                     l_item.setForeground(QBrush(QColor("#2ea043")))
                     font = l_item.font()
@@ -1752,7 +1798,6 @@ class NexusTagLibraryDialog(QDialog):
                     
                 lst.addItem(l_item)
                 
-            # ---  Re-enable signals after populating ---
             lst.blockSignals(False)
 
     def _filter_list(self, list_widget, text):
@@ -2210,7 +2255,16 @@ class TimelineDiaryDialog(QDialog):
         top_chart_bar = QHBoxLayout()
         top_chart_bar.addWidget(QLabel("<b>Chart Metric:</b>"))
         self.cb_chart_metric = QComboBox()
-        self.cb_chart_metric.addItems(["File Count by Extension", "Storage Size by Extension", "File Count by Size Class", "Tag Utilization"])
+        self.cb_chart_metric.addItems([
+            "File Count by Extension",
+            "Storage Size by Extension",
+            "Storage Usage by Year",
+            "File Age Distribution",
+            "Top 10 Largest Files",
+            "File Modification Timeline",
+            "File Size Distribution",
+            "Tag Utilization"
+        ])
         self.cb_chart_metric.currentTextChanged.connect(self.force_chart_redraw)
         top_chart_bar.addWidget(self.cb_chart_metric, stretch=1)
         chart_lay.addLayout(top_chart_bar)
@@ -2272,16 +2326,22 @@ class TimelineDiaryDialog(QDialog):
             except ValueError: pass
 
     def on_calendar_clicked(self, date):
-        # 1. Update the HTML Diary (Tab 1)
-        self.load_html_diary(date)
-        
-        # 2. Update Table & Charts (Tabs 2 & 3)
-        date_str = date.toString("yyyy-MM-dd")
-        query = "SELECT id, name, is_folder, extension, size, parent_path, modified, custom_tags FROM virtual_fs WHERE modified LIKE ? AND in_trash=0"
-        self.execute_search(query, (f"{date_str}%",))
-        
-        # 3. Automatically switch focus back to the Diary tab for easy reading
-        self.tabs.setCurrentIndex(0)
+            self.load_html_diary(date)
+            
+            date_str = date.toString("yyyy-MM-dd")
+            query = "SELECT id, name, is_folder, extension, size, parent_path, modified, custom_tags FROM virtual_fs WHERE modified LIKE ? AND in_trash=0"
+            
+            #Pass False so it doesn't erase the monthly highlights
+            self.execute_search(query, (f"{date_str}%",), update_highlights=False)
+            
+            self.tabs.setCurrentIndex(0)
+
+    def load_by_date(self, date):
+            date_str = date.toString("yyyy-MM-dd")
+            query = "SELECT id, name, is_folder, extension, size, parent_path, modified, custom_tags FROM virtual_fs WHERE modified LIKE ? AND in_trash=0"
+            
+            # FIXED: Pass False here as well
+            self.execute_search(query, (f"{date_str}%",), update_highlights=False)
 
     def load_html_diary(self, date):
         dt_str = date.toString("yyyy-MM-dd")
@@ -2330,17 +2390,24 @@ class TimelineDiaryDialog(QDialog):
         # When running a global filter, snap to the Table view so you can see all matches across days
         self.tabs.setCurrentIndex(1)
 
-    def execute_search(self, query, params):
+    # ADDED the update_highlights flag here
+    def execute_search(self, query, params, update_highlights=True):
         self.table.setSortingEnabled(False)
         self.table.setRowCount(0)
         
+        dates_found = set()
         analytics = {
             'ext_counts': {}, 'ext_sizes': {},
-            'size_cats': {'Tiny (<1MB)': 0, 'Medium (1-500MB)': 0, 'Huge (>500MB)': 0},
+            'year_sizes': {}, 'age_days': [],
+            'all_files': [], 
+            'mod_timeline': {}, 
+            'size_list': [], 
             'tags': {'Tagged': 0, 'Untagged': 0},
             'total': 0
         }
         
+        now = datetime.now()
+
         with sqlite3.connect(self.db_path) as conn:
             cur = conn.cursor()
             cur.execute(query, params)
@@ -2357,20 +2424,35 @@ class TimelineDiaryDialog(QDialog):
                 self.table.setItem(row, 5, QTableWidgetItem(str(db_id)))
                 
                 analytics['total'] += 1
+                
+                if mod:
+                    date_part = mod.split(" ")[0]
+                    dates_found.add(date_part)
+                    analytics['mod_timeline'][date_part] = analytics['mod_timeline'].get(date_part, 0) + 1
+                    
+                    try:
+                        dt_mod = datetime.strptime(mod, "%Y-%m-%d %H:%M:%S")
+                        analytics['year_sizes'][dt_mod.year] = analytics['year_sizes'].get(dt_mod.year, 0) + (size or 0)
+                        analytics['age_days'].append((now - dt_mod).days)
+                    except: pass
+
                 if not is_folder:
                     safe_ext = ext.upper() if ext else "UNKNOWN"
                     safe_size = size or 0
                     analytics['ext_counts'][safe_ext] = analytics['ext_counts'].get(safe_ext, 0) + 1
                     analytics['ext_sizes'][safe_ext] = analytics['ext_sizes'].get(safe_ext, 0) + safe_size
-                    
-                    if safe_size < 1048576: analytics['size_cats']['Tiny (<1MB)'] += 1
-                    elif safe_size <= 524288000: analytics['size_cats']['Medium (1-500MB)'] += 1
-                    else: analytics['size_cats']['Huge (>500MB)'] += 1
+                    analytics['size_list'].append(safe_size)
+                    analytics['all_files'].append((name, safe_size))
                     
                     if tags and str(tags).strip(): analytics['tags']['Tagged'] += 1
                     else: analytics['tags']['Untagged'] += 1
                 
         self.table.setSortingEnabled(True)
+        
+        # Only update the calendar highlights if the flag is True!
+        if update_highlights:
+            self.sync_calendar_highlights(dates_found)
+            
         self.latest_analytics = analytics
         self.render_charts()
 
@@ -2383,49 +2465,81 @@ class TimelineDiaryDialog(QDialog):
         an = self.latest_analytics
         if not an or an['total'] == 0:
             ax = self.fig.add_subplot(111)
-            ax.set_facecolor('#0d1117'); ax.text(0.5, 0.5, "No Data to Graph", color='#8b949e', ha='center', va='center', fontsize=12); ax.axis('off')
+            ax.set_facecolor('#0d1117'); ax.text(0.5, 0.5, "No Data", color='#8b949e', ha='center', va='center'); ax.axis('off')
             self.canvas.draw(); return
             
         metric = self.cb_chart_metric.currentText()
+        ax = self.fig.add_subplot(111)
+        ax.set_facecolor('#0d1117')
         colors = ["#58a6ff", "#3fb950", "#e3b341", "#a371f7", "#f85149", "#8b949e"]
-        
-        ax1 = self.fig.add_subplot(111)
-        ax1.set_facecolor('#0d1117')
-        labels, values, title = [], [], ""
-        
-        if "Extension" in metric and "Count" in metric:
-            title = "File Count"
-            sorted_data = sorted(an['ext_counts'].items(), key=lambda x: x[1], reverse=True)
-            top_data = dict(sorted_data[:5])
-            if len(sorted_data) > 5: top_data["OTHER"] = sum(x[1] for x in sorted_data[5:])
-            labels, values = list(top_data.keys()), list(top_data.values())
-        elif "Storage" in metric:
-            title = "Storage Used"
-            sorted_data = sorted(an['ext_sizes'].items(), key=lambda x: x[1], reverse=True)
-            top_data = dict(sorted_data[:5])
-            if len(sorted_data) > 5: top_data["OTHER"] = sum(x[1] for x in sorted_data[5:])
-            labels, values = list(top_data.keys()), list(top_data.values())
-        elif "Size Class" in metric:
-            title = "Size Categories"
-            labels, values = list(an['size_cats'].keys()), list(an['size_cats'].values())
+
+        if "Extension" in metric:
+            data = an['ext_counts'] if "Count" in metric else an['ext_sizes']
+            sorted_d = sorted(data.items(), key=lambda x: x[1], reverse=True)[:6]
+            ax.bar([x[0] for x in sorted_d], [x[1] for x in sorted_d], color=colors)
+            ax.set_title(metric, color="#c9d1d9")
+
+        elif "Usage by Year" in metric:
+            years = sorted(an['year_sizes'].keys())
+            sizes = [an['year_sizes'][y] for y in years]
+            ax.plot(years, sizes, marker='o', color="#58a6ff", linewidth=2)
+            ax.fill_between(years, sizes, color="#58a6ff", alpha=0.2)
+            ax.set_title("Storage Growth by Year", color="#c9d1d9")
+
+        elif "Age Distribution" in metric:
+            bins = [0, 7, 30, 180, 365, 1825]
+            labels = ["<1wk", "<1mo", "<6mo", "<1yr", ">1yr"]
+            counts = [0] * len(labels)
+            for d in an['age_days']:
+                if d <= 7: counts[0]+=1
+                elif d <= 30: counts[1]+=1
+                elif d <= 180: counts[2]+=1
+                elif d <= 365: counts[3]+=1
+                else: counts[4]+=1
+            ax.bar(labels, counts, color="#a371f7")
+            ax.set_title("File Age (Time since Modified)", color="#c9d1d9")
+
+        elif "Top 10" in metric:
+            top_10 = sorted(an['all_files'], key=lambda x: x[1], reverse=True)[:10]
+            names = [x[0][:15] + "..." if len(x[0]) > 15 else x[0] for x in top_10]
+            sizes = [x[1] for x in top_10]
+            ax.barh(names, sizes, color="#f85149")
+            ax.invert_yaxis()
+            ax.set_title("Top 10 Largest Files", color="#c9d1d9")
+
+        elif "Modification Timeline" in metric:
+            sorted_dates = sorted(an['mod_timeline'].keys())
+            counts = [an['mod_timeline'][d] for d in sorted_dates]
+            # Show only the last 15 active days to prevent overcrowding
+            disp_dates = sorted_dates[-15:]
+            disp_counts = counts[-15:]
+            ax.bar(disp_dates, disp_counts, color="#3fb950")
+            ax.tick_params(axis='x', rotation=45)
+            ax.set_title("Activity Spikes (Last 15 Active Days)", color="#c9d1d9")
+
+        elif "Size Distribution" in metric:
+            # Grouping files into logical size buckets
+            buckets = {"<1MB": 0, "1-10MB": 0, "10-100MB": 0, "100MB-1GB": 0, ">1GB": 0}
+            for s in an['size_list']:
+                if s < 1048576: buckets["<1MB"] += 1
+                elif s < 10485760: buckets["1-10MB"] += 1
+                elif s < 104857600: buckets["10-100MB"] += 1
+                elif s < 1073741824: buckets["100MB-1GB"] += 1
+                else: buckets[">1GB"] += 1
+            ax.bar(buckets.keys(), buckets.values(), color="#e3b341")
+            ax.set_title("Count by Size Range", color="#c9d1d9")
+
         elif "Tag" in metric:
-            title = "Tag Utilization"
-            labels, values = list(an['tags'].keys()), list(an['tags'].values())
+            vals = [an['tags']['Tagged'], an['tags']['Untagged']]
+            ax.pie(vals, labels=["Tagged", "Untagged"], autopct='%1.1f%%', colors=["#3fb950", "#30363d"], textprops={'color':"white"})
+            ax.set_title("Tag Coverage", color="#c9d1d9")
 
-        clean_labels = [l for l, v in zip(labels, values) if v > 0]
-        clean_values = [v for v in values if v > 0]
-
-        if not clean_values:
-            ax1.text(0.5, 0.5, "Insufficient Data", color='#8b949e', ha='center', va='center'); ax1.axis('off')
-            self.canvas.draw(); return
-
-        ax1.bar(clean_labels, clean_values, color=colors[:len(clean_labels)])
-        ax1.tick_params(axis='x', colors='#c9d1d9', labelsize=10, rotation=0) 
-        ax1.tick_params(axis='y', colors='#8b949e')
-        for spine in ['top', 'right']: ax1.spines[spine].set_visible(False)
-        for spine in ['bottom', 'left']: ax1.spines[spine].set_color('#30363d')
-        ax1.set_title(f"{title}", color="#c9d1d9", pad=15, fontsize=12, fontweight='bold')
-
+        # Global styling for Dark Nexus theme
+        ax.tick_params(axis='x', colors='#c9d1d9', labelsize=9)
+        ax.tick_params(axis='y', colors='#8b949e')
+        for spine in ['top', 'right']: ax.spines[spine].set_visible(False)
+        for spine in ['bottom', 'left']: ax.spines[spine].set_color('#30363d')
+        
         self.fig.tight_layout()
         self.canvas.draw()
 
@@ -2489,6 +2603,22 @@ class TimelineDiaryDialog(QDialog):
         self.load_html_diary(self.calendar.selectedDate())
         self.force_chart_redraw()
 
+
+    def sync_calendar_highlights(self, date_strings):
+        # Clear old highlights
+        self.calendar.setDateTextFormat(QDate(), QTextCharFormat())
+        
+        # Create the visual style for active days
+        fmt = QTextCharFormat()
+        fmt.setBackground(QBrush(QColor("#2ea043"))) 
+        fmt.setForeground(QBrush(QColor("white")))
+        fmt.setFontWeight(QFont.Bold)
+        
+        # Apply the highlight to every active date found in the search
+        for ds in date_strings:
+            qdate = QDate.fromString(ds, "yyyy-MM-dd")
+            if qdate.isValid():
+                self.calendar.setDateTextFormat(qdate, fmt)
 
 class SpaceAnalyzerDialog(QDialog):
     def __init__(self, db_path, parent=None):
