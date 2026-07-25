@@ -1,5 +1,5 @@
 """
-Nexus OS Virtual File Manager
+vman OS Virtual File Manager
 Timeline Diary, Deep Smart Views, Zero-Lag Async Engine, Custom Tags, Multi-Themes, and OS Hooks.
 """
 from __future__ import annotations
@@ -15,7 +15,7 @@ from PySide6.QtCore import (
 )
 from PySide6.QtGui import (
     QFont, QPixmap, QImage, QAction, QPainter, QIcon, QDragEnterEvent, QDropEvent, 
-    QColor, QBrush, QKeySequence, QShortcut, QDrag, QKeyEvent, QTextCursor, QTextCharFormat
+    QColor, QBrush, QKeySequence, QShortcut, QDrag, QKeyEvent, QTextCursor, QTextCharFormat, QTransform
 )
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QToolBar, QFileDialog, QMessageBox,
@@ -66,11 +66,17 @@ from PySide6.QtWidgets import QSplitter
 from PySide6.QtCore import QTimer, Qt
 from PySide6.QtWidgets import QRadioButton
 
+try:
+    from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
+    from PySide6.QtMultimediaWidgets import QVideoWidget, QGraphicsVideoItem
+    HAS_MULTIMEDIA = True
+except ImportError: HAS_MULTIMEDIA = False
+
 # ---------------- Constants & Themes ----------------
-APP_TITLE = "Nexus OS Data Engine"
-DATA_DIR = Path("nexus_data")
+APP_TITLE = "VMan"
+DATA_DIR = Path("vman_data")
 VIEWS_DIR = DATA_DIR / "compiled_views"
-DB_FILE = DATA_DIR / "nexus_vfs.db"
+DB_FILE = DATA_DIR / "vman_vfs.db"
 MAX_VIRTUAL_STORAGE = 100 * 1024 * 1024 * 1024  
 CHUNK_SIZE = 150 
 
@@ -92,7 +98,7 @@ SMART_PROTOCOLS = {
 }
 
 THEMES = {
-    "Dark Nexus": """
+    "Dark vman": """
         QMainWindow, QDialog, QDockWidget { background-color: #0d1117; color: #c9d1d9; font-family: 'Segoe UI'; font-size: 13px; }
         QWidget { color: #c9d1d9; }
         QDockWidget::title { background: #161b22; padding: 8px; border-top-left-radius: 8px; border-top-right-radius: 8px; font-weight: bold; }
@@ -153,7 +159,7 @@ def ensure_dirs():
     VIEWS_DIR.mkdir(parents=True, exist_ok=True)
 
 # ---------------- Database Engine ----------------
-class NexusDB:
+class vmanDB:
     def __init__(self, path: Path):
         self.path = path
         self.conn = sqlite3.connect(str(self.path), check_same_thread=False)
@@ -174,16 +180,22 @@ class NexusDB:
                 custom_tags TEXT DEFAULT ''
             );
         """)
-        # ADD 'hash_verified' to this list to safely upgrade the database!
+        # ADD 'hash_verified' to this list to safely upgrade the database!       
         for col in [
             "color_tag TEXT DEFAULT ''", "secondary_name TEXT DEFAULT ''", 
             "is_hidden INTEGER DEFAULT 0", "in_trash INTEGER DEFAULT 0", 
             "is_favorite INTEGER DEFAULT 0", "sha256 TEXT DEFAULT ''",
             "category TEXT DEFAULT 'Others'", "year TEXT DEFAULT ''", "month TEXT DEFAULT ''",
-            "custom_tags TEXT DEFAULT ''", "hash_verified INTEGER DEFAULT 0"
+            "custom_tags TEXT DEFAULT ''", "hash_verified INTEGER DEFAULT 0",
+            "creation_date TEXT DEFAULT ''", "owner TEXT DEFAULT ''"
         ]:
             try: c.execute(f"ALTER TABLE virtual_fs ADD COLUMN {col};")
             except sqlite3.OperationalError: pass
+            
+        # Automatically backfill missing creation dates for existing files so Timeline Diary works immediately!
+        c.execute("UPDATE virtual_fs SET creation_date = modified WHERE creation_date = '' OR creation_date IS NULL;")
+        
+      
         c.execute("CREATE INDEX IF NOT EXISTS idx_vfs_parent ON virtual_fs(parent_path);")
         c.execute("CREATE INDEX IF NOT EXISTS idx_vfs_ycme ON virtual_fs(year, category, month, extension);")
         c.execute("CREATE INDEX IF NOT EXISTS idx_vfs_tags ON virtual_fs(custom_tags);")
@@ -594,20 +606,23 @@ class ImportFilesThread(QThread):
                             cur.execute("INSERT OR IGNORE INTO virtual_fs (parent_path, name, is_folder, modified) VALUES (?,?,1,?)", (curr_parent, d, now_ts()))
                             added_d += 1
                         records = []
+
                         for f in files:
                             fp = os.path.join(root, f)
                             ext = os.path.splitext(f)[1].lower()
                             mod = datetime.fromtimestamp(os.path.getmtime(fp)).strftime("%Y-%m-%d %H:%M:%S")
-                            records.append((curr_parent, f, 0, fp, os.path.getsize(fp), ext, mod, get_category_for_ext(ext), mod[0:4], mod[5:7]))
+                            cre = datetime.fromtimestamp(os.path.getctime(fp)).strftime("%Y-%m-%d %H:%M:%S")
+                            records.append((curr_parent, f, 0, fp, os.path.getsize(fp), ext, mod, get_category_for_ext(ext), mod[0:4], mod[5:7], cre))
                             added_f += 1
-                        cur.executemany("INSERT INTO virtual_fs (parent_path, name, is_folder, real_path, size, extension, modified, category, year, month) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", records)
+                        cur.executemany("INSERT INTO virtual_fs (parent_path, name, is_folder, real_path, size, extension, modified, category, year, month, creation_date) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", records)
                         self.progress.emit(added_f, total, f"Imported {added_f}/{total} files...")
                 else:
+                    # Replace the single file fallback block with this:
                     ext = os.path.splitext(p)[1].lower()
                     mod = datetime.fromtimestamp(os.path.getmtime(p)).strftime("%Y-%m-%d %H:%M:%S")
-                    cur.execute("INSERT INTO virtual_fs (parent_path, name, is_folder, real_path, size, extension, modified, category, year, month) VALUES (?, ?, 0, ?, ?, ?, ?, ?, ?, ?)", (self.target_prefix, os.path.basename(p), p, os.path.getsize(p), ext, mod, get_category_for_ext(ext), mod[0:4], mod[5:7]))
+                    cre = datetime.fromtimestamp(os.path.getctime(p)).strftime("%Y-%m-%d %H:%M:%S")
+                    cur.execute("INSERT INTO virtual_fs (parent_path, name, is_folder, real_path, size, extension, modified, category, year, month, creation_date) VALUES (?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?)", (self.target_prefix, os.path.basename(p), p, os.path.getsize(p), ext, mod, get_category_for_ext(ext), mod[0:4], mod[5:7], cre))
                     added_f += 1
-                    self.progress.emit(added_f, total, f"Imported {added_f}/{total} files...")
             conn.commit()
             conn.close()
             self.finished_import.emit(added_f, added_d)
@@ -627,7 +642,7 @@ class CompilerThread(QThread):
             if self.is_cancelled: return
             self.progress.emit(0, 100, "Initializing compiler...")
             if os.path.exists(self.target_db): os.remove(self.target_db)
-            tgt_db = NexusDB(Path(self.target_db))
+            tgt_db = vmanDB(Path(self.target_db))
             src_conn = sqlite3.connect(self.source_db)
             src_cur = src_conn.cursor()
             self.progress.emit(20, 100, "Executing extraction query...")
@@ -792,7 +807,7 @@ class InteractiveBreadcrumb(QWidget):
                     add_btn(part, current_build)
         self.layout.addStretch()
 
-class NexusTableModel(QAbstractTableModel):
+class vmanTableModel(QAbstractTableModel):
     def __init__(self, headers: List[str], rows: List[Dict], parent=None):
         super().__init__(parent)
         self.headers, self.all_rows, self.display_limit = headers, rows, CHUNK_SIZE
@@ -862,17 +877,17 @@ class SandboxTableView(QTableView):
         sel = self.selectionModel().selectedRows()
         if not sel: return
         self.window()._current_drag_items = [self.model().data(self.model().index(idx.row(), 0), Qt.UserRole) for idx in sel]
-        drag = QDrag(self); mime = QMimeData(); mime.setText("nexus_internal_drag"); drag.setMimeData(mime); drag.exec(Qt.MoveAction | Qt.CopyAction)
+        drag = QDrag(self); mime = QMimeData(); mime.setText("vman_internal_drag"); drag.setMimeData(mime); drag.exec(Qt.MoveAction | Qt.CopyAction)
     def dragEnterEvent(self, event: QDragEnterEvent): 
-        if event.mimeData().hasUrls() or event.mimeData().text() == "nexus_internal_drag": event.acceptProposedAction()
+        if event.mimeData().hasUrls() or event.mimeData().text() == "vman_internal_drag": event.acceptProposedAction()
         else: super().dragEnterEvent(event)
     def dragMoveEvent(self, event): 
-        if event.mimeData().hasUrls() or event.mimeData().text() == "nexus_internal_drag": event.acceptProposedAction()
+        if event.mimeData().hasUrls() or event.mimeData().text() == "vman_internal_drag": event.acceptProposedAction()
         else: super().dragMoveEvent(event)
     def dropEvent(self, event: QDropEvent):
         if event.mimeData().hasUrls(): 
             self.filesDroppedOS.emit([url.toLocalFile() for url in event.mimeData().urls()]); event.acceptProposedAction()
-        elif event.mimeData().text() == "nexus_internal_drag":
+        elif event.mimeData().text() == "vman_internal_drag":
             idx = self.indexAt(event.position().toPoint())
             dest_path = self.window().current_prefix
             if idx.isValid():
@@ -896,17 +911,17 @@ class SandboxListView(QListView):
         sel = self.selectionModel().selectedIndexes()
         if not sel: return
         self.window()._current_drag_items = [self.model().data(idx, Qt.UserRole) for idx in sel]
-        drag = QDrag(self); mime = QMimeData(); mime.setText("nexus_internal_drag"); drag.setMimeData(mime); drag.exec(Qt.MoveAction | Qt.CopyAction)
+        drag = QDrag(self); mime = QMimeData(); mime.setText("vman_internal_drag"); drag.setMimeData(mime); drag.exec(Qt.MoveAction | Qt.CopyAction)
     def dragEnterEvent(self, event: QDragEnterEvent): 
-        if event.mimeData().hasUrls() or event.mimeData().text() == "nexus_internal_drag": event.acceptProposedAction()
+        if event.mimeData().hasUrls() or event.mimeData().text() == "vman_internal_drag": event.acceptProposedAction()
         else: super().dragEnterEvent(event)
     def dragMoveEvent(self, event): 
-        if event.mimeData().hasUrls() or event.mimeData().text() == "nexus_internal_drag": event.acceptProposedAction()
+        if event.mimeData().hasUrls() or event.mimeData().text() == "vman_internal_drag": event.acceptProposedAction()
         else: super().dragMoveEvent(event)
     def dropEvent(self, event: QDropEvent):
         if event.mimeData().hasUrls(): 
             self.filesDroppedOS.emit([url.toLocalFile() for url in event.mimeData().urls()]); event.acceptProposedAction()
-        elif event.mimeData().text() == "nexus_internal_drag":
+        elif event.mimeData().text() == "vman_internal_drag":
             idx = self.indexAt(event.position().toPoint())
             dest_path = self.window().current_prefix
             if idx.isValid():
@@ -920,13 +935,13 @@ class InternalTreeWidget(QTreeWidget):
     def __init__(self, parent=None): 
         super().__init__(parent); self.setAcceptDrops(True)
     def dragEnterEvent(self, event: QDragEnterEvent): 
-        if event.mimeData().text() == "nexus_internal_drag": event.acceptProposedAction()
+        if event.mimeData().text() == "vman_internal_drag": event.acceptProposedAction()
         else: super().dragEnterEvent(event)
     def dragMoveEvent(self, event): 
-        if event.mimeData().text() == "nexus_internal_drag": event.acceptProposedAction()
+        if event.mimeData().text() == "vman_internal_drag": event.acceptProposedAction()
         else: super().dragMoveEvent(event)
     def dropEvent(self, event: QDropEvent):
-        if event.mimeData().text() == "nexus_internal_drag" and self.itemAt(event.position().toPoint()):
+        if event.mimeData().text() == "vman_internal_drag" and self.itemAt(event.position().toPoint()):
             self.window().execute_internal_drop(self.itemAt(event.position().toPoint()).data(0, Qt.UserRole), bool(event.keyboardModifiers() & (Qt.ControlModifier | Qt.ShiftModifier)))
             event.acceptProposedAction()
 
@@ -939,9 +954,9 @@ class DuplicateProofDialog(QDialog):
         self.resize(850, 500)
         
         if main_app and hasattr(main_app, 'theme_combo'):
-            self.setStyleSheet(THEMES.get(main_app.theme_combo.currentText(), THEMES["Dark Nexus"]))
+            self.setStyleSheet(THEMES.get(main_app.theme_combo.currentText(), THEMES["Dark vman"]))
         else:
-            self.setStyleSheet(THEMES["Dark Nexus"])
+            self.setStyleSheet(THEMES["Dark vman"])
         
         layout = QVBoxLayout(self)
         layout.addWidget(QLabel(f"<h3 style='color:#58a6ff;'>Analysis: {match_type}</h3>"))
@@ -1194,7 +1209,7 @@ class ColumnListWidget(QListWidget):
         else:
             super().keyPressEvent(event)
 
-class NexusTagLibraryDialog(QDialog):
+class vmanTagLibraryDialog(QDialog):
     def __init__(self, db_path, parent=None):
         super().__init__(parent)
         self.db_path = db_path
@@ -1204,7 +1219,7 @@ class NexusTagLibraryDialog(QDialog):
         
 
         # --- 1. Load Custom Names Persistently ---
-        self.settings = QSettings("NexusOS", "TagLibraryConfig")
+        self.settings = QSettings("vmanOS", "TagLibraryConfig")
         saved_levels = self.settings.value("hierarchy_levels")
         if saved_levels:
             self.hierarchy_levels = list(saved_levels)
@@ -1218,11 +1233,11 @@ class NexusTagLibraryDialog(QDialog):
         self.l3_name = self.hierarchy_levels[3] if len(self.hierarchy_levels) > 3 else "Level 3"
         self.l4_name = self.hierarchy_levels[4] if len(self.hierarchy_levels) > 4 else "Level 4"
         
-        self.setWindowTitle("Nexus OS - Universal Tag Engine & Analytics")
+        self.setWindowTitle("vman OS - Universal Tag Engine & Analytics")
         self.resize(1300, 800)
         
         if self.main_app and hasattr(self.main_app, 'theme_combo'):
-            self.setStyleSheet(THEMES.get(self.main_app.theme_combo.currentText(), THEMES["Dark Nexus"]))
+            self.setStyleSheet(THEMES.get(self.main_app.theme_combo.currentText(), THEMES["Dark vman"]))
 
         self._build_toolbar() 
         self.main_layout = QVBoxLayout(self)
@@ -1403,6 +1418,7 @@ class NexusTagLibraryDialog(QDialog):
                     full_path = f"{pp}{name}/" if is_folder else f"{pp}{name}"
                     full_path = full_path.replace("//", "/")
                     tag_list = [t.strip() for t in str(tags).split(',')] if tags else []
+                    self.tag_cache[full_path] = tag_list # Unconditionally add both files and folders to view columns
                     if tag_list or is_folder:
                         self.tag_cache[full_path] = tag_list
         except Exception as e: print(f"DB Load Error: {e}")
@@ -1735,7 +1751,13 @@ class NexusTagLibraryDialog(QDialog):
         valid_paths = set()
         
         # 1. Always search the fast memory cache (Folders & Tags)
+        include_folders = self.radio_folders.isChecked()
+        include_files = self.radio_files.isChecked()
+
         for p in self.tag_cache.keys():
+            is_fldr = p.endswith('/')
+            if (is_fldr and not include_folders) or (not is_fldr and not include_files):
+                continue # Skip if it doesn't match the restrictive search parameters
             if query in p.lower():
                 valid_paths.add(p)
                 
@@ -1910,7 +1932,7 @@ class NexusTagLibraryDialog(QDialog):
         dlg.setMinimumWidth(500)
         
         if self.main_app and hasattr(self.main_app, 'theme_combo'):
-            dlg.setStyleSheet(THEMES.get(self.main_app.theme_combo.currentText(), THEMES["Dark Nexus"]))
+            dlg.setStyleSheet(THEMES.get(self.main_app.theme_combo.currentText(), THEMES["Dark vman"]))
             
         layout = QFormLayout(dlg)
         
@@ -2134,13 +2156,13 @@ class TimelineDiaryDialog(QDialog):
         self.db_path = db_path
         self.setWindowTitle("Timeline Diary & Analytics")
         
-        self.resize(1100, 650)
-        self.setMinimumSize(950, 600)
+        self.resize(1100, 670)
+        self.setMinimumSize(950, 660)
         
         if parent and hasattr(parent, 'theme_combo'):
-            self.setStyleSheet(THEMES.get(parent.theme_combo.currentText(), THEMES["Dark Nexus"]))
+            self.setStyleSheet(THEMES.get(parent.theme_combo.currentText(), THEMES["Dark vman"]))
         else:
-            self.setStyleSheet(THEMES["Dark Nexus"])
+            self.setStyleSheet(THEMES["Dark vman"])
 
         main_layout = QVBoxLayout(self)
         main_layout.setContentsMargins(10, 10, 10, 10)
@@ -2157,8 +2179,20 @@ class TimelineDiaryDialog(QDialog):
         
         # 1. Calendar
         self.calendar = QCalendarWidget()
-        self.calendar.setGridVisible(True)
-        self.calendar.setVerticalHeaderFormat(QCalendarWidget.NoVerticalHeader)
+
+        self.date_mode_mod = QRadioButton("Modified")
+        self.date_mode_mod.setChecked(True)
+        self.date_mode_cre = QRadioButton("Created")
+        
+        self.date_mode_mod.toggled.connect(self.on_date_mode_changed)
+        self.date_mode_cre.toggled.connect(self.on_date_mode_changed)
+        
+        rb_lay = QHBoxLayout()
+        rb_lay.addWidget(self.date_mode_mod)
+        rb_lay.addWidget(self.date_mode_cre)
+        left_lay.addLayout(rb_lay)
+        
+
         
         # --- FIXED: Wire up dynamic month highlighting and click routing ---
         self.calendar.currentPageChanged.connect(self.highlight_month)
@@ -2289,6 +2323,11 @@ class TimelineDiaryDialog(QDialog):
         self.highlight_month(today.year(), today.month())
         self.on_calendar_clicked(today)
 
+    def on_date_mode_changed(self):
+        # Instantly forces the calendar, HTML reader, and Table to reload with the newly chosen metric
+        self.highlight_month(self.calendar.yearShown(), self.calendar.monthShown())
+        self.on_calendar_clicked(self.calendar.selectedDate())
+
     def populate_dropdowns(self):
         with sqlite3.connect(self.db_path) as conn:
             cur = conn.cursor()
@@ -2314,10 +2353,10 @@ class TimelineDiaryDialog(QDialog):
             self.cb_tag.addItems(sorted(list(all_tags)))
 
     def highlight_month(self, year, month):
-        # Always runs when you flip calendar pages to pre-highlight active days
         self.calendar.setDateTextFormat(QDate(), QTextCharFormat())
+        col = "creation_date" if self.date_mode_cre.isChecked() else "modified"
         with sqlite3.connect(self.db_path) as conn:
-            days = [r[0] for r in conn.cursor().execute("SELECT DISTINCT SUBSTR(modified, 9, 2) FROM virtual_fs WHERE is_folder=0 AND in_trash=0 AND modified LIKE ?", (f"{year}-{month:02d}-%",)).fetchall()]
+            days = [r[0] for r in conn.cursor().execute(f"SELECT DISTINCT SUBSTR({col}, 9, 2) FROM virtual_fs WHERE is_folder=0 AND in_trash=0 AND {col} LIKE ?", (f"{year}-{month:02d}-%",)).fetchall()]
         
         fmt = QTextCharFormat()
         fmt.setBackground(QColor("#2ea043")); fmt.setForeground(QColor("white")); fmt.setFontWeight(QFont.Bold)
@@ -2326,27 +2365,26 @@ class TimelineDiaryDialog(QDialog):
             except ValueError: pass
 
     def on_calendar_clicked(self, date):
-            self.load_html_diary(date)
-            
-            date_str = date.toString("yyyy-MM-dd")
-            query = "SELECT id, name, is_folder, extension, size, parent_path, modified, custom_tags FROM virtual_fs WHERE modified LIKE ? AND in_trash=0"
-            
-            #Pass False so it doesn't erase the monthly highlights
-            self.execute_search(query, (f"{date_str}%",), update_highlights=False)
-            
-            self.tabs.setCurrentIndex(0)
+        self.load_html_diary(date)
+        date_str = date.toString("yyyy-MM-dd")
+        col = "creation_date" if self.date_mode_cre.isChecked() else "modified"
+        query = f"SELECT id, name, is_folder, extension, size, parent_path, {col}, custom_tags FROM virtual_fs WHERE {col} LIKE ? AND in_trash=0"
+        
+        self.execute_search(query, (f"{date_str}%",), update_highlights=False)
+        self.tabs.setCurrentIndex(0)
 
     def load_by_date(self, date):
-            date_str = date.toString("yyyy-MM-dd")
-            query = "SELECT id, name, is_folder, extension, size, parent_path, modified, custom_tags FROM virtual_fs WHERE modified LIKE ? AND in_trash=0"
-            
-            # FIXED: Pass False here as well
-            self.execute_search(query, (f"{date_str}%",), update_highlights=False)
+        date_str = date.toString("yyyy-MM-dd")
+        col = "creation_date" if self.date_mode_cre.isChecked() else "modified"
+        query = f"SELECT id, name, is_folder, extension, size, parent_path, {col}, custom_tags FROM virtual_fs WHERE {col} LIKE ? AND in_trash=0"
+        
+        self.execute_search(query, (f"{date_str}%",), update_highlights=False)
 
     def load_html_diary(self, date):
         dt_str = date.toString("yyyy-MM-dd")
+        col = "creation_date" if self.date_mode_cre.isChecked() else "modified"
         with sqlite3.connect(self.db_path) as conn:
-            entries = conn.cursor().execute("SELECT SUBSTR(modified, 12, 8), name, parent_path, size, category FROM virtual_fs WHERE modified LIKE ? AND is_folder=0 AND in_trash=0 ORDER BY modified ASC", (f"{dt_str}%",)).fetchall()
+            entries = conn.cursor().execute(f"SELECT SUBSTR({col}, 12, 8), name, parent_path, size, category FROM virtual_fs WHERE {col} LIKE ? AND is_folder=0 AND in_trash=0 ORDER BY {col} ASC", (f"{dt_str}%",)).fetchall()
         
         html = f"<h1 style='color:#58a6ff; text-align:center;'>📖 System Timeline: {date.toString('dddd, MMMM d, yyyy')}</h1><hr>"
         if not entries: 
@@ -2354,13 +2392,15 @@ class TimelineDiaryDialog(QDialog):
         else:
             html += f"<p style='color:#c9d1d9; text-align:center;'><b>{len(entries)}</b> files were modified or logged.</p><br><ul style='list-style-type: none; padding-left: 0;'>"
             cat_colors = {"Images": "#a371f7", "Videos": "#f85149", "Audio": "#ff7b72", "Documents": "#d2a8ff", "Code": "#79c0ff", "Others": "#8b949e"}
+            
+            action_verb = "Created" if self.date_mode_cre.isChecked() else "Modified"
+            
             for time_str, name, pp, size, cat in entries:
                 c_color = cat_colors.get(cat, "#8b949e")
-                # Handle size safely (assumes human_size is available globally in the file)
                 try: safe_size = human_size(size)
                 except NameError: safe_size = f"{size} bytes"
                 
-                html += f"<li style='margin-bottom: 15px; background-color: rgba(33, 38, 45, 0.6); padding: 12px; border-left: 5px solid {c_color}; border-radius: 6px;'><span style='color: #58a6ff; font-size: 15px;'><b>🕒 {time_str}</b></span><br><span style='font-size: 16px; color: white;'>Action registered on <b style='color: {c_color};'>{name}</b></span> <span style='color: #8b949e; font-size: 13px;'>({safe_size})</span><br><span style='color: #8b949e; font-size: 13px;'>Path: {pp}</span></li>"
+                html += f"<li style='margin-bottom: 15px; background-color: rgba(33, 38, 45, 0.6); padding: 12px; border-left: 5px solid {c_color}; border-radius: 6px;'><span style='color: #58a6ff; font-size: 15px;'><b>🕒 {time_str}</b></span><br><span style='font-size: 16px; color: white;'>{action_verb} <b style='color: {c_color};'>{name}</b></span> <span style='color: #8b949e; font-size: 13px;'>({safe_size})</span><br><span style='color: #8b949e; font-size: 13px;'>Path: {pp}</span></li>"
             html += "</ul>"
         self.diary_browser.setHtml(html)
 
@@ -2373,7 +2413,8 @@ class TimelineDiaryDialog(QDialog):
             self.calendar.setCurrentPage(int(y), target_month)
             self.highlight_month(int(y), target_month)
         
-        query = "SELECT id, name, is_folder, extension, size, parent_path, modified, custom_tags FROM virtual_fs WHERE in_trash=0"
+        col = "creation_date" if self.date_mode_cre.isChecked() else "modified"
+        query = f"SELECT id, name, is_folder, extension, size, parent_path, {col}, custom_tags FROM virtual_fs WHERE in_trash=0"
         params = []
         
         if y != "All": query += " AND year=?"; params.append(y)
@@ -2387,7 +2428,6 @@ class TimelineDiaryDialog(QDialog):
             
         self.execute_search(query, tuple(params))
         
-        # When running a global filter, snap to the Table view so you can see all matches across days
         self.tabs.setCurrentIndex(1)
 
     # ADDED the update_highlights flag here
@@ -2534,7 +2574,7 @@ class TimelineDiaryDialog(QDialog):
             ax.pie(vals, labels=["Tagged", "Untagged"], autopct='%1.1f%%', colors=["#3fb950", "#30363d"], textprops={'color':"white"})
             ax.set_title("Tag Coverage", color="#c9d1d9")
 
-        # Global styling for Dark Nexus theme
+        # Global styling for Dark vman theme
         ax.tick_params(axis='x', colors='#c9d1d9', labelsize=9)
         ax.tick_params(axis='y', colors='#8b949e')
         for spine in ['top', 'right']: ax.spines[spine].set_visible(False)
@@ -2727,8 +2767,29 @@ class SpaceAnalyzerDialog(QDialog):
         scan_lay.addStretch()
         scan_lay.addWidget(self.btn_view_safe)
         scan_lay.addWidget(self.btn_delete)
+        self.btn_apply_tag = QPushButton("🏷️ Assign Custom Tag")
+        self.btn_apply_tag.setStyleSheet("background-color: #1f6feb; font-weight: bold; color: white;")
+        self.btn_apply_tag.clicked.connect(self.assign_tags_selected)
+        scan_lay.addWidget(self.btn_apply_tag)
         layout.addLayout(scan_lay)
 
+    def assign_tags_selected(self):
+        ids = [int(self.table.item(r, 8).text()) for r in range(self.table.rowCount()) if self.table.item(r, 0).checkState() == Qt.Checked]
+        if not ids: return
+        tags, ok = QInputDialog.getText(self, "Assign Tag", "Enter Custom Tag:")
+        if ok and tags.strip():
+            prog = QProgressDialog("Applying custom tags...", "Cancel", 0, len(ids), self)
+            prog.setWindowModality(Qt.WindowModal); prog.show()
+            with sqlite3.connect(self.db_path) as conn:
+                for i, db_id in enumerate(ids):
+                    if prog.wasCanceled(): break
+                    old = conn.cursor().execute("SELECT custom_tags FROM virtual_fs WHERE id=?", (db_id,)).fetchone()[0]
+                    new_val = f"{old}, {tags.strip()}".strip(", ") if old else tags.strip()
+                    conn.cursor().execute("UPDATE virtual_fs SET custom_tags=? WHERE id=?", (new_val, db_id))
+                    prog.setValue(i+1)
+                conn.commit()
+            if self.parent(): self.parent().refresh_all()
+            QMessageBox.information(self, "Complete", "Tags assigned to selected files.")
 
     def show_context_menu(self, pos):
         item = self.table.itemAt(pos)
@@ -3067,9 +3128,9 @@ class BulkOperationEngine(QDialog):
         self.resize(700, 600)
         
         if parent and hasattr(parent, 'theme_combo'):
-            self.setStyleSheet(THEMES.get(parent.theme_combo.currentText(), THEMES["Dark Nexus"]))
+            self.setStyleSheet(THEMES.get(parent.theme_combo.currentText(), THEMES["Dark vman"]))
         else:
-            self.setStyleSheet(THEMES["Dark Nexus"])
+            self.setStyleSheet(THEMES["Dark vman"])
 
         layout = QVBoxLayout(self)
         
@@ -3343,103 +3404,261 @@ class AdvancedImageViewer(QGraphicsView):
             if event.angleDelta().y() > 0: self.scale(self.zoom_factor, self.zoom_factor)
             else: self.scale(1 / self.zoom_factor, 1 / self.zoom_factor)
         else: super().wheelEvent(event)
+        
+    def keyPressEvent(self, event):
+        # Ignore these keys so the main Viewer dialog catches them for navigation/media controls!
+        if event.key() in (Qt.Key_Left, Qt.Key_Right, Qt.Key_Up, Qt.Key_Down, Qt.Key_Space):
+            event.ignore()
+        else:
+            super().keyPressEvent(event)    
+        
 
-class NexusViewer(QDialog):
+class VisualWaveform(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent); self.setFixedHeight(100); self.bars = [0]*30; self.timer = QTimer(self); self.timer.timeout.connect(self.update_wave)
+    def update_wave(self):
+        import random; self.bars = [random.randint(10, 90) for _ in range(30)]; self.update()
+    def paintEvent(self, e):
+        painter = QPainter(self); painter.setBrush(QBrush(QColor("#58a6ff"))); painter.setPen(Qt.NoPen)
+        w = self.width() / 30
+        for i, h in enumerate(self.bars): painter.drawRect(int(i*w), self.height() - h, int(w-2), h)
+
+class AdvancedVideoViewer(QGraphicsView):
+    def __init__(self, scene, parent=None):
+        super().__init__(scene, parent)
+        self.setRenderHints(QPainter.Antialiasing | QPainter.SmoothPixmapTransform)
+        self.setDragMode(QGraphicsView.ScrollHandDrag)
+        self.setStyleSheet("background: transparent; border: none;")
+        self.zoom_factor = 1.15
+    def wheelEvent(self, event):
+        if event.modifiers() == Qt.ControlModifier:
+            if event.angleDelta().y() > 0: self.scale(self.zoom_factor, self.zoom_factor)
+            else: self.scale(1 / self.zoom_factor, 1 / self.zoom_factor)
+        else: super().wheelEvent(event)
+    def keyPressEvent(self, event):
+        # Ignore these keys so the main Viewer dialog catches them for playback/navigation
+        if event.key() in (Qt.Key_Left, Qt.Key_Right, Qt.Key_Up, Qt.Key_Down, Qt.Key_Space): event.ignore()
+        else: super().keyPressEvent(event)
+
+class vmanViewer(QDialog):
     def __init__(self, playlist, start_index, parent=None):
         super().__init__(parent)
         self.playlist, self.current_index = playlist, start_index
-        self.setWindowTitle("Nexus Media Engine"); self.resize(1000, 700)
-        if parent and hasattr(parent, 'theme_combo'): self.setStyleSheet(THEMES.get(parent.theme_combo.currentText(), THEMES["Dark Nexus"]))
-        else: self.setStyleSheet(THEMES["Dark Nexus"])
+        self.setWindowTitle("vman Advanced Media Engine"); self.resize(1100, 800)
+        self.setStyleSheet(THEMES.get(parent.theme_combo.currentText() if parent else "Dark vman", THEMES["Dark vman"]))
         
-        layout = QVBoxLayout(self)
-        self.header_layout = QHBoxLayout()
-        self.btn_prev = QPushButton("◀ Prev"); self.btn_prev.clicked.connect(self._prev_item)
-        self.lbl_title = QLabel(); self.lbl_title.setFont(QFont("Segoe UI", 12, QFont.Bold)); self.lbl_title.setAlignment(Qt.AlignCenter)
-        self.lbl_counter = QLabel(); self.lbl_counter.setFixedWidth(80); self.lbl_counter.setAlignment(Qt.AlignCenter)
-        self.btn_next = QPushButton("Next ▶"); self.btn_next.clicked.connect(self._next_item)
-        self.btn_zoom_in = QPushButton("🔍+"); self.btn_zoom_out = QPushButton("🔍-")
-        self.btn_zoom_in.clicked.connect(self.zoom_in); self.btn_zoom_out.clicked.connect(self.zoom_out)
+        # Absolute layout for floating toolbar
+        self.main_layout = QVBoxLayout(self)
         
-        self.header_layout.addWidget(self.btn_prev); self.header_layout.addWidget(self.btn_zoom_out); self.header_layout.addWidget(self.btn_zoom_in)
-        self.header_layout.addWidget(self.lbl_counter); self.header_layout.addWidget(self.lbl_title, 1); self.header_layout.addWidget(self.btn_next)
-        layout.addLayout(self.header_layout)
+        # Top Filename Header (Separate from bottom tools)
+        self.lbl_title = QLabel()
+        self.lbl_title.setFont(QFont("Segoe UI", 14, QFont.Bold))
+        self.lbl_title.setAlignment(Qt.AlignCenter)
+        self.lbl_title.setStyleSheet("background-color: #161b22; padding: 10px; border-bottom: 2px solid #58a6ff;")
+        self.main_layout.addWidget(self.lbl_title)
 
-        self.stack = QStackedWidget(); layout.addWidget(self.stack)
-        self.txt_view = QPlainTextEdit(); self.txt_view.setReadOnly(True); self.txt_view.setFont(QFont("Consolas", 11)); self.stack.addWidget(self.txt_view)
-        self.img_view = AdvancedImageViewer(); self.stack.addWidget(self.img_view)
+        self.stack = QStackedWidget()
+        self.main_layout.addWidget(self.stack)
 
-        self.media_widget = QWidget()
-        m_layout = QVBoxLayout(self.media_widget)
+        self.txt_view = QPlainTextEdit(); self.txt_view.setReadOnly(True)
+        self.img_view = AdvancedImageViewer()
+        self.stack.addWidget(self.txt_view); self.stack.addWidget(self.img_view)
+
+        self.media_container = QWidget()
+        m_lay = QVBoxLayout(self.media_container)
+        
+        self.wave_vis = VisualWaveform(); self.wave_vis.hide()
+        m_lay.addWidget(self.wave_vis)
+        
         if HAS_MULTIMEDIA:
-            self.video_widget = QVideoWidget(); m_layout.addWidget(self.video_widget, 1)
-            m_controls = QHBoxLayout()
-            self.btn_play = QPushButton("⏯ Play/Pause"); self.slider = QSlider(Qt.Horizontal); self.vol_slider = QSlider(Qt.Horizontal)
-            self.vol_slider.setMaximumWidth(100); self.vol_slider.setValue(100)
-            m_controls.addWidget(self.btn_play); m_controls.addWidget(self.slider); m_controls.addWidget(QLabel("Vol:")); m_controls.addWidget(self.vol_slider)
-            m_layout.addLayout(m_controls)
-            self.player = QMediaPlayer(); self.audio = QAudioOutput(); self.player.setAudioOutput(self.audio); self.player.setVideoOutput(self.video_widget)
-            self.btn_play.clicked.connect(self._toggle_playback)
-            self.player.positionChanged.connect(self.slider.setValue); self.player.durationChanged.connect(self.slider.setMaximum)
-            self.slider.sliderMoved.connect(self.player.setPosition); self.vol_slider.valueChanged.connect(lambda v: self.audio.setVolume(v/100.0))
-        self.stack.addWidget(self.media_widget)
-        self._setup_shortcuts(); self._load_current_item()
+            # Mount video inside a GraphicsView so it can be flipped, rotated, AND Zoomed/Dragged!
+            self.video_scene = QGraphicsScene()
+            self.video_view = AdvancedVideoViewer(self.video_scene)
+            self.video_item = QGraphicsVideoItem()
+            self.video_scene.addItem(self.video_item)
+            
+            self.video_item.nativeSizeChanged.connect(lambda size: (self.video_item.setSize(size), self.video_view.fitInView(self.video_item.boundingRect(), Qt.KeepAspectRatio)))
+            m_lay.addWidget(self.video_view, 1)
+            
+            self.player = QMediaPlayer(); self.audio = QAudioOutput()
+            self.player.setAudioOutput(self.audio); self.player.setVideoOutput(self.video_item)
+            
+            # A-B Loop mechanism
+            self.loop_a, self.loop_b = -1, -1
+            self.player.positionChanged.connect(self._check_loop)
+            
+        self.stack.addWidget(self.media_container)
 
-    def zoom_in(self):
-        if self.stack.currentIndex() == 0: font = self.txt_view.font(); font.setPointSize(font.pointSize() + 2); self.txt_view.setFont(font)
-        elif self.stack.currentIndex() == 1: self.img_view.scale(1.2, 1.2)
-    def zoom_out(self):
-        if self.stack.currentIndex() == 0: font = self.txt_view.font(); font.setPointSize(max(6, font.pointSize() - 2)); self.txt_view.setFont(font)
-        elif self.stack.currentIndex() == 1: self.img_view.scale(0.8, 0.8)
-    def _setup_shortcuts(self):
-        QShortcut(QKeySequence(Qt.Key_Right), self, self._next_item); QShortcut(QKeySequence(Qt.Key_Left), self, self._prev_item)
-        QShortcut(QKeySequence(Qt.Key_Space), self, self._toggle_playback); QShortcut(QKeySequence(Qt.Key_Escape), self, self.close)
-        QShortcut(QKeySequence(Qt.Key_Up), self, self._vol_up); QShortcut(QKeySequence(Qt.Key_Down), self, self._vol_down)
-    def _vol_up(self):
-        if HAS_MULTIMEDIA and hasattr(self, 'vol_slider'): self.vol_slider.setValue(min(100, self.vol_slider.value() + 10))
-    def _vol_down(self):
-        if HAS_MULTIMEDIA and hasattr(self, 'vol_slider'): self.vol_slider.setValue(max(0, self.vol_slider.value() - 10))
-    def _toggle_playback(self):
-        if hasattr(self, 'player'):
-            if self.player.playbackState() == QMediaPlayer.PlayingState: self.player.pause()
-            else: self.player.play()
-    def _update_nav_buttons(self): 
-        self.btn_prev.setEnabled(self.current_index > 0); self.btn_next.setEnabled(self.current_index < len(self.playlist) - 1)
+        # Bottom Toolbar
+        self.toolbar = QFrame()
+        self.toolbar.setStyleSheet("background-color: rgba(22, 27, 34, 0.9); border-radius: 8px;")
+        t_lay = QHBoxLayout(self.toolbar)
+        
+        btn_prev = QPushButton("◀"); btn_prev.clicked.connect(self._prev_item)
+        btn_next = QPushButton("▶"); btn_next.clicked.connect(self._next_item)
+        self.btn_play = QPushButton("⏯ Play"); self.btn_play.clicked.connect(self._toggle_playback)
+        self.btn_flip = QPushButton("Flip (F)"); self.btn_flip.clicked.connect(self._flip_img)
+        self.btn_rot = QPushButton("Rotate (R)"); self.btn_rot.clicked.connect(self._rot_img)
+        self.btn_slide = QPushButton("Slideshow"); self.btn_slide.setCheckable(True); self.btn_slide.clicked.connect(self._toggle_slide)
+        self.btn_ab = QPushButton("A-B Loop"); self.btn_ab.clicked.connect(self._set_ab_loop)
+        
+        self.slider = QSlider(Qt.Horizontal)
+        if HAS_MULTIMEDIA:
+            self.player.positionChanged.connect(self.slider.setValue)
+            self.player.durationChanged.connect(self.slider.setMaximum)
+            self.slider.sliderMoved.connect(self.player.setPosition)
+
+        t_lay.addWidget(btn_prev); t_lay.addWidget(self.btn_play); t_lay.addWidget(self.slider)
+        t_lay.addWidget(self.btn_ab); t_lay.addWidget(self.btn_flip); t_lay.addWidget(self.btn_rot)
+        t_lay.addWidget(self.btn_slide); t_lay.addWidget(btn_next)
+        self.main_layout.addWidget(self.toolbar)
+        
+        self.slide_timer = QTimer(self); self.slide_timer.timeout.connect(self._next_item)
+        self.rot_angle = 0; self.flip_h = False
+
+        # # Shortcuts
+        QShortcut(QKeySequence("F"), self, self._flip_img)
+        QShortcut(QKeySequence("R"), self, self._rot_img)
+        QShortcut(QKeySequence("H"), self, self._toggle_ui_visibility)
+        QShortcut(QKeySequence("F11"), self, self._toggle_fullscreen)
+        
+        # Make Hide/Mute GLOBAL so they work perfectly while the window is hidden in the background
+        parent_win = self.parent() if self.parent() else self
+        sc_hide = QShortcut(QKeySequence("B"), parent_win)
+        sc_hide.setContext(Qt.ApplicationShortcut)
+        sc_hide.activated.connect(self._toggle_hide)
+        
+        sc_mute = QShortcut(QKeySequence("M"), parent_win)
+        sc_mute.setContext(Qt.ApplicationShortcut)
+        sc_mute.activated.connect(self._toggle_mute)
+        
+        QShortcut(QKeySequence(Qt.Key_Right), self, self._next_item)
+        QShortcut(QKeySequence(Qt.Key_Left), self, self._prev_item)
+        QShortcut(QKeySequence(Qt.Key_Space), self, self._toggle_playback)
+        QShortcut(QKeySequence(Qt.Key_Up), self, self._vol_up)
+        QShortcut(QKeySequence(Qt.Key_Down), self, self._vol_down)
+
+        self._load_current_item()
+
+
+    def _toggle_hide(self):
+        if self.isVisible(): self.hide()
+        else: self.show()
+
+    def _flip_img(self): 
+        if self.stack.currentIndex() == 1: 
+            self.flip_h = not self.flip_h; self._apply_img_transform()
+        elif self.stack.currentIndex() == 2 and HAS_MULTIMEDIA:
+            self.flip_v = not getattr(self, 'flip_v', False); self._apply_video_transform()
+
+    def _rot_img(self): 
+        if self.stack.currentIndex() == 1: 
+            self.rot_angle = (self.rot_angle + 90) % 360; self._apply_img_transform()
+        elif self.stack.currentIndex() == 2 and HAS_MULTIMEDIA:
+            self.rot_v_angle = (getattr(self, 'rot_v_angle', 0) + 90) % 360; self._apply_video_transform()
+
+    def _apply_video_transform(self):
+        if not HAS_MULTIMEDIA: return
+        trans = QTransform()
+        center = self.video_item.boundingRect().center()
+        trans.translate(center.x(), center.y())
+        trans.rotate(getattr(self, 'rot_v_angle', 0))
+        if getattr(self, 'flip_v', False): trans.scale(-1, 1)
+        trans.translate(-center.x(), -center.y())
+        self.video_item.setTransform(trans)
+        self.video_view.fitInView(self.video_item.boundingRect(), Qt.KeepAspectRatio)
+
     def _load_current_item(self):
         if not self.playlist: return
-        self._update_nav_buttons()
         item = self.playlist[self.current_index]
-        self.lbl_title.setText(item['name']); self.lbl_counter.setText(f"{self.current_index + 1} / {len(self.playlist)}")
-        self.setWindowTitle(f"Nexus Viewer - {item['name']}")
-        if hasattr(self, 'player'): self.player.stop()
-        if item['ext'] in ['.png', '.jpg', '.jpeg', '.bmp', '.gif', '.webp']: 
-            self.stack.setCurrentIndex(1); self.img_view.set_image(QPixmap(item['path']))
-        elif item['ext'] in ['.txt', '.py', '.json', '.csv', '.md', '.log', '.xml', '.js', '.html', '.ini', '.sh', '.cpp', '.c', '.h']:
+        self.lbl_title.setText(f"{item['name']} ({self.current_index + 1}/{len(self.playlist)})")
+        if hasattr(self, 'player'): self.player.stop(); self.wave_vis.timer.stop(); self.loop_a = -1; self.loop_b = -1; self.btn_ab.setText("A-B Loop")
+        
+        self.btn_flip.hide(); self.btn_rot.hide(); self.btn_slide.hide(); self.wave_vis.hide(); self.btn_ab.hide()
+        self.flip_v = False; self.rot_v_angle = 0
+        if HAS_MULTIMEDIA: self._apply_video_transform()
+        
+        if item['ext'] in ['.png', '.jpg', '.jpeg', '.bmp']: 
+            self.stack.setCurrentIndex(1)
+            self.orig_pm = QPixmap(item['path'])
+            self.flip_h, self.rot_angle = False, 0
+            self._apply_img_transform()
+            self.btn_flip.show(); self.btn_rot.show(); self.btn_slide.show()
+        elif item['ext'] in ['.mp3', '.wav']: 
+            self.stack.setCurrentIndex(2); self.video_view.hide(); self.wave_vis.show(); self.btn_ab.show()
+            self.player.setSource(QUrl.fromLocalFile(item['path'])); self._toggle_playback()
+        elif item['ext'] in ['.mp4', '.avi', '.mkv', '.mov']: 
+            self.stack.setCurrentIndex(2); self.video_view.show(); self.wave_vis.hide(); self.btn_ab.show()
+            self.btn_flip.show(); self.btn_rot.show()
+            self.player.setSource(QUrl.fromLocalFile(item['path'])); self._toggle_playback()
+        else:
             self.stack.setCurrentIndex(0)
             try:
-                with open(item['path'], 'r', encoding='utf-8', errors='replace') as f: self.txt_view.setPlainText(f.read())
+                with open(item['path'], 'r', encoding='utf-8') as f: self.txt_view.setPlainText(f.read())
             except Exception as e: self.txt_view.setPlainText(str(e))
-        elif item['ext'] in ['.mp3', '.wav', '.ogg', '.mp4', '.avi', '.mkv', '.mov'] and HAS_MULTIMEDIA: 
-            self.stack.setCurrentIndex(2); self.player.setSource(QUrl.fromLocalFile(item['path'])); self.player.play()
-        else: self.stack.setCurrentIndex(0); self.txt_view.setPlainText("Format unsupported natively.")
+
+    def _toggle_mute(self):
+        if HAS_MULTIMEDIA and hasattr(self, 'audio'): 
+            self.audio.setMuted(not self.audio.isMuted())
+
+    def _vol_up(self):
+        if HAS_MULTIMEDIA and hasattr(self, 'audio'): 
+            self.audio.setVolume(min(1.0, self.audio.volume() + 0.1))
+
+    def _vol_down(self):
+        if HAS_MULTIMEDIA and hasattr(self, 'audio'): 
+            self.audio.setVolume(max(0.0, self.audio.volume() - 0.1))
+
+    def _toggle_ui_visibility(self):
+        is_visible = not self.toolbar.isVisible()
+        self.toolbar.setVisible(is_visible)
+        self.lbl_title.setVisible(is_visible)
+
+    def _check_loop(self, pos):
+        if self.loop_b > 0 and pos >= self.loop_b: self.player.setPosition(max(0, self.loop_a))
+
+    def _set_ab_loop(self):
+        if self.loop_a == -1: self.loop_a = self.player.position(); self.btn_ab.setText("Set B")
+        elif self.loop_b == -1: self.loop_b = self.player.position(); self.btn_ab.setText("Clear A-B")
+        else: self.loop_a = -1; self.loop_b = -1; self.btn_ab.setText("A-B Loop")
+
+    def _toggle_slide(self):
+        if self.btn_slide.isChecked(): self.slide_timer.start(3000)
+        else: self.slide_timer.stop()
+
+    def _apply_img_transform(self):
+        if hasattr(self, 'orig_pm'):
+            img = self.orig_pm.toImage()
+            if self.flip_h: img = img.mirrored(True, False)
+            pm = QPixmap.fromImage(img).transformed(QTransform().rotate(self.rot_angle))
+            self.img_view.set_image(pm)
+
+    def _toggle_fullscreen(self): self.showNormal() if self.isFullScreen() else self.showFullScreen()
+    def _toggle_playback(self):
+        if hasattr(self, 'player'):
+            if self.player.playbackState() == QMediaPlayer.PlayingState: self.player.pause(); self.wave_vis.timer.stop()
+            else: self.player.play(); self.wave_vis.timer.start(100) if self.wave_vis.isVisible() else None
+
+
     def _next_item(self):
         if self.current_index < len(self.playlist) - 1: self.current_index += 1; self._load_current_item()
     def _prev_item(self):
         if self.current_index > 0: self.current_index -= 1; self._load_current_item()
     def closeEvent(self, ev):
-        if hasattr(self, 'player'): self.player.stop()
+        if hasattr(self, 'player'): self.player.stop(); self.wave_vis.timer.stop()
         super().closeEvent(ev)
 
 # ---------------- Main Application Window ----------------
-class NexusVirtualManager(QMainWindow):
+class vmanVirtualManager(QMainWindow):
     def __init__(self):
         super().__init__()
         self.show_hidden = False
+        self.show_secondary_names = False
         self.current_prefix = "/"
         self.active_db_path = str(DB_FILE)
         
         # --- Persistent Storage Settings ---
-        self.settings = QSettings("NexusOS", "VirtualManager")
+        self.settings = QSettings("vmanOS", "VirtualManager")
         self.max_storage_gb = float(self.settings.value("max_storage_gb", 100.0))
         self.max_virtual_storage = self.max_storage_gb * 1024 * 1024 * 1024
         # ----------------------------------------
@@ -3460,14 +3679,15 @@ class NexusVirtualManager(QMainWindow):
         self.render_progress = None
 
         ensure_dirs()
-        self.db = NexusDB(DB_FILE)
+        self.db = vmanDB(DB_FILE)
         self.setWindowTitle(APP_TITLE)
         self.resize(1600, 950)
         self.setFont(QFont("Segoe UI", 10))
+        self.setWindowIcon(QIcon("icons/vman.png"))
         
         self._build_ui()
         self._setup_shortcuts()
-        self.apply_theme("Dark Nexus") 
+        self.apply_theme("Dark vman") 
         self.refresh_all()
 
     def sys_log(self, message):
@@ -3501,7 +3721,7 @@ class NexusVirtualManager(QMainWindow):
         act_new_file = QAction("📄 File", self)
         act_new_file.triggered.connect(self.create_virtual_file)
         
-        act_timeline = QAction("📅 Timeline Diary", self)
+        act_timeline = QAction("📅 Timeline", self)
         act_timeline.triggered.connect(lambda: TimelineDiaryDialog(self.active_db_path, self).exec())
         
         act_analyzer = QAction("🧹 Analyzer", self)
@@ -3522,6 +3742,11 @@ class NexusVirtualManager(QMainWindow):
         
         self.act_view_mode = QAction("🖼 Grid View", self)
         self.act_view_mode.triggered.connect(self.toggle_view_mode)
+        
+        self.act_sec_name = QAction("🏷", self)
+        self.act_sec_name.setCheckable(True)
+        self.act_sec_name.triggered.connect(self.toggle_secondary_names)
+        tb.addAction(self.act_sec_name)
         
         self.act_toggle_sidebar = QAction("📊 Inspector", self)
         self.act_toggle_sidebar.triggered.connect(self.toggle_sidebar)
@@ -3752,6 +3977,87 @@ class NexusVirtualManager(QMainWindow):
         self.status = QStatusBar()
         self.setStatusBar(self.status)
 
+    def cmd_map_folder(self, item):
+        typ, v_path, db_id = item
+        if typ != "folder": return
+        real_p = QFileDialog.getExistingDirectory(self, f"Select Real Folder mapped to {v_path}")
+        if not real_p: return
+        real_p = real_p.replace('\\', '/')
+        try:
+            with sqlite3.connect(self.db.path, timeout=10) as conn:
+                cur = conn.cursor()
+                # 1. Update the folder itself
+                cur.execute("UPDATE virtual_fs SET real_path=? WHERE id=?", (real_p, db_id))
+                # 2. Automatically sync all contents inside the folder
+                cur.execute("SELECT id, parent_path, name FROM virtual_fs WHERE parent_path LIKE ?", (f"{v_path}%",))
+                for c_id, pp, name in cur.fetchall():
+                    full_v = f"{pp}{name}/".replace("//", "/")
+                    rel = full_v[len(v_path):]
+                    new_real = os.path.join(real_p, rel).replace('\\', '/').rstrip('/')
+                    cur.execute("UPDATE virtual_fs SET real_path=? WHERE id=?", (new_real, c_id))
+                conn.commit()
+            QMessageBox.information(self, "Mapped", f"Successfully mapped '{v_path}' and all its contents to:\n{real_p}")
+            self.clear_cache(); self.refresh_all()
+        except Exception as e: QMessageBox.critical(self, "Error", str(e))
+
+    def toggle_secondary_names(self):
+        self.show_secondary_names = self.act_sec_name.isChecked()
+        self.clear_cache()
+        self.load_directory(self.current_prefix)
+
+    def show_multi_properties(self, items):
+        total_size, folders, files = 0, 0, 0
+        with sqlite3.connect(self.db.path) as conn:
+            cur = conn.cursor()
+            for typ, path, db_id in items:
+                if db_id == -1: continue
+                if typ == "file":
+                    files += 1
+                    sz = cur.execute("SELECT size FROM virtual_fs WHERE id=?", (db_id,)).fetchone()
+                    total_size += sz[0] if sz and sz[0] else 0
+                else:
+                    folders += 1
+                    cnt, sz = cur.execute("SELECT COUNT(id), SUM(size) FROM virtual_fs WHERE parent_path LIKE ? AND is_folder=0", (f"{path}%",)).fetchone()
+                    files += cnt or 0
+                    total_size += sz or 0
+        QMessageBox.information(self, "Multi-Selection Properties", f"<b>Selected Items:</b> {len(items)}<br><br><b>Total Folders:</b> {folders}<br><b>Total Files:</b> {files}<br><b>Combined Size:</b> {human_size(total_size)}")
+
+    def cmd_delete_physical(self, items):
+        if QMessageBox.question(self, "Physical Deletion", f"WARNING: This will delete {len(items)} items from your REAL hard drive permanently.\n\nAre you sure?", QMessageBox.Yes|QMessageBox.No) != QMessageBox.Yes: return
+        deleted = 0
+        with sqlite3.connect(self.db.path) as conn:
+            cur = conn.cursor()
+            for typ, path, db_id in items:
+                if db_id == -1: continue
+                rp = cur.execute("SELECT real_path FROM virtual_fs WHERE id=?", (db_id,)).fetchone()
+                if rp and rp[0] and os.path.exists(rp[0]):
+                    try:
+                        shutil.rmtree(rp[0]) if os.path.isdir(rp[0]) else os.remove(rp[0])
+                        deleted += 1
+                    except Exception as e: QMessageBox.warning(self, "Error", f"Failed to delete {rp[0]}: {e}")
+                if typ == "file": cur.execute("DELETE FROM virtual_fs WHERE id=?", (db_id,))
+                else: cur.execute("DELETE FROM virtual_fs WHERE parent_path LIKE ? OR id=?", (f"{path}%", db_id))
+            conn.commit()
+        self.clear_cache(); self.refresh_all(); self.status.showMessage(f"Physically deleted {deleted} items from disk.")
+
+    def cmd_map_parent_drive(self, item):
+        db_id = item[2]
+        if db_id == -1: return
+        with sqlite3.connect(self.db.path) as conn:
+            rp = conn.cursor().execute("SELECT real_path FROM virtual_fs WHERE id=?", (db_id,)).fetchone()
+            if not rp or not rp[0]: return QMessageBox.warning(self, "Error", "No physical path associated with this item.")
+            
+            # Auto-detect Windows drive letter (C:/) or Linux root mount (/mnt/usb/)
+            old_root = rp[0][:3] if rp[0][1] == ':' else "/" + rp[0].strip("/").split("/")[0] + "/"
+            new_root, ok = QInputDialog.getText(self, "Map Drive/Mount", f"Current root detected: {old_root}\nEnter new Drive Letter or Mount Point:", QLineEdit.Normal, old_root)
+            if ok and new_root.strip():
+                new_root = new_root.strip().replace('\\', '/')
+                if not new_root.endswith('/'): new_root += '/'
+                conn.cursor().execute("UPDATE virtual_fs SET real_path = REPLACE(real_path, ?, ?) WHERE real_path LIKE ?", (old_root, new_root, f"{old_root}%"))
+                conn.commit()
+                QMessageBox.information(self, "Remapped", f"Successfully updated paths mapped under {old_root} to {new_root}.")
+                self.clear_cache(); self.refresh_all()
+
     def _setup_shortcuts(self):
         QShortcut(QKeySequence(Qt.Key_F11), self, self.toggle_fullscreen)
         QShortcut(QKeySequence("Shift+Delete"), self, self.cmd_delete_permanent)
@@ -3760,12 +4066,12 @@ class NexusVirtualManager(QMainWindow):
         QShortcut(QKeySequence("Ctrl+V"), self, self.cmd_paste); QShortcut(QKeySequence("Delete"), self, self.cmd_delete)
         QShortcut(QKeySequence("F2"), self, self.cmd_rename); QShortcut(QKeySequence("Ctrl+Shift+N"), self, self.create_folder)
         QShortcut(QKeySequence("Ctrl+N"), self, self.create_virtual_file); QShortcut(QKeySequence("Ctrl+F"), self, self.search_box.setFocus)
-        QShortcut(QKeySequence("Ctrl+O"), self, self.open_selected_nexus)
+        QShortcut(QKeySequence("Ctrl+O"), self, self.open_selected_vman)
         QShortcut(QKeySequence("Backspace"), self, self.nav_back); QShortcut(QKeySequence("Shift+Backspace"), self, self.nav_forward); QShortcut(QKeySequence("Alt+Up"), self, self.nav_up)
 
     def show_help(self):
-        dlg = QDialog(self); dlg.setWindowTitle("Nexus OS Instructions"); dlg.setStyleSheet(THEMES[self.theme_combo.currentText()]); dlg.resize(600, 400); lay = QVBoxLayout(dlg); txt = QPlainTextEdit()
-        txt.setPlainText("""NEXUS OS - KEYBOARD & FEATURE GUIDE\n\n[Keyboard Navigation]\nBackspace   : Go Back\nShift+Back  : Go Forward\nAlt+Up      : Go Up One Directory\nCtrl+F      : Focus Global Search\nEnter       : Open selected folder or OS File\n\n[Viewer Controls (Ctrl+O)]\nSpacebar    : Play/Pause Media\nRight/Left  : Next/Previous Item\nUp/Down     : Volume Control\nZoom In/Out : Dedicated buttons for Images and Text\nEscape      : Close Viewer\n\n[Operations]\nMultiselect : Use Ctrl/Shift + Click to highlight multiple items.\nExport/OS   : Right click to "Materialize" ANY number of files back to Physical Windows/Mac OS.\nF2          : Rename (Select multiple files to Bulk Rename sequentially!)\nDelete      : Send to Trash / Permanently Delete\nCtrl+C/V/X  : Copy, Paste, Cut (Works on multiple items!)""")
+        dlg = QDialog(self); dlg.setWindowTitle("vman OS Instructions"); dlg.setStyleSheet(THEMES[self.theme_combo.currentText()]); dlg.resize(600, 400); lay = QVBoxLayout(dlg); txt = QPlainTextEdit()
+        txt.setPlainText("""vman OS - KEYBOARD & FEATURE GUIDE\n\n[Keyboard Navigation]\nBackspace   : Go Back\nShift+Back  : Go Forward\nAlt+Up      : Go Up One Directory\nCtrl+F      : Focus Global Search\nEnter       : Open selected folder or OS File\n\n[Viewer Controls (Ctrl+O)]\nSpacebar    : Play/Pause Media\nRight/Left  : Next/Previous Item\nUp/Down     : Volume Control\nZoom In/Out : Dedicated buttons for Images and Text\nEscape      : Close Viewer\n\n[Operations]\nMultiselect : Use Ctrl/Shift + Click to highlight multiple items.\nExport/OS   : Right click to "Materialize" ANY number of files back to Physical Windows/Mac OS.\nF2          : Rename (Select multiple files to Bulk Rename sequentially!)\nDelete      : Send to Trash / Permanently Delete\nCtrl+C/V/X  : Copy, Paste, Cut (Works on multiple items!)""")
         txt.setReadOnly(True); lay.addWidget(txt); dlg.exec()
 
     def filter_current_view(self, text):
@@ -3781,7 +4087,7 @@ class NexusVirtualManager(QMainWindow):
 
     def apply_theme(self, theme_name=None):
         if theme_name is None: theme_name = self.theme_combo.currentText()
-        self.setStyleSheet(THEMES.get(theme_name, THEMES["Dark Nexus"]))
+        self.setStyleSheet(THEMES.get(theme_name, THEMES["Dark vman"]))
         self.is_dark_mode = "Light" not in theme_name
         self.update_statistics() 
         
@@ -3810,7 +4116,7 @@ class NexusVirtualManager(QMainWindow):
         return False
 
     def load_external_db(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Load Nexus DB", "", "SQLite DB (*.db)")
+        path, _ = QFileDialog.getOpenFileName(self, "Load vman DB", "", "SQLite DB (*.db)")
         if path:
             dest = VIEWS_DIR / Path(path).name
             if str(Path(path).resolve()) != str(dest.resolve()): shutil.copy2(path, dest)
@@ -3848,7 +4154,7 @@ class NexusVirtualManager(QMainWindow):
                 self.active_db_path = str(DB_FILE); self.status.showMessage("Reconnected to Main System DB"); self.sys_log("Reconnected to Main System DB.")
             else:
                 self.active_db_path = str(VIEWS_DIR / db_name); self.status.showMessage(f"Connected to isolated DB: {db_name}"); self.sys_log(f"Switched context to Isolated DB: {db_name}")
-            self.db.close(); self.db = NexusDB(Path(self.active_db_path)); self.clear_cache(); self.refresh_tree(); self.nav_to_path("/")
+            self.db.close(); self.db = vmanDB(Path(self.active_db_path)); self.clear_cache(); self.refresh_tree(); self.nav_to_path("/")
         elif path: self.nav_to_path(path)
 
     def on_folder_expand(self, item: QTreeWidgetItem):
@@ -3926,7 +4232,7 @@ class NexusVirtualManager(QMainWindow):
         if not self.render_queue:
             self.render_timer.stop()
             # UPDATED: Expanded to 7 highly detailed columns
-            shared_model = NexusTableModel(["Name", "Ext", "Size", "Modified", "Type", "Location", "Tag"], self.table_rows_buffer)
+            shared_model = vmanTableModel(["Name", "Ext", "Size", "Modified", "Type", "Location", "Tag"], self.table_rows_buffer)
             self.file_table.setModel(shared_model); self.file_grid.setModel(shared_model)
             
             # Adjusted column widths for the new data
@@ -3951,14 +4257,16 @@ class NexusVirtualManager(QMainWindow):
             if len(item) == 8:
                 db_id, pp, f_name, c_tag, sec_n, is_h, count, size = item
                 v_path = f"{pp}{f_name}/" if not f_name.endswith("/") else f"{pp}{f_name}"
-                disp_name = f"{f_name}\n({sec_n})" if sec_n else f"{f_name}"
-                # UPDATED: Added blank Ext/Date mapping for folders
+                disp_name = sec_n if (self.show_secondary_names and sec_n) else (f"{f_name}\n({sec_n})" if sec_n else f"{f_name}")
+                
                 self.table_rows_buffer.append({"display": [disp_name, "", human_size(size), "N/A", f"Virtual Folder ({count})", pp, c_tag], "sort_keys": [(0, f_name.lower()), (0, ""), (0, size), (0, ""), (0, count), (0, pp.lower()), (0, c_tag)], "user_data": ("folder", v_path, db_id), "color_tag": c_tag, "is_hidden": is_h, "icon": dir_icon})
             else:
                 db_id, n, s, ext, rp, mod, c_tag, sec_n, is_h = item[:9]
                 icon = self._get_native_icon(rp, False, ext); s_val = s if s else 0; ext_str = str(ext) if ext else ""
-                disp_name = f"{n}\n({sec_n})" if sec_n else str(n)
-                # UPDATED: Injected precise Ext and Date strings
+                
+                # FIXED: Uses 'n' instead of 'f_name' for virtual files!
+                disp_name = sec_n if (self.show_secondary_names and sec_n) else (f"{n}\n({sec_n})" if sec_n else f"{n}")
+                
                 self.table_rows_buffer.append({"display": [disp_name, ext_str, human_size(s_val), str(mod), "Virtual File", str(rp) if rp else "", c_tag], "sort_keys": [(1, str(n).lower()), (1, ext_str.lower()), (1, s_val), (1, str(mod)), (1, "Virtual File"), (1, str(rp).lower() if rp else ""), (1, c_tag)], "user_data": ("file", str(rp), db_id), "color_tag": c_tag, "is_hidden": is_h, "icon": icon})
 
         if self.render_progress: self.render_progress.setValue(self.render_progress.maximum() - len(self.render_queue))
@@ -4072,11 +4380,11 @@ class NexusVirtualManager(QMainWindow):
             except Exception as e: QMessageBox.warning(self, "Open", str(e))
         else: QMessageBox.warning(self, "Not Found", "Target file is missing locally.")
 
-    def open_selected_nexus(self):
+    def open_selected_vman(self):
         sel = self._get_selected_items()
         if not sel or sel[0][2] == -1: return
         target_typ, target_rp, target_db_id = sel[0]
-        if target_typ != "file" or not target_rp or not os.path.exists(target_rp): return QMessageBox.warning(self, "Nexus Viewer", "Cannot open virtual folder or missing local file.")
+        if target_typ != "file" or not target_rp or not os.path.exists(target_rp): return QMessageBox.warning(self, "vman Viewer", "Cannot open virtual folder or missing local file.")
             
         playlist, start_index = [], 0
         model = self.file_table.model()
@@ -4086,7 +4394,7 @@ class NexusVirtualManager(QMainWindow):
                 playlist.append({'path': data[1], 'name': name.split('\n')[0], 'ext': os.path.splitext(data[1])[1].lower()})
                 if data[2] == target_db_id: start_index = len(playlist) - 1
 
-        self.viewer = NexusViewer(playlist, start_index, self); self.viewer.show()
+        self.viewer = vmanViewer(playlist, start_index, self); self.viewer.show()
 
     def open_local_file_system(self, db_id):
         row = self.db.conn.cursor().execute("SELECT real_path FROM virtual_fs WHERE id = ?", (db_id,)).fetchone()
@@ -4108,7 +4416,7 @@ class NexusVirtualManager(QMainWindow):
 
     def show_properties(self, typ, path, db_id):
         cur = self.db.conn.cursor()
-        dlg = QDialog(self); dlg.setWindowTitle("Nexus Entity Properties"); dlg.setMinimumWidth(450); dlg.setStyleSheet(THEMES.get(self.theme_combo.currentText(), THEMES["Dark Nexus"]))
+        dlg = QDialog(self); dlg.setWindowTitle("vman Entity Properties"); dlg.setMinimumWidth(450); dlg.setStyleSheet(THEMES.get(self.theme_combo.currentText(), THEMES["Dark vman"]))
         layout = QFormLayout(dlg)
         
         if typ == "folder":
@@ -4231,7 +4539,7 @@ class NexusVirtualManager(QMainWindow):
                 if sel_items[0][0] == "file": 
                     menu.addAction("🚀 Open Native System App", lambda: self.open_local_file_system(sel_items[0][2]))
                     menu.addAction("📂 Show in OS Explorer", lambda: self.open_file_location(sel_items[0][2]))
-                    menu.addAction("🎞 Open in Nexus Viewer (Ctrl+O)", self.open_selected_nexus)
+                    menu.addAction("🎞 Open in vman Viewer (Ctrl+O)", self.open_selected_vman)
                 elif sel_items[0][0] == "folder":
                     # NEW: Option to hash entire folder contents!
                     menu.addAction("🧬 Compute SHA-256 for all Contents", lambda: self.bulk_compute_hash(sel_items[0][1]))
@@ -4243,7 +4551,7 @@ class NexusVirtualManager(QMainWindow):
                     menu.addAction("Unhide" if res[0] else "Hide", lambda: self.toggle_item_hidden(sel_items[0][2], not res[0]))
                     menu.addAction("Remove Favorite" if res[1] else "Add Favorite", lambda: self.toggle_item_fav(sel_items[0][2], not res[1]))
             
-            menu.addAction("Copy (Ctrl+C)", self.cmd_copy); menu.addAction("Cut (Ctrl+X)", self.cmd_delete) ; menu.addAction("Rename (F2)", self.cmd_rename)
+            menu.addAction("Copy (Ctrl+C)", self.cmd_copy); menu.addAction("Cut (Ctrl+X)", self.cmd_cut) ; menu.addAction("Rename (F2)", self.cmd_rename)
             
             if self.current_prefix.startswith("trash://"):
                 menu.addAction("♻️ Restore from Trash", self.restore_from_trash)
@@ -4261,7 +4569,17 @@ class NexusVirtualManager(QMainWindow):
             menu.addSeparator()         
             
             
-            if len(sel_items) == 1: menu.addAction("ℹ️ Properties", lambda: self.show_properties(sel_items[0][0], sel_items[0][1], sel_items[0][2])); menu.addSeparator()
+            if len(sel_items) == 1: 
+                menu.addAction("ℹ️ Properties", lambda: self.show_properties(sel_items[0][0], sel_items[0][1], sel_items[0][2]))
+                if sel_items[0][0] == "folder":
+                    menu.addAction("🔗 Map THIS Folder to Physical OS", lambda: self.cmd_map_folder(sel_items[0]))
+                menu.addAction("🗺️ Map Parent Drive/Mount (Auto-Detect)", lambda: self.cmd_map_parent_drive(sel_items[0]))
+            elif len(sel_items) > 1:
+                menu.addAction("ℹ️ Multi-Item Properties", lambda: self.show_multi_properties(sel_items))
+            
+            menu.addSeparator()
+            menu.addAction("💀 Delete PHYSICAL OS Items", lambda: self.cmd_delete_physical(sel_items))
+            menu.addSeparator()
                 
             tag_menu = menu.addMenu("🏷 Set Color Tag")
             for color in ["None", "Red", "Green", "Blue", "Gold"]: tag_menu.addAction(color, lambda checked=False, c=color: self.bulk_tag_items(c, sel_items))
@@ -4333,7 +4651,7 @@ class NexusVirtualManager(QMainWindow):
         # Now respects Shift+Delete bypassing the Trash
         is_permanent = force_permanent or self.current_prefix.startswith("trash://") or self.active_db_path != str(DB_FILE)
         
-        msg = "Permanently delete from Nexus OS? (This cannot be undone!)" if is_permanent else "Move selected items to Virtual Trash?"
+        msg = "Permanently delete from vman OS? (This cannot be undone!)" if is_permanent else "Move selected items to Virtual Trash?"
         if QMessageBox.question(self, "Delete", msg, QMessageBox.Yes|QMessageBox.No) != QMessageBox.Yes: return
         
         with sqlite3.connect(self.db.path) as conn:
@@ -4411,7 +4729,7 @@ class NexusVirtualManager(QMainWindow):
                     conn.cursor().execute("UPDATE virtual_fs SET secondary_name = ? WHERE id = ?", (new_sec.strip(), db_id)); conn.commit(); self.clear_cache(); self.load_directory(self.current_prefix)
 
     def execute_internal_drop(self, dest_path, is_copy):
-        if not self._current_drag_items or dest_path.startswith("trash://") or self._is_smart_path(dest_path) or self.active_db_path != str(DB_FILE): return
+        if not self._current_drag_items or dest_path.startswith("trash://") or self._is_smart_path(dest_path): return
         with sqlite3.connect(self.db.path) as conn:
             cur = conn.cursor()
             for typ, path, db_id in self._current_drag_items:
@@ -4448,7 +4766,8 @@ class NexusVirtualManager(QMainWindow):
         name, ok = QInputDialog.getText(self, "New Virtual File", "File Name:")
         if ok and name.strip():
             with sqlite3.connect(self.db.path) as conn:
-                conn.cursor().execute("INSERT INTO virtual_fs (parent_path, name, is_folder, real_path, size, extension, modified) VALUES (?, ?, 0, '', 0, ?, ?)", (self.current_prefix, name.strip(), os.path.splitext(name.strip())[1].lower(), now_ts())); conn.commit(); self.clear_cache(); self.load_directory(self.current_prefix)
+                conn.cursor().execute("INSERT INTO virtual_fs (parent_path, name, is_folder, real_path, size, extension, modified, creation_date) VALUES (?, ?, 0, '', 0, ?, ?, ?)", (self.current_prefix, name.strip(), os.path.splitext(name.strip())[1].lower(), now_ts(), now_ts())); conn.commit(); self.clear_cache(); self.load_directory(self.current_prefix)
+       
 
     def import_real_files(self):
         if not self.current_prefix.startswith("trash://") and not self.current_prefix.startswith("fav://") and not self._is_smart_path(self.current_prefix):
@@ -4513,7 +4832,7 @@ class NexusVirtualManager(QMainWindow):
         stats = self.db.get_stats(self.current_prefix if not self._is_smart_path(self.current_prefix) else "")
         usage_pct = (stats['used_bytes'] / self.max_virtual_storage) * 100 if self.max_virtual_storage else 0
         html = f"<h3 style='color:#58a6ff;'>System Analytics ({Path(self.active_db_path).name})</h3><hr><b>Total Virtual Files:</b> {stats['files']}<br><b>Total Virtual Folders:</b> {stats['folders']}<br><b>Simulated Storage Used:</b> {human_size(stats['used_bytes'])}<br><b>Average File Size:</b> {human_size(stats['avg_bytes'])}<br><b>System Allocation:</b> {usage_pct:.4f}%<br><hr><b>Oldest Mod Date:</b> {stats['oldest']}<br><b>Newest Mod Date:</b> {stats['newest']}<br><hr><h4 style='color:#58a6ff;'>Top Largest Managed Files:</h4><ul style='list-style-type: square; margin-left: -20px;'>"
-        for f in stats['top_files'][:5]: html += f"<li>{f[0]} <span style='color:#8b949e;'>({human_size(f[1])})</span></li>"
+        for f in stats['top_files'][:10]: html += f"<li>{f[0]} <span style='color:#8b949e;'>({human_size(f[1])})</span></li>"
         html += "</ul>"
         self.lbl_stats_txt.setHtml(html)
         
@@ -4586,7 +4905,7 @@ class NexusVirtualManager(QMainWindow):
     def open_tag_library(self):
         # Create the dialog only once, so it remembers your search and columns
         if not hasattr(self, 'tag_library_instance') or self.tag_library_instance is None:
-            self.tag_library_instance = NexusTagLibraryDialog(self.active_db_path, self)
+            self.tag_library_instance = vmanTagLibraryDialog(self.active_db_path, self)
         else:
             # Refresh automatically if you switched databases
             if self.tag_library_instance.db_path != self.active_db_path:
@@ -4627,7 +4946,7 @@ class NexusVirtualManager(QMainWindow):
                             self.db.close()
                             db_file.rename(new_file)
                             self.active_db_path = str(new_file)
-                            self.db = NexusDB(Path(self.active_db_path))
+                            self.db = vmanDB(Path(self.active_db_path))
                             self.status.showMessage(f"Renamed active database to {new_file.name}")
                         else:
                             db_file.rename(new_file)
@@ -4644,7 +4963,7 @@ class NexusVirtualManager(QMainWindow):
                         if self.active_db_path == str(db_file):
                             self.db.close()
                             self.active_db_path = str(DB_FILE)
-                            self.db = NexusDB(Path(self.active_db_path))
+                            self.db = vmanDB(Path(self.active_db_path))
                             self.status.showMessage("Reconnected to Main System DB. Active isolated DB was deleted.")
                             self.nav_to_path("/")
                             
@@ -4736,6 +5055,6 @@ class NexusVirtualManager(QMainWindow):
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     app.setApplicationName(APP_TITLE)
-    win = NexusVirtualManager()
+    win = vmanVirtualManager()
     win.show()
     sys.exit(app.exec())
