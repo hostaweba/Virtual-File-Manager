@@ -3375,6 +3375,79 @@ class AdvancedVideoViewer(QGraphicsView):
         if event.key() in (Qt.Key_Left, Qt.Key_Right, Qt.Key_Up, Qt.Key_Down, Qt.Key_Space): event.ignore()
         else: super().keyPressEvent(event)
 
+class LazyImageLabel(QLabel):
+    def __init__(self, path):
+        super().__init__()
+        self.path = path
+        self.loaded = False
+        self.setMinimumHeight(600)
+        self.setAlignment(Qt.AlignCenter)
+        self.setStyleSheet("background: transparent; margin-bottom: 20px;")
+
+    def load_if_needed(self, view_width):
+        if not self.loaded:
+            img = QImage(self.path)
+            if not img.isNull() and img.width() > 0:
+                pm = QPixmap.fromImage(img).scaledToWidth(view_width - 40, Qt.SmoothTransformation)
+                self.setPixmap(pm)
+                self.setMinimumHeight(pm.height())
+            self.loaded = True
+
+
+class VerticalStripViewer(QScrollArea):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWidgetResizable(True)
+        self.setStyleSheet("background: transparent; border: none;")
+        self.container = QWidget()
+        self.layout = QVBoxLayout(self.container)
+        self.layout.setContentsMargins(0, 0, 0, 0)
+        self.layout.setAlignment(Qt.AlignTop | Qt.AlignHCenter)
+        self.setWidget(self.container)
+        self.labels = []
+        self.verticalScrollBar().valueChanged.connect(self.check_visibility)
+        
+    def load_playlist(self, playlist):
+        while self.layout.count():
+            item = self.layout.takeAt(0)
+            if item.widget(): item.widget().deleteLater()
+        self.labels.clear()
+        
+        for item in playlist:
+            if item['ext'] in ['.png', '.jpg', '.jpeg', '.bmp', '.gif', '.webp']:
+                lbl = LazyImageLabel(item['path'])
+                self.layout.addWidget(lbl)
+                self.labels.append(lbl)
+        QTimer.singleShot(100, self.check_visibility)
+        
+    def check_visibility(self):
+        vw = self.viewport().width()
+        rect = self.viewport().rect().adjusted(0, -1500, 0, 1500) # Preload buffer
+        for lbl in self.labels:
+            lbl_y = lbl.mapTo(self.container, lbl.rect().topLeft()).y()
+            scroll_y = self.verticalScrollBar().value()
+            if lbl_y + lbl.height() >= scroll_y - 1500 and lbl_y <= scroll_y + rect.height():
+                lbl.load_if_needed(vw)
+                
+    def scroll_to_index(self, index):
+        if 0 <= index < len(self.labels):
+            y = self.labels[index].mapTo(self.container, self.labels[index].rect().topLeft()).y()
+            self.verticalScrollBar().setValue(y)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.check_visibility()
+        
+    def keyPressEvent(self, event):
+        if event.key() in (Qt.Key_Up, Qt.Key_Down):
+            bar = self.verticalScrollBar()
+            step = 150 if event.key() == Qt.Key_Down else -150
+            bar.setValue(bar.value() + step)
+            event.accept()
+        else:
+            super().keyPressEvent(event)
+
+
 class vmanViewer(QDialog):
     def __init__(self, playlist, start_index, parent=None):
         super().__init__(parent)
@@ -3382,10 +3455,18 @@ class vmanViewer(QDialog):
         self.setWindowTitle("VMan Media Engine"); self.resize(1100, 800)
         self.setStyleSheet(THEMES.get(parent.theme_combo.currentText() if parent else "Dark", THEMES["Dark"]))
         
-        # Absolute layout for floating toolbar
         self.main_layout = QVBoxLayout(self)
+        self.main_layout.setContentsMargins(0, 0, 0, 0)
+        self.main_layout.setSpacing(0)
         
-        # Top Filename Header (Separate from bottom tools)
+        # Slideshow Running Line (Progress Bar)
+        self.slide_progress = QFrame()
+        self.slide_progress.setFixedHeight(4)
+        self.slide_progress.setStyleSheet("background-color: #58a6ff;")
+        self.slide_progress.setFixedWidth(0)
+        self.slide_progress.hide()
+        self.main_layout.addWidget(self.slide_progress)
+
         self.lbl_title = QLabel()
         self.lbl_title.setFont(QFont("Segoe UI", 14, QFont.Bold))
         self.lbl_title.setAlignment(Qt.AlignCenter)
@@ -3397,45 +3478,54 @@ class vmanViewer(QDialog):
 
         self.txt_view = QPlainTextEdit(); self.txt_view.setReadOnly(True)
         self.img_view = AdvancedImageViewer()
-        self.stack.addWidget(self.txt_view); self.stack.addWidget(self.img_view)
-
+        self.vert_view = VerticalStripViewer() # New Vertical Mode
+        
+        self.stack.addWidget(self.txt_view)    # Index 0
+        self.stack.addWidget(self.img_view)    # Index 1
+        
         self.media_container = QWidget()
         m_lay = QVBoxLayout(self.media_container)
-        
         self.wave_vis = StaticWaveform(); self.wave_vis.hide()
         m_lay.addWidget(self.wave_vis)
         
         if HAS_MULTIMEDIA:
-            # Mount video inside a GraphicsView so it can be flipped, rotated, AND Zoomed/Dragged!
             self.video_scene = QGraphicsScene()
             self.video_view = AdvancedVideoViewer(self.video_scene)
             self.video_item = QGraphicsVideoItem()
             self.video_scene.addItem(self.video_item)
-            
             self.video_item.nativeSizeChanged.connect(lambda size: (self.video_item.setSize(size), self.video_view.fitInView(self.video_item.boundingRect(), Qt.KeepAspectRatio)))
             m_lay.addWidget(self.video_view, 1)
-            
             self.player = QMediaPlayer(); self.audio = QAudioOutput()
             self.player.setAudioOutput(self.audio); self.player.setVideoOutput(self.video_item)
-            
-            # A-B Loop mechanism
             self.loop_a, self.loop_b = -1, -1
             self.player.positionChanged.connect(self._check_loop)
             
-        self.stack.addWidget(self.media_container)
+        self.stack.addWidget(self.media_container) # Index 2
+        self.stack.addWidget(self.vert_view)       # Index 3
 
         # Bottom Toolbar
-        self.toolbar = QFrame()
-        self.toolbar.setStyleSheet("background-color: rgba(22, 27, 34, 0.9); border-radius: 8px;")
+        self.toolbar = QWidget()
+        self.toolbar.setStyleSheet("background-color: rgba(22, 27, 34, 0.9);")
         t_lay = QHBoxLayout(self.toolbar)
+        t_lay.setContentsMargins(10, 10, 10, 10)
         
         btn_prev = QPushButton("◀"); btn_prev.clicked.connect(self._prev_item)
         btn_next = QPushButton("▶"); btn_next.clicked.connect(self._next_item)
         self.btn_play = QPushButton("⏯ Play"); self.btn_play.clicked.connect(self._toggle_playback)
         self.btn_flip = QPushButton("Flip (F)"); self.btn_flip.clicked.connect(self._flip_img)
         self.btn_rot = QPushButton("Rotate (R)"); self.btn_rot.clicked.connect(self._rot_img)
-        self.btn_slide = QPushButton("Slideshow"); self.btn_slide.setCheckable(True); self.btn_slide.clicked.connect(self._toggle_slide)
         self.btn_ab = QPushButton("A-B Loop"); self.btn_ab.clicked.connect(self._set_ab_loop)
+        
+        # New Controls
+        self.btn_vert_mode = QPushButton("🖼️ Webpage Mode")
+        self.btn_vert_mode.setCheckable(True)
+        self.btn_vert_mode.clicked.connect(self._toggle_vert_mode)
+        
+        self.cb_speed = QComboBox()
+        self.cb_speed.addItems(["1s", "3s", "5s", "10s"])
+        self.cb_speed.setCurrentText("3s")
+        
+        self.btn_slide = QPushButton("Slideshow"); self.btn_slide.setCheckable(True); self.btn_slide.clicked.connect(self._toggle_slide)
         
         self.slider = QSlider(Qt.Horizontal)
         if HAS_MULTIMEDIA:
@@ -3445,24 +3535,22 @@ class vmanViewer(QDialog):
 
         t_lay.addWidget(btn_prev); t_lay.addWidget(self.btn_play); t_lay.addWidget(self.slider)
         t_lay.addWidget(self.btn_ab); t_lay.addWidget(self.btn_flip); t_lay.addWidget(self.btn_rot)
-        t_lay.addWidget(self.btn_slide); t_lay.addWidget(btn_next)
+        t_lay.addWidget(self.btn_vert_mode); t_lay.addWidget(self.cb_speed); t_lay.addWidget(self.btn_slide); t_lay.addWidget(btn_next)
         self.main_layout.addWidget(self.toolbar)
         
-        self.slide_timer = QTimer(self); self.slide_timer.timeout.connect(self._next_item)
+        self.slide_tick_timer = QTimer(self); self.slide_tick_timer.timeout.connect(self._slide_tick)
+        self.slide_elapsed = 0
         self.rot_angle = 0; self.flip_h = False
 
-        # # Shortcuts
         QShortcut(QKeySequence("F"), self, self._flip_img)
         QShortcut(QKeySequence("R"), self, self._rot_img)
         QShortcut(QKeySequence("H"), self, self._toggle_ui_visibility)
         QShortcut(QKeySequence("F11"), self, self._toggle_fullscreen)
         
-        # Make Hide/Mute GLOBAL so they work perfectly while the window is hidden in the background
         parent_win = self.parent() if self.parent() else self
         self.sc_hide = QShortcut(QKeySequence("B"), parent_win)
         self.sc_hide.setContext(Qt.ApplicationShortcut)
         self.sc_hide.activated.connect(self._toggle_hide)
-        
         self.sc_mute = QShortcut(QKeySequence("M"), parent_win)
         self.sc_mute.setContext(Qt.ApplicationShortcut)
         self.sc_mute.activated.connect(self._toggle_mute)
@@ -3475,6 +3563,15 @@ class vmanViewer(QDialog):
 
         self._load_current_item()
 
+    def _toggle_vert_mode(self):
+        if self.btn_vert_mode.isChecked():
+            self.btn_vert_mode.setText("🖼️ Normal Mode")
+            self.stack.setCurrentIndex(3)
+            self.vert_view.load_playlist(self.playlist)
+            self.vert_view.scroll_to_index(self.current_index)
+        else:
+            self.btn_vert_mode.setText("🖼️ Webpage Mode")
+            self._load_current_item()
 
     def _toggle_hide(self):
         if self.isVisible(): 
@@ -3514,17 +3611,24 @@ class vmanViewer(QDialog):
         if hasattr(self, 'player'): self.player.stop(); self.loop_a = -1; self.loop_b = -1; self.btn_ab.setText("A-B Loop")
         
         self.btn_flip.hide(); self.btn_rot.hide(); self.btn_slide.hide(); self.wave_vis.hide(); self.btn_ab.hide()
+        self.btn_vert_mode.hide(); self.cb_speed.hide()
         self.flip_v = False; self.rot_v_angle = 0
         if HAS_MULTIMEDIA: self._apply_video_transform()
-        
         if hasattr(self, 'video_view'): self.video_view.hide()
         
         if item['ext'] in ['.png', '.jpg', '.jpeg', '.bmp', '.gif', '.webp']: 
+            self.btn_vert_mode.show(); self.cb_speed.show(); self.btn_slide.show()
+            if self.btn_vert_mode.isChecked():
+                self.stack.setCurrentIndex(3)
+                self.vert_view.scroll_to_index(self.current_index)
+                return
+                
             self.stack.setCurrentIndex(1)
             self.orig_pm = QPixmap(item['path'])
             self.flip_h, self.rot_angle = False, 0
             self._apply_img_transform()
-            self.btn_flip.show(); self.btn_rot.show(); self.btn_slide.show()
+            self.btn_flip.show(); self.btn_rot.show()
+            
         elif item['ext'] in ['.txt', '.csv', '.json', '.xml', '.py', '.md', '.log', '.ini', '.sh', '.cpp', '.c', '.h']:
             self.stack.setCurrentIndex(0)
             try:
@@ -3544,17 +3648,27 @@ class vmanViewer(QDialog):
             self.stack.setCurrentIndex(0)
             self.txt_view.setPlainText("Format unsupported natively.")
 
-    def _toggle_mute(self):
-        if HAS_MULTIMEDIA and hasattr(self, 'audio'): 
-            self.audio.setMuted(not self.audio.isMuted())
+    def _restore_title(self):
+        item = self.playlist[self.current_index]
+        self.lbl_title.setText(f"{item['name']} ({self.current_index + 1}/{len(self.playlist)})")
 
     def _vol_up(self):
         if HAS_MULTIMEDIA and hasattr(self, 'audio'): 
-            self.audio.setVolume(min(1.0, self.audio.volume() + 0.1))
+            vol = min(1.0, self.audio.volume() + 0.1)
+            self.audio.setVolume(vol)
+            self.lbl_title.setText(f"🔊 Volume: {int(vol*100)}%")
+            QTimer.singleShot(1500, self._restore_title)
 
     def _vol_down(self):
         if HAS_MULTIMEDIA and hasattr(self, 'audio'): 
-            self.audio.setVolume(max(0.0, self.audio.volume() - 0.1))
+            vol = max(0.0, self.audio.volume() - 0.1)
+            self.audio.setVolume(vol)
+            self.lbl_title.setText(f"🔉 Volume: {int(vol*100)}%")
+            QTimer.singleShot(1500, self._restore_title)
+
+    def _toggle_mute(self):
+        if HAS_MULTIMEDIA and hasattr(self, 'audio'): 
+            self.audio.setMuted(not self.audio.isMuted())
 
     def _toggle_ui_visibility(self):
         is_visible = not self.toolbar.isVisible()
@@ -3570,8 +3684,24 @@ class vmanViewer(QDialog):
         else: self.loop_a = -1; self.loop_b = -1; self.btn_ab.setText("A-B Loop")
 
     def _toggle_slide(self):
-        if self.btn_slide.isChecked(): self.slide_timer.start(3000)
-        else: self.slide_timer.stop()
+        if self.btn_slide.isChecked():
+            self.slide_elapsed = 0
+            self.slide_progress.show()
+            self.slide_tick_timer.start(30) # High-speed ticks for smooth line
+        else:
+            self.slide_tick_timer.stop()
+            self.slide_progress.hide()
+            self.slide_progress.setFixedWidth(0)
+
+    def _slide_tick(self):
+        target_ms = int(self.cb_speed.currentText().replace("s", "")) * 1000
+        self.slide_elapsed += 30
+        pct = self.slide_elapsed / target_ms
+        self.slide_progress.setFixedWidth(int(self.width() * pct))
+        
+        if self.slide_elapsed >= target_ms:
+            self.slide_elapsed = 0
+            self._next_item()
 
     def _apply_img_transform(self):
         if hasattr(self, 'orig_pm'):
@@ -3581,6 +3711,7 @@ class vmanViewer(QDialog):
             self.img_view.set_image(pm)
 
     def _toggle_fullscreen(self): self.showNormal() if self.isFullScreen() else self.showFullScreen()
+    
     def _toggle_playback(self):
         if hasattr(self, 'player'):
             if self.player.playbackState() == QMediaPlayer.PlayingState: self.player.pause()
@@ -3588,18 +3719,17 @@ class vmanViewer(QDialog):
 
     def _next_item(self):
         if self.current_index < len(self.playlist) - 1: self.current_index += 1; self._load_current_item()
+        
     def _prev_item(self):
         if self.current_index > 0: self.current_index -= 1; self._load_current_item()
     
     def closeEvent(self, ev):
-        # 1. Stop background slide timers if active
-        if hasattr(self, 'slide_timer'): 
-            self.slide_timer.stop()
+        if hasattr(self, 'slide_tick_timer'): 
+            self.slide_tick_timer.stop()
 
-        # 2. Aggressively clean up multimedia handles to prevent OS deadlocks
         if HAS_MULTIMEDIA and hasattr(self, 'player') and self.player is not None:
             self.player.stop()
-            self.player.setSource(QUrl())  # Release physical file lock instantly
+            self.player.setSource(QUrl())
             self.player.setVideoOutput(None)
             self.player.setAudioOutput(None)
             self.player.deleteLater()
@@ -3609,7 +3739,6 @@ class vmanViewer(QDialog):
             self.audio.deleteLater()
             self.audio = None
 
-        # 3. Destroy global shortcuts so they don't block the next window
         if hasattr(self, 'sc_hide'):
             self.sc_hide.setEnabled(False)
             self.sc_hide.deleteLater()
@@ -4058,9 +4187,49 @@ class vmanVirtualManager(QMainWindow):
         QShortcut(QKeySequence("Backspace"), self, self.nav_back); QShortcut(QKeySequence("Shift+Backspace"), self, self.nav_forward); QShortcut(QKeySequence("Alt+Up"), self, self.nav_up)
 
     def show_help(self):
-        dlg = QDialog(self); dlg.setWindowTitle("Instructions"); dlg.setStyleSheet(THEMES[self.theme_combo.currentText()]); dlg.resize(600, 400); lay = QVBoxLayout(dlg); txt = QPlainTextEdit()
-        txt.setPlainText("""VMan - KEYBOARD & FEATURE GUIDE\n\n[Keyboard Navigation]\nBackspace   : Go Back\nShift+Back  : Go Forward\nAlt+Up      : Go Up One Directory\nCtrl+F      : Focus Global Search\nEnter       : Open selected folder or OS File\n\n[Viewer Controls (Ctrl+O)]\nSpacebar    : Play/Pause Media\nRight/Left  : Next/Previous Item\nUp/Down     : Volume Control\nZoom In/Out : Dedicated buttons for Images and Text\nEscape      : Close Viewer\n\n[Operations]\nMultiselect : Use Ctrl/Shift + Click to highlight multiple items.\nExport/OS   : Right click to "Materialize" ANY number of files back to Physical Windows/Mac OS.\nF2          : Rename (Select multiple files to Bulk Rename sequentially!)\nDelete      : Send to Trash / Permanently Delete\nCtrl+C/V/X  : Copy, Paste, Cut (Works on multiple items!)""")
-        txt.setReadOnly(True); lay.addWidget(txt); dlg.exec()
+        dlg = QDialog(self)
+        dlg.setWindowTitle("VMan Guide")
+        dlg.setStyleSheet(THEMES[self.theme_combo.currentText()])
+        dlg.resize(650, 480)
+        lay = QVBoxLayout(dlg)
+        txt = QPlainTextEdit()
+        txt.setPlainText("""==========================\nVMan - KEYBOARD & FEATURE GUIDE\n==========================\n
+[Keyboard Navigation]
+---------------------
+Backspace     : Go Back
+Shift+Back    : Go Forward
+Alt+Up        : Go Up One Directory
+Ctrl+F        : Focus Global Search
+Enter         : Open selected folder or OS File
+Ctrl+H        : Toggle Hidden Items
+
+[Media & Image Viewer Controls (Ctrl+O / F)]
+---------------------------------------------
+Spacebar      : Play / Pause Media
+Right / Left  : Next / Previous Item
+Up / Down     : Volume Control (Audio/Video) or Scroll Webpage Strip
+H             : Toggle Hide/Show Top Title and Bottom Toolbar
+B             : Global Hide/Show Viewer Window
+M             : Mute Audio
+F11           : Toggle Fullscreen Mode
+
+[Webpage & Slideshow Engine]
+-----------------------------
+Webpage Mode  : Stacks all images vertically like an infinite scroll feed. Navigate/scroll manually using the Up/Down arrow keys.
+Slideshow     : Runs automatically with a smooth live progress bar.
+Speed Control : Choose between 1s, 3s, 5s, or 10s intervals using the dropdown next to the slideshow button.
+
+[Operations & Advanced Tools]
+------------------------------
+Multiselect   : Use Ctrl/Shift + Click to highlight multiple items.
+Export/OS     : Right-click to "Materialize" ANY number of files back to Physical Windows/Mac OS.
+F2            : Rename (Select multiple files to Bulk Rename sequentially!)
+Delete        : Send to Trash / Permanently Delete (Shift+Delete bypasses trash)
+Ctrl+C/V/X    : Copy, Paste, Cut (Fully functional across Main and Isolated databases!)
+""")
+        txt.setReadOnly(True)
+        lay.addWidget(txt)
+        dlg.exec()
 
     def filter_current_view(self, text):
         term = text.lower()
