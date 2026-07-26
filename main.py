@@ -89,7 +89,7 @@ SMART_PROTOCOLS = {
 }
 
 THEMES = {
-    "Dark vman": """
+    "Dark": """
         QMainWindow, QDialog, QDockWidget { background-color: #0d1117; color: #c9d1d9; font-family: 'Segoe UI'; font-size: 13px; }
         QWidget { color: #c9d1d9; }
         QDockWidget::title { background: #161b22; padding: 8px; border-top-left-radius: 8px; border-top-right-radius: 8px; font-weight: bold; }
@@ -107,7 +107,7 @@ THEMES = {
         QTableView::indicator { width: 18px; height: 18px; border: 1px solid #8b949e; border-radius: 3px; background: #21262d; }
         QTableView::indicator:checked { background-color: #58a6ff; }
     """,
-    "Light Clean": """
+    "Light": """
         QMainWindow, QDialog, QDockWidget { background-color: #f6f8fa; color: #24292f; font-family: 'Segoe UI'; font-size: 13px; }
         QWidget { color: #24292f; }
         QDockWidget::title { background: #e1e4e8; padding: 8px; border-top-left-radius: 8px; border-top-right-radius: 8px; font-weight: bold; color: #24292f; }
@@ -921,9 +921,9 @@ class DuplicateProofDialog(QDialog):
         self.resize(850, 500)
         
         if main_app and hasattr(main_app, 'theme_combo'):
-            self.setStyleSheet(THEMES.get(main_app.theme_combo.currentText(), THEMES["Dark vman"]))
+            self.setStyleSheet(THEMES.get(main_app.theme_combo.currentText(), THEMES["Dark"]))
         else:
-            self.setStyleSheet(THEMES["Dark vman"])
+            self.setStyleSheet(THEMES["Dark"])
         
         layout = QVBoxLayout(self)
         layout.addWidget(QLabel(f"<h3 style='color:#58a6ff;'>Analysis: {match_type}</h3>"))
@@ -1199,7 +1199,7 @@ class vmanTagLibraryDialog(QDialog):
         self.resize(1300, 800)
         
         if self.main_app and hasattr(self.main_app, 'theme_combo'):
-            self.setStyleSheet(THEMES.get(self.main_app.theme_combo.currentText(), THEMES["Dark vman"]))
+            self.setStyleSheet(THEMES.get(self.main_app.theme_combo.currentText(), THEMES["Dark"]))
 
         self._build_toolbar() 
         self.main_layout = QVBoxLayout(self)
@@ -1857,7 +1857,7 @@ class vmanTagLibraryDialog(QDialog):
         dlg.setMinimumWidth(500)
         
         if self.main_app and hasattr(self.main_app, 'theme_combo'):
-            dlg.setStyleSheet(THEMES.get(self.main_app.theme_combo.currentText(), THEMES["Dark vman"]))
+            dlg.setStyleSheet(THEMES.get(self.main_app.theme_combo.currentText(), THEMES["Dark"]))
             
         layout = QFormLayout(dlg)
         
@@ -2073,9 +2073,9 @@ class TimelineDiaryDialog(QDialog):
         self.setMinimumSize(950, 660)
         
         if parent and hasattr(parent, 'theme_combo'):
-            self.setStyleSheet(THEMES.get(parent.theme_combo.currentText(), THEMES["Dark vman"]))
+            self.setStyleSheet(THEMES.get(parent.theme_combo.currentText(), THEMES["Dark"]))
         else:
-            self.setStyleSheet(THEMES["Dark vman"])
+            self.setStyleSheet(THEMES["Dark"])
 
         main_layout = QVBoxLayout(self)
         main_layout.setContentsMargins(10, 10, 10, 10)
@@ -2487,7 +2487,7 @@ class TimelineDiaryDialog(QDialog):
             ax.pie(vals, labels=["Tagged", "Untagged"], autopct='%1.1f%%', colors=["#3fb950", "#30363d"], textprops={'color':"white"})
             ax.set_title("Tag Coverage", color="#c9d1d9")
 
-        # Global styling for Dark vman theme
+        # Global styling for Dark theme
         ax.tick_params(axis='x', colors='#c9d1d9', labelsize=9)
         ax.tick_params(axis='y', colors='#8b949e')
         for spine in ['top', 'right']: ax.spines[spine].set_visible(False)
@@ -2578,7 +2578,7 @@ class SpaceAnalyzerDialog(QDialog):
         super().__init__(parent)
         self.db_path = db_path
         self.scan_roots = ["/"] 
-        self.setWindowTitle("Advanced Space & Integrity Analyzer")
+        self.setWindowTitle("Space & Integrity Analyzer")
         
         # --- Increased width to 1350 to perfectly fit all 9 columns ---
         self.resize(1350, 700) 
@@ -3035,13 +3035,13 @@ class BulkOperationEngine(QDialog):
     def __init__(self, db_path, parent=None):
         super().__init__(parent)
         self.db_path = db_path
-        self.setWindowTitle("Advanced Bulk Operations Engine")
+        self.setWindowTitle("Bulk Operations Engine")
         self.resize(700, 600)
         
         if parent and hasattr(parent, 'theme_combo'):
-            self.setStyleSheet(THEMES.get(parent.theme_combo.currentText(), THEMES["Dark vman"]))
+            self.setStyleSheet(THEMES.get(parent.theme_combo.currentText(), THEMES["Dark"]))
         else:
-            self.setStyleSheet(THEMES["Dark vman"])
+            self.setStyleSheet(THEMES["Dark"])
 
         layout = QVBoxLayout(self)
         
@@ -3362,8 +3362,8 @@ class vmanViewer(QDialog):
     def __init__(self, playlist, start_index, parent=None):
         super().__init__(parent)
         self.playlist, self.current_index = playlist, start_index
-        self.setWindowTitle("vman Advanced Media Engine"); self.resize(1100, 800)
-        self.setStyleSheet(THEMES.get(parent.theme_combo.currentText() if parent else "Dark vman", THEMES["Dark vman"]))
+        self.setWindowTitle("VMan Media Engine"); self.resize(1100, 800)
+        self.setStyleSheet(THEMES.get(parent.theme_combo.currentText() if parent else "Dark", THEMES["Dark"]))
         
         # Absolute layout for floating toolbar
         self.main_layout = QVBoxLayout(self)
@@ -3644,7 +3644,7 @@ class vmanVirtualManager(QMainWindow):
         
         self._build_ui()
         self._setup_shortcuts()
-        self.apply_theme("Dark vman") 
+        self.apply_theme("Dark") 
         self.refresh_all()
 
     def sys_log(self, message):
@@ -3678,7 +3678,7 @@ class vmanVirtualManager(QMainWindow):
         act_new_file = QAction("📄 File", self)
         act_new_file.triggered.connect(self.create_virtual_file)
         
-        act_timeline = QAction("📅 Timeline", self)
+        act_timeline = QAction("📅 Timeline Diary", self)
         act_timeline.triggered.connect(lambda: TimelineDiaryDialog(self.active_db_path, self).exec())
         
         act_analyzer = QAction("🧹 Analyzer", self)
@@ -4042,7 +4042,7 @@ class vmanVirtualManager(QMainWindow):
 
     def show_help(self):
         dlg = QDialog(self); dlg.setWindowTitle("Instructions"); dlg.setStyleSheet(THEMES[self.theme_combo.currentText()]); dlg.resize(600, 400); lay = QVBoxLayout(dlg); txt = QPlainTextEdit()
-        txt.setPlainText("""vman OS - KEYBOARD & FEATURE GUIDE\n\n[Keyboard Navigation]\nBackspace   : Go Back\nShift+Back  : Go Forward\nAlt+Up      : Go Up One Directory\nCtrl+F      : Focus Global Search\nEnter       : Open selected folder or OS File\n\n[Viewer Controls (Ctrl+O)]\nSpacebar    : Play/Pause Media\nRight/Left  : Next/Previous Item\nUp/Down     : Volume Control\nZoom In/Out : Dedicated buttons for Images and Text\nEscape      : Close Viewer\n\n[Operations]\nMultiselect : Use Ctrl/Shift + Click to highlight multiple items.\nExport/OS   : Right click to "Materialize" ANY number of files back to Physical Windows/Mac OS.\nF2          : Rename (Select multiple files to Bulk Rename sequentially!)\nDelete      : Send to Trash / Permanently Delete\nCtrl+C/V/X  : Copy, Paste, Cut (Works on multiple items!)""")
+        txt.setPlainText("""VMan - KEYBOARD & FEATURE GUIDE\n\n[Keyboard Navigation]\nBackspace   : Go Back\nShift+Back  : Go Forward\nAlt+Up      : Go Up One Directory\nCtrl+F      : Focus Global Search\nEnter       : Open selected folder or OS File\n\n[Viewer Controls (Ctrl+O)]\nSpacebar    : Play/Pause Media\nRight/Left  : Next/Previous Item\nUp/Down     : Volume Control\nZoom In/Out : Dedicated buttons for Images and Text\nEscape      : Close Viewer\n\n[Operations]\nMultiselect : Use Ctrl/Shift + Click to highlight multiple items.\nExport/OS   : Right click to "Materialize" ANY number of files back to Physical Windows/Mac OS.\nF2          : Rename (Select multiple files to Bulk Rename sequentially!)\nDelete      : Send to Trash / Permanently Delete\nCtrl+C/V/X  : Copy, Paste, Cut (Works on multiple items!)""")
         txt.setReadOnly(True); lay.addWidget(txt); dlg.exec()
 
     def filter_current_view(self, text):
@@ -4058,7 +4058,7 @@ class vmanVirtualManager(QMainWindow):
 
     def apply_theme(self, theme_name=None):
         if theme_name is None: theme_name = self.theme_combo.currentText()
-        self.setStyleSheet(THEMES.get(theme_name, THEMES["Dark vman"]))
+        self.setStyleSheet(THEMES.get(theme_name, THEMES["Dark"]))
         self.is_dark_mode = "Light" not in theme_name
         self.update_statistics() 
         
@@ -4392,7 +4392,7 @@ class vmanVirtualManager(QMainWindow):
 
     def show_properties(self, typ, path, db_id):
         cur = self.db.conn.cursor()
-        dlg = QDialog(self); dlg.setWindowTitle("vman Entity Properties"); dlg.setMinimumWidth(450); dlg.setStyleSheet(THEMES.get(self.theme_combo.currentText(), THEMES["Dark vman"]))
+        dlg = QDialog(self); dlg.setWindowTitle("vman Entity Properties"); dlg.setMinimumWidth(450); dlg.setStyleSheet(THEMES.get(self.theme_combo.currentText(), THEMES["Dark"]))
         layout = QFormLayout(dlg)
         
         if typ == "folder":
@@ -4498,81 +4498,109 @@ class vmanVirtualManager(QMainWindow):
     def context_menu(self, pos, is_grid=False):
         menu = QMenu(self)
 
+        # 1. Selection & General
         menu.addAction("☑ Select All (Ctrl+A)", self.cmd_select_all)
-        menu.addSeparator()
-                
-        if self.current_prefix.startswith("trash://"):
-            menu.addAction("🔥 Empty Trash", self.empty_trash)
-            menu.addSeparator()
-            
-        if not self._is_smart_path(self.current_prefix) and self.active_db_path == str(DB_FILE) and not self.current_prefix.startswith("trash://"):
-            menu.addAction("📂 Create Virtual Folder (Ctrl+Shift+N)", self.create_folder); menu.addAction("📥 Import Real Files", self.import_real_files); menu.addAction("📁 Import Real Folder", self.import_real_folder)
         
-        sel_items = [i for i in self._get_selected_items() if i[2] != -1] 
+        # Determine state variables
+        sel_items = [i for i in self._get_selected_items() if i[2] != -1]
+        is_trash = self.current_prefix.startswith("trash://")
+        
+        if is_trash:
+            menu.addSeparator()
+            menu.addAction("🔥 Empty Trash", self.empty_trash)
+
+        # 2. File/Folder Creation & Import (Only if not smart/trash)
+        if not self._is_smart_path(self.current_prefix) and self.active_db_path == str(DB_FILE) and not is_trash:
+            menu.addSeparator()
+            create_menu = menu.addMenu("✨ Create / Import")
+            create_menu.addAction("📂 Create Virtual Folder (Ctrl+Shift+N)", self.create_folder)
+            create_menu.addAction("📥 Import Real Files", self.import_real_files)
+            create_menu.addAction("📁 Import Real Folder", self.import_real_folder)
+
+        # 3. Operations on Selected Items
         if sel_items:
             menu.addSeparator()
+            
+            # --- OPEN / VIEW ---
             if len(sel_items) == 1:
-                if sel_items[0][0] == "file": 
-                    menu.addAction("🚀 Open Native System App", lambda: self.open_local_file_system(sel_items[0][2]))
-                    menu.addAction("📂 Show in OS Explorer", lambda: self.open_file_location(sel_items[0][2]))
-                    menu.addAction("🎞 Open in vman Viewer (Ctrl+O)", self.open_selected_vman)
-                elif sel_items[0][0] == "folder":
-                    # NEW: Option to hash entire folder contents!
-                    menu.addAction("🧬 Compute SHA-256 for all Contents", lambda: self.bulk_compute_hash(sel_items[0][1]))
-
-                menu.addAction("📋 Copy Virtual Path", lambda: QApplication.clipboard().setText(sel_items[0][1]))
-                menu.addAction("🏷 Set Secondary Name", self.cmd_set_secondary_name)
+                open_menu = menu.addMenu("🚀 Open / Navigate")
+                if sel_items[0][0] == "file":
+                    open_menu.addAction("🚀 Open Native System App", lambda: self.open_local_file_system(sel_items[0][2]))
+                    open_menu.addAction("📂 Show in OS Explorer", lambda: self.open_file_location(sel_items[0][2]))
+                    open_menu.addAction("🎞 Open in vman Viewer (Ctrl+O)", self.open_selected_vman)
+                open_menu.addAction("📋 Copy Virtual Path", lambda: QApplication.clipboard().setText(sel_items[0][1]))
+            
+            # --- CLIPBOARD ---
+            menu.addAction("Copy (Ctrl+C)", self.cmd_copy)
+            menu.addAction("Cut (Ctrl+X)", self.cmd_cut)
+            
+            # --- EDIT / MODIFY ---
+            edit_menu = menu.addMenu("✏️ Edit & Modify")
+            edit_menu.addAction("Rename (F2)", self.cmd_rename)
+            edit_menu.addAction("🧹 Clean '[copy]' Prefix", lambda: self.cmd_remove_copy_prefix(sel_items))
+            
+            if len(sel_items) == 1:
+                edit_menu.addAction("🏷 Set Secondary Name", self.cmd_set_secondary_name)
                 res = self.db.conn.cursor().execute("SELECT is_hidden, is_favorite FROM virtual_fs WHERE id=?", (sel_items[0][2],)).fetchone()
-                if res: 
-                    menu.addAction("Unhide" if res[0] else "Hide", lambda: self.toggle_item_hidden(sel_items[0][2], not res[0]))
-                    menu.addAction("Remove Favorite" if res[1] else "Add Favorite", lambda: self.toggle_item_fav(sel_items[0][2], not res[1]))
+                if res:
+                    edit_menu.addAction("👁️ Unhide" if res[0] else "🙈 Hide", lambda: self.toggle_item_hidden(sel_items[0][2], not res[0]))
+                    edit_menu.addAction("💔 Remove Favorite" if res[1] else "⭐ Add Favorite", lambda: self.toggle_item_fav(sel_items[0][2], not res[1]))
             
-            menu.addAction("Copy (Ctrl+C)", self.cmd_copy); menu.addAction("Cut (Ctrl+X)", self.cmd_cut) ; menu.addAction("Rename (F2)", self.cmd_rename)
+            # --- TAGS ---
+            tag_menu = menu.addMenu("🏷 Tags & Labels")
+            color_menu = tag_menu.addMenu("🎨 Set Color Tag")
+            for color in ["None", "Red", "Green", "Blue", "Gold"]: 
+                color_menu.addAction(color, lambda checked=False, c=color: self.bulk_tag_items(c, sel_items))
+            tag_menu.addAction("📝 Bulk Add Custom Tags...", lambda: self.bulk_add_custom_tags(sel_items))
+
+            # --- SYSTEM & MAPPING ---
+            sys_menu = menu.addMenu("⚙️ System & Mapping")
+            if len(sel_items) == 1:
+                if sel_items[0][0] == "folder":
+                    sys_menu.addAction("🧬 Compute SHA-256 for all Contents", lambda: self.bulk_compute_hash(sel_items[0][1]))
+                    sys_menu.addAction("🔗 Map THIS Folder to Physical OS", lambda: self.cmd_map_folder(sel_items[0]))
+                sys_menu.addAction("🗺️ Map Parent Drive/Mount (Auto-Detect)", lambda: self.cmd_map_parent_drive(sel_items[0]))
+
+            # --- EXPORT ---
+            export_menu = menu.addMenu("📤 Export & Extract")
+            export_menu.addAction(f"💾 Materialize {len(sel_items)} Items to OS", lambda: self.materialize_to_os(sel_items))
+            export_menu.addAction(f"📤 Export {len(sel_items)} Items to OS Location...", self.export_virtual_to_os)
+            export_menu.addAction("📦 Export Selected to ZIP...", lambda: self.export_to_zip(sel_items))
+            export_menu.addAction("📊 Export View to CSV", lambda: self.export_csv(sel_items))
             
-            #Add the option to remove [copy]
-            menu.addAction("🧹 Clean '[copy]' Prefix", lambda: self.cmd_remove_copy_prefix(sel_items))
-            
-            if self.current_prefix.startswith("trash://"):
-                menu.addAction("♻️ Restore from Trash", self.restore_from_trash)
-                menu.addAction("🧨 Permanent Delete (Shift+Del)", self.cmd_delete_permanent)
+            # --- PROPERTIES ---
+            if len(sel_items) == 1:
+                menu.addAction("ℹ️ Properties", lambda: self.show_properties(sel_items[0][0], sel_items[0][1], sel_items[0][2]))
             else:
-                menu.addAction("🗑️ Trash (Delete)", self.cmd_delete)
-                menu.addAction("🧨 Permanent Delete (Shift+Del)", self.cmd_delete_permanent)                
+                menu.addAction("ℹ️ Multi-Item Properties", lambda: self.show_multi_properties(sel_items))
 
             menu.addSeparator()
-            if len(sel_items) > 0:
-                menu.addAction("💾 Export / Materialize to OS", lambda: self.materialize_to_os(sel_items))
+
+            # --- DELETE & TRASH ---
+            del_menu = menu.addMenu("🗑️ Delete Options")
+            if is_trash:
+                del_menu.addAction("♻️ Restore from Trash", self.restore_from_trash)
+                del_menu.addAction("🧨 Permanent Delete (Shift+Del)", self.cmd_delete_permanent)
             else:
-                # Allows you to export the entire view by right-clicking empty space!
-                menu.addAction("💾 Export Current View to OS", lambda: self.materialize_to_os([("folder", self.current_prefix, -1)]))         
-            menu.addSeparator()         
+                del_menu.addAction("🗑️ Move to Trash (Delete)", self.cmd_delete)
+                del_menu.addAction("🧨 Permanent Delete (Shift+Del)", self.cmd_delete_permanent)
             
-            
-            if len(sel_items) == 1: 
-                menu.addAction("ℹ️ Properties", lambda: self.show_properties(sel_items[0][0], sel_items[0][1], sel_items[0][2]))
-                if sel_items[0][0] == "folder":
-                    menu.addAction("🔗 Map THIS Folder to Physical OS", lambda: self.cmd_map_folder(sel_items[0]))
-                menu.addAction("🗺️ Map Parent Drive/Mount (Auto-Detect)", lambda: self.cmd_map_parent_drive(sel_items[0]))
-            elif len(sel_items) > 1:
-                menu.addAction("ℹ️ Multi-Item Properties", lambda: self.show_multi_properties(sel_items))
-            
-            menu.addSeparator()
-            menu.addAction("💀 Delete PHYSICAL OS Items", lambda: self.cmd_delete_physical(sel_items))
-            menu.addSeparator()
-                
-            tag_menu = menu.addMenu("🏷 Set Color Tag")
-            for color in ["None", "Red", "Green", "Blue", "Gold"]: tag_menu.addAction(color, lambda checked=False, c=color: self.bulk_tag_items(c, sel_items))
-            menu.addAction("🏷️ Bulk Add Custom Tags...", lambda: self.bulk_add_custom_tags(sel_items)); menu.addSeparator()
-            menu.addAction(f"📤 Export {len(sel_items)} Items to OS Location...", self.export_virtual_to_os)
-            menu.addAction("📦 Export Selected to ZIP...", lambda: self.export_to_zip(sel_items))
-            menu.addAction("📊 Export View to CSV", lambda: self.export_csv(sel_items))
-            
+            del_menu.addSeparator()
+            del_menu.addAction("💀 Delete PHYSICAL OS Items", lambda: self.cmd_delete_physical(sel_items))
+
+        # 4. View / Global Actions (If no selection)
         menu.addSeparator()
-        if not sel_items: menu.addAction("📤 Materialize Entire View to OS", self.export_virtual_to_os)
-        menu.addAction("⚙️ Compile View to Isolated DB", self.compile_current_view)
+        if not sel_items: 
+            menu.addAction("📤 Materialize Entire View to OS", self.export_virtual_to_os)
         
-        act_paste = QAction("📋 Paste (Ctrl+V)", self); act_paste.triggered.connect(self.cmd_paste); act_paste.setEnabled(bool(self.v_clipboard["items"]) and not self._is_smart_path(self.current_prefix))
+        menu.addAction("⚙️ Compile View to Isolated DB", self.compile_current_view)
+
+        # 5. Paste Action (Always available if conditions met)
+        act_paste = QAction("📋 Paste (Ctrl+V)", self)
+        act_paste.triggered.connect(self.cmd_paste)
+        act_paste.setEnabled(bool(self.v_clipboard["items"]) and not self._is_smart_path(self.current_prefix))
         menu.addAction(act_paste)
+
         menu.exec(self.file_grid.viewport().mapToGlobal(pos) if is_grid else self.file_table.viewport().mapToGlobal(pos))
 
     def toggle_item_hidden(self, db_id, hide: bool): 
