@@ -4529,6 +4529,9 @@ class vmanVirtualManager(QMainWindow):
             
             menu.addAction("Copy (Ctrl+C)", self.cmd_copy); menu.addAction("Cut (Ctrl+X)", self.cmd_cut) ; menu.addAction("Rename (F2)", self.cmd_rename)
             
+            #Add the option to remove [copy]
+            menu.addAction("🧹 Clean '[copy]' Prefix", lambda: self.cmd_remove_copy_prefix(sel_items))
+            
             if self.current_prefix.startswith("trash://"):
                 menu.addAction("♻️ Restore from Trash", self.restore_from_trash)
                 menu.addAction("🧨 Permanent Delete (Shift+Del)", self.cmd_delete_permanent)
@@ -4707,6 +4710,42 @@ class vmanVirtualManager(QMainWindow):
                             cur.execute("UPDATE virtual_fs SET parent_path = ? || SUBSTR(parent_path, LENGTH(?) + 1) WHERE parent_path LIKE ?", (f"{self.current_prefix}{new_name}/", path, f"{path}%"))
                         prog.setValue(i+1)
                     conn.commit(); self.clear_cache(); self.refresh_tree(); self.load_directory(self.current_prefix); self.sys_log(f"Bulk Renamed {len(items)} items to base '{base_name.strip()}'")
+
+    def cmd_remove_copy_prefix(self, items):
+        if not items: return
+        renamed_count = 0
+        
+        with sqlite3.connect(self.db.path) as conn:
+            cur = conn.cursor()
+            for typ, path, db_id in items:
+                if db_id == -1: continue
+                
+                old_name = cur.execute("SELECT name FROM virtual_fs WHERE id = ?", (db_id,)).fetchone()[0]
+                new_name = old_name
+                
+                # Strip all [copy] prefixes 
+                while new_name.startswith("[copy]"):
+                    new_name = new_name[6:]
+                    
+                # Ensure the new name isn't completely empty, then apply
+                if new_name != old_name and new_name.strip():
+                    cur.execute("UPDATE virtual_fs SET name = ? WHERE id = ?", (new_name, db_id))
+                    
+                    # If it's a folder, we must update all sub-paths so children don't break
+                    if typ == "folder":
+                        cur.execute("UPDATE virtual_fs SET parent_path = ? || SUBSTR(parent_path, LENGTH(?) + 1) WHERE parent_path LIKE ?", (f"{self.current_prefix}{new_name}/", path, f"{path}%"))
+                        
+                    renamed_count += 1
+            conn.commit()
+            
+        if renamed_count > 0:
+            self.clear_cache()
+            self.refresh_tree()
+            self.load_directory(self.current_prefix)
+            self.sys_log(f"Removed '[copy]' prefix from {renamed_count} items.")
+            self.status.showMessage(f"Cleaned names of {renamed_count} items.", 3000)
+        else:
+            self.status.showMessage("No '[copy]' prefixes found on selected items.", 3000)
 
     def cmd_set_secondary_name(self):
         items = self._get_selected_items()
