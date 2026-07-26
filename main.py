@@ -4527,7 +4527,7 @@ class vmanVirtualManager(QMainWindow):
             menu.addAction("🔥 Empty Trash", self.empty_trash)
 
         # 2. File/Folder Creation & Import (Only if not smart/trash)
-        if not self._is_smart_path(self.current_prefix) and self.active_db_path == str(DB_FILE) and not is_trash:
+        if not self._is_smart_path(self.current_prefix) and not is_trash:
             menu.addSeparator()
             create_menu = menu.addMenu("✨ Create / Import")
             create_menu.addAction("📂 Create Virtual Folder (Ctrl+Shift+N)", self.create_folder)
@@ -4687,7 +4687,7 @@ class vmanVirtualManager(QMainWindow):
             return
 
         # Now respects Shift+Delete bypassing the Trash
-        is_permanent = force_permanent or self.current_prefix.startswith("trash://") or self.active_db_path != str(DB_FILE)
+        is_permanent = force_permanent or self.current_prefix.startswith("trash://")
         
         msg = "Permanently delete from VMan? (This cannot be undone!)" if is_permanent else "Move selected items to Virtual Trash?"
         if QMessageBox.question(self, "Delete", msg, QMessageBox.Yes|QMessageBox.No) != QMessageBox.Yes: return
@@ -4803,7 +4803,7 @@ class vmanVirtualManager(QMainWindow):
                     conn.cursor().execute("UPDATE virtual_fs SET secondary_name = ? WHERE id = ?", (new_sec.strip(), db_id)); conn.commit(); self.clear_cache(); self.load_directory(self.current_prefix)
 
     def execute_internal_drop(self, dest_path, is_copy):
-        if not self._current_drag_items or dest_path.startswith("trash://") or self._is_smart_path(dest_path) or self.active_db_path != str(DB_FILE): return
+        if not self._current_drag_items or dest_path.startswith("trash://") or self._is_smart_path(dest_path): return
         
         # HELPER TO MANAGE [copy] PREFIX
         def get_copy_name(name):
