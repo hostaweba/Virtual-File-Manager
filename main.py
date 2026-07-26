@@ -617,31 +617,48 @@ class CompilerThread(QThread):
             tgt_db = vmanDB(Path(self.target_db))
             src_conn = sqlite3.connect(self.source_db)
             src_cur = src_conn.cursor()
+            
+            # --- Dynamically fetch exact columns expected by the target DB ---
+            tgt_conn = tgt_db.conn
+            tgt_cur = tgt_conn.cursor()
+            tgt_cur.execute("PRAGMA table_info(virtual_fs)")
+            tgt_cols = [row[1] for row in tgt_cur.fetchall()]
+            
             self.progress.emit(20, 100, "Executing extraction query...")
-            src_cur.execute(self.query, self.params)
+            
+            # --- Rewrite query to safely pull ONLY the matching columns ---
+            actual_query = self.query.replace("SELECT *", f"SELECT {','.join(tgt_cols)}")
+            src_cur.execute(actual_query, self.params)
+            
             rows = src_cur.fetchall()
             total = len(rows)
             if total == 0: 
                 self.error.emit("View is empty. Compilation cancelled.")
                 return
+                
             self.progress.emit(40, 100, f"Pathing and writing {total} records...")
             is_smart_view = "://" in self.source_prefix
             modified_rows = []
+            
+            # Dynamically locate the index for 'parent_path' to adjust paths safely
+            pp_idx = tgt_cols.index("parent_path")
+            
             for r in rows:
                 if self.is_cancelled: return
                 r_list = list(r)
-                if is_smart_view: r_list[1] = "/"
+                if is_smart_view: r_list[pp_idx] = "/"
                 else:
-                    if r_list[1].startswith(self.source_prefix):
-                        r_list[1] = "/" + r_list[1][len(self.source_prefix):]
-                        if not r_list[1].startswith("/"): r_list[1] = "/" + r_list[1]
+                    if r_list[pp_idx].startswith(self.source_prefix):
+                        r_list[pp_idx] = "/" + r_list[pp_idx][len(self.source_prefix):]
+                        if not r_list[pp_idx].startswith("/"): r_list[pp_idx] = "/" + r_list[pp_idx]
                 modified_rows.append(tuple(r_list))
-            tgt_conn = tgt_db.conn
-            tgt_cur = tgt_conn.cursor()
+                
             batch_size = 1000
+            num_cols = len(tgt_cols)
+            
             for i in range(0, total, batch_size):
                 if self.is_cancelled: return
-                tgt_cur.executemany(f"INSERT INTO virtual_fs VALUES ({','.join(['?']*18)})", modified_rows[i:i+batch_size])
+                tgt_cur.executemany(f"INSERT INTO virtual_fs VALUES ({','.join(['?']*num_cols)})", modified_rows[i:i+batch_size])
                 tgt_conn.commit()
                 self.progress.emit(int(40 + (i/total)*60), 100, f"Compiled {min(i+batch_size, total)}/{total} records...")
             
