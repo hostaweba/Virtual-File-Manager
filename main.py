@@ -1,5 +1,5 @@
 """
-vman OS Virtual File Manager - Stable Optimized Edition
+VMan OS Virtual File Manager
 Timeline Diary, Deep Smart Views, Zero-Lag Async Engine, Custom Tags, Multi-Themes, and OS Hooks.
 """
 from __future__ import annotations
@@ -64,7 +64,7 @@ from PySide6.QtCore import QTimer, Qt
 from PySide6.QtWidgets import QRadioButton
 
 # ---------------- Constants & Themes ----------------
-APP_TITLE = "VMan OS"
+APP_TITLE = "VMan"
 DATA_DIR = Path("vman_data")
 VIEWS_DIR = DATA_DIR / "compiled_views"
 DB_FILE = DATA_DIR / "vman_vfs.db"
@@ -1195,7 +1195,7 @@ class vmanTagLibraryDialog(QDialog):
         self.l3_name = self.hierarchy_levels[3] if len(self.hierarchy_levels) > 3 else "Level 3"
         self.l4_name = self.hierarchy_levels[4] if len(self.hierarchy_levels) > 4 else "Level 4"
         
-        self.setWindowTitle("vman OS - Universal Tag Engine & Analytics")
+        self.setWindowTitle("Universal Tag Engine & Analytics")
         self.resize(1300, 800)
         
         if self.main_app and hasattr(self.main_app, 'theme_combo'):
@@ -3442,13 +3442,13 @@ class vmanViewer(QDialog):
         
         # Make Hide/Mute GLOBAL so they work perfectly while the window is hidden in the background
         parent_win = self.parent() if self.parent() else self
-        sc_hide = QShortcut(QKeySequence("B"), parent_win)
-        sc_hide.setContext(Qt.ApplicationShortcut)
-        sc_hide.activated.connect(self._toggle_hide)
+        self.sc_hide = QShortcut(QKeySequence("B"), parent_win)
+        self.sc_hide.setContext(Qt.ApplicationShortcut)
+        self.sc_hide.activated.connect(self._toggle_hide)
         
-        sc_mute = QShortcut(QKeySequence("M"), parent_win)
-        sc_mute.setContext(Qt.ApplicationShortcut)
-        sc_mute.activated.connect(self._toggle_mute)
+        self.sc_mute = QShortcut(QKeySequence("M"), parent_win)
+        self.sc_mute.setContext(Qt.ApplicationShortcut)
+        self.sc_mute.activated.connect(self._toggle_mute)
         
         QShortcut(QKeySequence(Qt.Key_Right), self, self._next_item)
         QShortcut(QKeySequence(Qt.Key_Left), self, self._prev_item)
@@ -3460,8 +3460,12 @@ class vmanViewer(QDialog):
 
 
     def _toggle_hide(self):
-        if self.isVisible(): self.hide()
-        else: self.show()
+        if self.isVisible(): 
+            self.hide()
+        else: 
+            self.show()
+            self.raise_()
+            self.activateWindow()
 
     def _flip_img(self): 
         if self.stack.currentIndex() == 1: 
@@ -3569,8 +3573,36 @@ class vmanViewer(QDialog):
         if self.current_index < len(self.playlist) - 1: self.current_index += 1; self._load_current_item()
     def _prev_item(self):
         if self.current_index > 0: self.current_index -= 1; self._load_current_item()
+    
     def closeEvent(self, ev):
-        if hasattr(self, 'player'): self.player.stop()
+        # 1. Stop background slide timers if active
+        if hasattr(self, 'slide_timer'): 
+            self.slide_timer.stop()
+
+        # 2. Aggressively clean up multimedia handles to prevent OS deadlocks
+        if HAS_MULTIMEDIA and hasattr(self, 'player') and self.player is not None:
+            self.player.stop()
+            self.player.setSource(QUrl())  # Release physical file lock instantly
+            self.player.setVideoOutput(None)
+            self.player.setAudioOutput(None)
+            self.player.deleteLater()
+            self.player = None
+            
+        if HAS_MULTIMEDIA and hasattr(self, 'audio') and self.audio is not None:
+            self.audio.deleteLater()
+            self.audio = None
+
+        # 3. Destroy global shortcuts so they don't block the next window
+        if hasattr(self, 'sc_hide'):
+            self.sc_hide.setEnabled(False)
+            self.sc_hide.deleteLater()
+            del self.sc_hide
+            
+        if hasattr(self, 'sc_mute'):
+            self.sc_mute.setEnabled(False)
+            self.sc_mute.deleteLater()
+            del self.sc_mute
+            
         super().closeEvent(ev)
 
 # ---------------- Main Application Window ----------------
@@ -4009,7 +4041,7 @@ class vmanVirtualManager(QMainWindow):
         QShortcut(QKeySequence("Backspace"), self, self.nav_back); QShortcut(QKeySequence("Shift+Backspace"), self, self.nav_forward); QShortcut(QKeySequence("Alt+Up"), self, self.nav_up)
 
     def show_help(self):
-        dlg = QDialog(self); dlg.setWindowTitle("vman OS Instructions"); dlg.setStyleSheet(THEMES[self.theme_combo.currentText()]); dlg.resize(600, 400); lay = QVBoxLayout(dlg); txt = QPlainTextEdit()
+        dlg = QDialog(self); dlg.setWindowTitle("Instructions"); dlg.setStyleSheet(THEMES[self.theme_combo.currentText()]); dlg.resize(600, 400); lay = QVBoxLayout(dlg); txt = QPlainTextEdit()
         txt.setPlainText("""vman OS - KEYBOARD & FEATURE GUIDE\n\n[Keyboard Navigation]\nBackspace   : Go Back\nShift+Back  : Go Forward\nAlt+Up      : Go Up One Directory\nCtrl+F      : Focus Global Search\nEnter       : Open selected folder or OS File\n\n[Viewer Controls (Ctrl+O)]\nSpacebar    : Play/Pause Media\nRight/Left  : Next/Previous Item\nUp/Down     : Volume Control\nZoom In/Out : Dedicated buttons for Images and Text\nEscape      : Close Viewer\n\n[Operations]\nMultiselect : Use Ctrl/Shift + Click to highlight multiple items.\nExport/OS   : Right click to "Materialize" ANY number of files back to Physical Windows/Mac OS.\nF2          : Rename (Select multiple files to Bulk Rename sequentially!)\nDelete      : Send to Trash / Permanently Delete\nCtrl+C/V/X  : Copy, Paste, Cut (Works on multiple items!)""")
         txt.setReadOnly(True); lay.addWidget(txt); dlg.exec()
 
@@ -4332,6 +4364,12 @@ class vmanVirtualManager(QMainWindow):
                 playlist.append({'path': data[1], 'name': name.split('\n')[0], 'ext': os.path.splitext(data[1])[1].lower()})
                 if data[2] == target_db_id: start_index = len(playlist) - 1
 
+        # CLEANUP OLD VIEWER TO PREVENT BACKGROUND CONFLICTS
+        if hasattr(self, 'viewer') and self.viewer is not None:
+            self.viewer.close()
+            self.viewer.deleteLater()
+            self.viewer = None
+
         self.viewer = vmanViewer(playlist, start_index, self); self.viewer.show()
 
     def open_local_file_system(self, db_id):
@@ -4603,7 +4641,7 @@ class vmanVirtualManager(QMainWindow):
         # Now respects Shift+Delete bypassing the Trash
         is_permanent = force_permanent or self.current_prefix.startswith("trash://") or self.active_db_path != str(DB_FILE)
         
-        msg = "Permanently delete from vman OS? (This cannot be undone!)" if is_permanent else "Move selected items to Virtual Trash?"
+        msg = "Permanently delete from VMan? (This cannot be undone!)" if is_permanent else "Move selected items to Virtual Trash?"
         if QMessageBox.question(self, "Delete", msg, QMessageBox.Yes|QMessageBox.No) != QMessageBox.Yes: return
         
         with sqlite3.connect(self.db.path) as conn:
@@ -4682,6 +4720,14 @@ class vmanVirtualManager(QMainWindow):
 
     def execute_internal_drop(self, dest_path, is_copy):
         if not self._current_drag_items or dest_path.startswith("trash://") or self._is_smart_path(dest_path) or self.active_db_path != str(DB_FILE): return
+        
+        # HELPER TO MANAGE [copy] PREFIX
+        def get_copy_name(name):
+            clean_name = name
+            while clean_name.startswith("[copy]"):
+                clean_name = clean_name[6:]
+            return f"[copy]{clean_name}"
+
         with sqlite3.connect(self.db.path) as conn:
             cur = conn.cursor()
             for typ, path, db_id in self._current_drag_items:
@@ -4689,13 +4735,15 @@ class vmanVirtualManager(QMainWindow):
                 if typ == "file":
                     if is_copy:
                         row = cur.execute("SELECT name, is_folder, real_path, size, extension, modified, color_tag, is_hidden, category, year, month, custom_tags FROM virtual_fs WHERE id = ?", (db_id,)).fetchone()
-                        if row: cur.execute("INSERT INTO virtual_fs (parent_path, name, is_folder, real_path, size, extension, modified, color_tag, is_hidden, category, year, month, custom_tags) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (dest_path, f"{row[0]} - Copy", *row[1:]))
+                        if row: 
+                            new_name = get_copy_name(row[0])
+                            cur.execute("INSERT INTO virtual_fs (parent_path, name, is_folder, real_path, size, extension, modified, color_tag, is_hidden, category, year, month, custom_tags) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (dest_path, new_name, *row[1:]))
                     else: cur.execute("UPDATE virtual_fs SET parent_path = ? WHERE id = ?", (dest_path, db_id))
                 else:
                     row = cur.execute("SELECT name FROM virtual_fs WHERE id = ?", (db_id,)).fetchone()
                     if not row: continue
                     if is_copy:
-                        new_base_name = f"{row[0]} - Copy"
+                        new_base_name = get_copy_name(row[0])
                         cur.execute("INSERT INTO virtual_fs (parent_path, name, is_folder) VALUES (?, ?, 1)", (dest_path, new_base_name))
                         for r in cur.execute("SELECT name, is_folder, real_path, size, extension, modified, color_tag, is_hidden, parent_path, category, year, month, custom_tags FROM virtual_fs WHERE parent_path LIKE ?", (f"{path}%",)).fetchall(): 
                             cur.execute("INSERT INTO virtual_fs (parent_path, name, is_folder, real_path, size, extension, modified, color_tag, is_hidden, category, year, month, custom_tags) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (f"{dest_path}{new_base_name}/" + r[8][len(path):], *r[:8], r[9], r[10], r[11], r[12]))
