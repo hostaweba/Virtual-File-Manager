@@ -2720,9 +2720,9 @@ class SpaceAnalyzerDialog(QDialog):
         # Smart Rule Engine UI
         self.combo_smart_select = QComboBox()
         self.combo_smart_select.addItems([
-            "Rule: Keep Oldest (Check Newest for deletion)",
-            "Rule: Keep Newest (Check Oldest for deletion)",
-            "Rule: Keep files in a specific Virtual Folder..."
+            "Keep Oldest (Check Newest for deletion)",
+            "Keep Newest (Check Oldest for deletion)",
+            "Keep files in a specific Virtual Folder..."
         ])
         self.btn_apply_smart = QPushButton("Apply Rule")
         self.btn_apply_smart.setStyleSheet("color: #58a6ff; font-weight: bold;")
@@ -2743,7 +2743,7 @@ class SpaceAnalyzerDialog(QDialog):
         sel_lay.addWidget(self.btn_select_all)
         sel_lay.addWidget(self.btn_check_hl)
         sel_lay.addWidget(self.btn_uncheck_hl)
-        sel_lay.addSpacing(15) 
+        sel_lay.addSpacing(1) 
         sel_lay.addWidget(self.combo_smart_select)
         sel_lay.addWidget(self.btn_apply_smart)
         sel_lay.addStretch() # Pushes Action tools to the right
