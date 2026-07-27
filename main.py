@@ -26,7 +26,7 @@ from PySide6.QtWidgets import (
     QStackedWidget, QListView, QTabWidget, QSlider, QStyle, QGraphicsOpacityEffect, 
     QScrollArea, QDialog, QGraphicsView, QGraphicsScene, QTextBrowser, 
     QTableWidget, QTableWidgetItem, QCheckBox, QCalendarWidget, QSpinBox, 
-    QGridLayout, QFrame, QSplitter, QListWidget, QListWidgetItem, QGroupBox, QFormLayout
+    QGridLayout, QFrame, QSplitter, QListWidget, QListWidgetItem, QGroupBox, QFormLayout, QProgressBar
 )
 
 try:
@@ -68,8 +68,10 @@ APP_TITLE = "VMan"
 DATA_DIR = Path("vman_data")
 VIEWS_DIR = DATA_DIR / "compiled_views"
 DB_FILE = DATA_DIR / "vman_vfs.db"
+ICONS_DIR = Path("icons")                    # Where you put jpg.png, png.png, txt.png
+THUMBS_DIR = DATA_DIR / "thumbnails"         # Where manual grid thumbnails get saved
 MAX_VIRTUAL_STORAGE = 100 * 1024 * 1024 * 1024  
-CHUNK_SIZE = 150 
+CHUNK_SIZE = 150
 
 FILE_CATEGORIES = {
     "Images": ['.png', '.jpg', '.jpeg', '.bmp', '.gif', '.webp', '.svg'],
@@ -394,9 +396,12 @@ class BulkHashCalculator(QThread):
 
 class DataLoaderThread(QThread):
     data_ready = Signal(list, list) 
-    def __init__(self, db_path, target_path, show_hidden, parent=None):
+    def __init__(self, db_path, target_path, show_hidden, fast_mode=False, parent=None):
         super().__init__(parent)
-        self.db_path, self.target_path, self.show_hidden = db_path, target_path, show_hidden
+        self.db_path = db_path
+        self.target_path = target_path
+        self.show_hidden = show_hidden
+        self.fast_mode = fast_mode
         self.is_cancelled = False
     def cancel(self): self.is_cancelled = True
     def run(self):
@@ -411,7 +416,11 @@ class DataLoaderThread(QThread):
             if self.target_path.startswith("tags://"):
                 parts = [p for p in self.target_path.replace("tags://", "").split("/") if p]
                 if len(parts) == 0:
-                    cur.execute("SELECT custom_tags, size FROM virtual_fs WHERE is_folder=0 AND in_trash=0 AND custom_tags IS NOT NULL AND custom_tags != ''")
+                    if getattr(self, 'fast_mode', False):
+                        cur.execute("SELECT custom_tags, 0 FROM virtual_fs WHERE is_folder=0 AND in_trash=0 AND custom_tags IS NOT NULL AND custom_tags != ''")
+                    else:
+                        cur.execute("SELECT custom_tags, size FROM virtual_fs WHERE is_folder=0 AND in_trash=0 AND custom_tags IS NOT NULL AND custom_tags != ''")
+                        
                     tag_stats = defaultdict(lambda: [0, 0])
                     for tags_str, sz in cur.fetchall():
                         for t in [x.strip() for x in tags_str.split(",") if x.strip()]:
@@ -420,19 +429,25 @@ class DataLoaderThread(QThread):
                     folders = [(-1, "tags://", t, "", "", 0, stats[0], stats[1]) for t, stats in tag_stats.items()]
                 elif len(parts) >= 1:
                     target_tag = parts[0]
-                    cur.execute(f"SELECT id, name, size, extension, real_path, modified, color_tag, secondary_name, is_hidden, custom_tags FROM virtual_fs WHERE is_folder=0 AND in_trash=0 AND custom_tags LIKE ? {h_q}", (f"%{target_tag}%",))
+                    cur.execute(f"SELECT id, name, size, extension, real_path, modified, color_tag, secondary_name, is_hidden, custom_tags FROM virtual_fs WHERE is_folder=0 AND in_trash=0 AND custom_tags LIKE ? {h_q} LIMIT 500", (f"%{target_tag}%",))
                     for row in cur.fetchall():
                         if target_tag in [x.strip() for x in str(row[9]).split(",") if x.strip()]: files.append(row[:9])
 
             elif self.target_path.startswith("y_m_f://"):
                 parts = [p for p in self.target_path.replace("y_m_f://", "").split("/") if p]
-                cur.execute("SELECT parent_path, year, month, COUNT(id) FROM virtual_fs WHERE is_folder=0 AND in_trash=0 AND year IS NOT NULL AND year != '' AND month IS NOT NULL AND month != '' GROUP BY parent_path, year, month")
-                folder_age, temp_tracker = {}, {}
-                for pp, y, m, c in cur.fetchall():
-                    if pp not in temp_tracker or c > temp_tracker[pp]:
-                        temp_tracker[pp], folder_age[pp] = c, (y, m)
-                cur.execute("SELECT parent_path, COUNT(id), SUM(size) FROM virtual_fs WHERE is_folder=0 AND in_trash=0 GROUP BY parent_path")
-                totals = {r[0]: (r[1], r[2]) for r in cur.fetchall()}
+                
+                if getattr(self, 'fast_mode', False):
+                    cur.execute("SELECT DISTINCT parent_path, year, month FROM virtual_fs WHERE is_folder=0 AND in_trash=0 AND year IS NOT NULL AND year != '' AND month IS NOT NULL AND month != ''")
+                    folder_age = {pp: (y, m) for pp, y, m in cur.fetchall()}
+                    totals = {}
+                else:
+                    cur.execute("SELECT parent_path, year, month, COUNT(id) FROM virtual_fs WHERE is_folder=0 AND in_trash=0 AND year IS NOT NULL AND year != '' AND month IS NOT NULL AND month != '' GROUP BY parent_path, year, month")
+                    folder_age, temp_tracker = {}, {}
+                    for pp, y, m, c in cur.fetchall():
+                        if pp not in temp_tracker or c > temp_tracker[pp]:
+                            temp_tracker[pp], folder_age[pp] = c, (y, m)
+                    cur.execute("SELECT parent_path, COUNT(id), SUM(size) FROM virtual_fs WHERE is_folder=0 AND in_trash=0 GROUP BY parent_path")
+                    totals = {r[0]: (r[1], r[2]) for r in cur.fetchall()}
 
                 if len(parts) == 0:
                     folders = [(-1, "y_m_f://", yr, "", "", 0, 0, 0) for yr in sorted(list(set([v[0] for v in folder_age.values()])), reverse=True)]
@@ -445,7 +460,7 @@ class DataLoaderThread(QThread):
                 elif len(parts) >= 3:
                     for pp, age in folder_age.items():
                         if age == (parts[0], parts[1]) and (pp.strip("/").split("/")[-1] if pp.strip("/") else "Root_Files") == parts[2]:
-                            cur.execute(f"SELECT id, name, size, extension, real_path, modified, color_tag, secondary_name, is_hidden FROM virtual_fs WHERE parent_path=? AND is_folder=0 AND in_trash=0 {h_q}", (pp,))
+                            cur.execute(f"SELECT id, name, size, extension, real_path, modified, color_tag, secondary_name, is_hidden FROM virtual_fs WHERE parent_path=? AND is_folder=0 AND in_trash=0 {h_q} LIMIT 500", (pp,))
                             files = cur.fetchall()
                             break
 
@@ -456,29 +471,41 @@ class DataLoaderThread(QThread):
                 if depth < len(cols):
                     target_col = cols[depth]
                     where_clauses = ["is_folder=0", "in_trash=0", f"{target_col} != ''"] + [f"{cols[i]}=?" for i in range(depth)]
-                    cur.execute(f"SELECT {target_col}, COUNT(id), SUM(size) FROM virtual_fs WHERE {' AND '.join(where_clauses)} GROUP BY {target_col}", tuple(parts))
-                    base_path = matched_proto + "/".join(parts) + "/" if parts else matched_proto
-                    folders = [(-1, base_path, r[0], "", "", 0, r[1], r[2] or 0) for r in cur.fetchall() if r[0]]
+                    
+                    if getattr(self, 'fast_mode', False):
+                        cur.execute(f"SELECT DISTINCT {target_col} FROM virtual_fs WHERE {' AND '.join(where_clauses)}", tuple(parts))
+                        base_path = matched_proto + "/".join(parts) + "/" if parts else matched_proto
+                        folders = [(-1, base_path, r[0], "", "", 0, 0, 0) for r in cur.fetchall() if r[0]]
+                    else:
+                        cur.execute(f"SELECT {target_col}, COUNT(id), SUM(size) FROM virtual_fs WHERE {' AND '.join(where_clauses)} GROUP BY {target_col}", tuple(parts))
+                        base_path = matched_proto + "/".join(parts) + "/" if parts else matched_proto
+                        folders = [(-1, base_path, r[0], "", "", 0, r[1], r[2] or 0) for r in cur.fetchall() if r[0]]
                 else:
                     where_clauses = ["is_folder=0", "in_trash=0"] + [f"{cols[i]}=?" for i in range(len(cols))]
                     if not self.show_hidden: where_clauses.append("is_hidden=0")
-                    cur.execute(f"SELECT id, name, size, extension, real_path, modified, color_tag, secondary_name, is_hidden FROM virtual_fs WHERE {' AND '.join(where_clauses)}", tuple(parts))
+                    cur.execute(f"SELECT id, name, size, extension, real_path, modified, color_tag, secondary_name, is_hidden FROM virtual_fs WHERE {' AND '.join(where_clauses)} LIMIT 500", tuple(parts))
                     files = cur.fetchall()
 
             elif self.target_path == "trash://":
-                cur.execute("SELECT id, parent_path, name, color_tag, secondary_name, is_hidden FROM virtual_fs WHERE is_folder=1 AND in_trash=1")
+                cur.execute("SELECT id, parent_path, name, color_tag, secondary_name, is_hidden FROM virtual_fs WHERE is_folder=1 AND in_trash=1 LIMIT 500")
                 folders = [(r[0], r[1], r[2], r[3], r[4], r[5], 0, 0) for r in cur.fetchall()]
-                cur.execute("SELECT id, name, size, extension, real_path, modified, color_tag, secondary_name, is_hidden FROM virtual_fs WHERE is_folder=0 AND in_trash=1")
+                cur.execute("SELECT id, name, size, extension, real_path, modified, color_tag, secondary_name, is_hidden FROM virtual_fs WHERE is_folder=0 AND in_trash=1 LIMIT 500")
                 files = cur.fetchall()
             elif self.target_path == "fav://":
-                cur.execute(f"SELECT id, parent_path, name, color_tag, secondary_name, is_hidden FROM virtual_fs WHERE is_folder=1 AND is_favorite=1 AND in_trash=0 {h_q}")
+                cur.execute(f"SELECT id, parent_path, name, color_tag, secondary_name, is_hidden FROM virtual_fs WHERE is_folder=1 AND is_favorite=1 AND in_trash=0 {h_q} LIMIT 500")
                 folders = [(r[0], r[1], r[2], r[3], r[4], r[5], 0, 0) for r in cur.fetchall()]
-                cur.execute(f"SELECT id, name, size, extension, real_path, modified, color_tag, secondary_name, is_hidden FROM virtual_fs WHERE is_folder=0 AND is_favorite=1 AND in_trash=0 {h_q}")
+                cur.execute(f"SELECT id, name, size, extension, real_path, modified, color_tag, secondary_name, is_hidden FROM virtual_fs WHERE is_folder=0 AND is_favorite=1 AND in_trash=0 {h_q} LIMIT 500")
                 files = cur.fetchall()
             else:
-                cur.execute(f"SELECT id, name, color_tag, secondary_name, is_hidden, (SELECT COUNT(id) FROM virtual_fs f2 WHERE f2.parent_path LIKE virtual_fs.parent_path || virtual_fs.name || '/%' AND f2.is_folder=0 AND f2.in_trash=0), (SELECT SUM(size) FROM virtual_fs f2 WHERE f2.parent_path LIKE virtual_fs.parent_path || virtual_fs.name || '/%' AND f2.is_folder=0 AND f2.in_trash=0) FROM virtual_fs WHERE parent_path=? AND is_folder=1 AND in_trash=0 {h_q}", (self.target_path,))
+                if getattr(self, 'fast_mode', False):
+                    # Fast Mode: Bypass recursive COUNT() and SUM() for instant loading
+                    cur.execute(f"SELECT id, name, color_tag, secondary_name, is_hidden, 0, 0 FROM virtual_fs WHERE parent_path=? AND is_folder=1 AND in_trash=0 {h_q} LIMIT 500", (self.target_path,))
+                else:
+                    # Normal Mode: Perform deep calculation of folder sizes and items
+                    cur.execute(f"SELECT id, name, color_tag, secondary_name, is_hidden, (SELECT COUNT(id) FROM virtual_fs f2 WHERE f2.parent_path LIKE virtual_fs.parent_path || virtual_fs.name || '/%' AND f2.is_folder=0 AND f2.in_trash=0), (SELECT SUM(size) FROM virtual_fs f2 WHERE f2.parent_path LIKE virtual_fs.parent_path || virtual_fs.name || '/%' AND f2.is_folder=0 AND f2.in_trash=0) FROM virtual_fs WHERE parent_path=? AND is_folder=1 AND in_trash=0 {h_q} LIMIT 500", (self.target_path,))
+                
                 folders = [(r[0], self.target_path, r[1], r[2], r[3], r[4], r[5] or 0, r[6] or 0) for r in cur.fetchall()] 
-                cur.execute(f"SELECT id, name, size, extension, real_path, modified, color_tag, secondary_name, is_hidden FROM virtual_fs WHERE parent_path=? AND is_folder=0 AND in_trash=0 {h_q}", (self.target_path,))
+                cur.execute(f"SELECT id, name, size, extension, real_path, modified, color_tag, secondary_name, is_hidden FROM virtual_fs WHERE parent_path=? AND is_folder=0 AND in_trash=0 {h_q} LIMIT 500", (self.target_path,))
                 files = cur.fetchall()
                 
             if not self.is_cancelled: self.data_ready.emit(folders, files)
@@ -519,22 +546,24 @@ class SpaceScannerThread(QThread):
             path_params = tuple(f"{p}%" for p in self.scan_roots)
             
             self.progress.emit(10, 100, "Scanning for Junk...")
-            cur.execute(f"SELECT id, name, parent_path, extension, size, modified, sha256 FROM virtual_fs WHERE is_folder=0 AND in_trash=0 AND ({path_cond}) AND (extension IN ('.tmp', '.bak', '.log', '.cache') OR name LIKE '%cache%')", path_params)
+            # FIX: Added hash_verified=0 to ignore intentionally marked safe files
+            cur.execute(f"SELECT id, name, parent_path, extension, size, modified, sha256 FROM virtual_fs WHERE is_folder=0 AND in_trash=0 AND hash_verified=0 AND ({path_cond}) AND (extension IN ('.tmp', '.bak', '.log', '.cache') OR name LIKE '%cache%')", path_params)
             for r in cur.fetchall():
                 if self.is_cancelled: return
                 self.found.emit("Junk File", r[1], r[2], r[3] or "", r[4] or 0, r[5] or "Unknown", r[6] or "", r[0])
             
             self.progress.emit(40, 100, "Scanning for Huge Files...")
-            cur.execute(f"SELECT id, name, parent_path, extension, size, modified, sha256 FROM virtual_fs WHERE is_folder=0 AND in_trash=0 AND ({path_cond}) AND size > 524288000 ORDER BY size DESC", path_params)
+            cur.execute(f"SELECT id, name, parent_path, extension, size, modified, sha256 FROM virtual_fs WHERE is_folder=0 AND in_trash=0 AND hash_verified=0 AND ({path_cond}) AND size > 524288000 ORDER BY size DESC", path_params)
             for r in cur.fetchall():
                 if self.is_cancelled: return
                 self.found.emit("Huge File (>500MB)", r[1], r[2], r[3] or "", r[4] or 0, r[5] or "Unknown", r[6] or "", r[0])
             
             self.progress.emit(70, 100, "Scanning for Duplicates...")
-            cur.execute(f"SELECT size, extension, COUNT(*) as c FROM virtual_fs WHERE is_folder=0 AND in_trash=0 AND ({path_cond}) AND size > 0 GROUP BY size, extension HAVING c > 1", path_params)
+            # FIX: Strict duplicate scan excluding safe files
+            cur.execute(f"SELECT size, extension, COUNT(*) as c FROM virtual_fs WHERE is_folder=0 AND in_trash=0 AND hash_verified=0 AND ({path_cond}) AND size > 0 GROUP BY size, extension HAVING c > 1", path_params)
             for size, ext, count in cur.fetchall():
                 if self.is_cancelled: return
-                cur.execute(f"SELECT id, name, parent_path, extension, modified, sha256 FROM virtual_fs WHERE size=? AND extension=? AND is_folder=0 AND in_trash=0 AND ({path_cond})", (size, ext) + path_params)
+                cur.execute(f"SELECT id, name, parent_path, extension, modified, sha256 FROM virtual_fs WHERE size=? AND extension=? AND is_folder=0 AND in_trash=0 AND hash_verified=0 AND ({path_cond})", (size, ext) + path_params)
                 files = cur.fetchall()
                 for f in files[1:]: 
                     self.found.emit("Duplicate File", f[1], f[2], f[3] or "", size or 0, f[4] or "Unknown", f[5] or "", f[0])
@@ -2641,32 +2670,9 @@ class SpaceAnalyzerDialog(QDialog):
         layout.addWidget(self.table)
 
         
-        sel_lay = QHBoxLayout()
-        self.btn_select_all = QPushButton("☑ Check All")
-        self.btn_select_all.clicked.connect(self.toggle_select_all)
-        self.btn_check_hl = QPushButton("✓ Check Highlighted")
-        self.btn_check_hl.clicked.connect(lambda: self.set_highlighted_state(Qt.Checked))
-        self.btn_uncheck_hl = QPushButton("✗ Uncheck Highlighted")
-        self.btn_uncheck_hl.clicked.connect(lambda: self.set_highlighted_state(Qt.Unchecked))
-        
-        self.btn_mark_safe = QPushButton("🛡️ Mark Safe (Ignore)")
-        self.btn_mark_safe.setStyleSheet("color: #3fb950; font-weight: bold;")
-        self.btn_mark_safe.clicked.connect(lambda: self.update_safety_status(True))
-        
-        self.btn_unmark_safe = QPushButton("❌ Unmark Safe")
-        self.btn_unmark_safe.setStyleSheet("color: #e3b341;")
-        self.btn_unmark_safe.clicked.connect(lambda: self.update_safety_status(False))
-
-        sel_lay.addWidget(self.btn_select_all)
-        sel_lay.addWidget(self.btn_check_hl)
-        sel_lay.addWidget(self.btn_uncheck_hl)
-        sel_lay.addStretch()
-        sel_lay.addWidget(self.btn_mark_safe)
-        sel_lay.addWidget(self.btn_unmark_safe)
-        layout.addLayout(sel_lay)
-
-        # ----- Scanning & Deletion Tools
+        # ----- Row 1: Scanning & Safe Tools -----
         scan_lay = QHBoxLayout()
+        
         self.btn_refresh = QPushButton("🔄 Scan Junk")
         self.btn_refresh.clicked.connect(self.scan)
         
@@ -2680,26 +2686,120 @@ class SpaceAnalyzerDialog(QDialog):
         self.btn_scan_corrupt = QPushButton("⚠️ Data Anomalies")
         self.btn_scan_corrupt.setStyleSheet("color: #e3b341; font-weight: bold;")
         self.btn_scan_corrupt.clicked.connect(self.scan_corrupt_files)
+
+        self.btn_mark_safe = QPushButton("🛡️ Mark Safe (Ignore Intentional Duplicates)")
+        self.btn_mark_safe.setStyleSheet("color: #3fb950; font-weight: bold;")
+        self.btn_mark_safe.clicked.connect(lambda: self.update_safety_status(True))
         
-        self.btn_view_safe = QPushButton("👁️ View Safe Files")
-        self.btn_view_safe.clicked.connect(self.view_safe_files)
-        
-        self.btn_delete = QPushButton("🗑️ Delete Checked")
-        self.btn_delete.setStyleSheet("background-color: #8b0000; font-weight: bold; color: white;")
-        self.btn_delete.clicked.connect(self.delete_selected)
-        
+        self.btn_unmark_safe = QPushButton("❌ Unmark Safe")
+        self.btn_unmark_safe.setStyleSheet("color: #e3b341;")
+        self.btn_unmark_safe.clicked.connect(lambda: self.update_safety_status(False))
+
         scan_lay.addWidget(self.btn_refresh)
         scan_lay.addWidget(self.btn_scan_hash)
         scan_lay.addWidget(self.btn_scan_versions)
         scan_lay.addWidget(self.btn_scan_corrupt)
-        scan_lay.addStretch()
-        scan_lay.addWidget(self.btn_view_safe)
-        scan_lay.addWidget(self.btn_delete)
+        scan_lay.addStretch() # Pushes Safe tools to the right
+        scan_lay.addWidget(self.btn_mark_safe)
+        scan_lay.addWidget(self.btn_unmark_safe)
+        layout.addLayout(scan_lay)
+
+        # ----- Row 2: Selection & Action Tools -----
+        sel_lay = QHBoxLayout()
+        
+        # Manual Selection Tools
+        self.btn_select_all = QPushButton("☑ Check All")
+        self.btn_select_all.clicked.connect(self.toggle_select_all)
+        
+        self.btn_check_hl = QPushButton("✓ Check Highlighted")
+        self.btn_check_hl.clicked.connect(lambda: self.set_highlighted_state(Qt.Checked))
+        
+        self.btn_uncheck_hl = QPushButton("✗ Uncheck Highlighted")
+        self.btn_uncheck_hl.clicked.connect(lambda: self.set_highlighted_state(Qt.Unchecked))
+
+        # Smart Rule Engine UI
+        self.combo_smart_select = QComboBox()
+        self.combo_smart_select.addItems([
+            "Rule: Keep Oldest (Check Newest for deletion)",
+            "Rule: Keep Newest (Check Oldest for deletion)",
+            "Rule: Keep files in a specific Virtual Folder..."
+        ])
+        self.btn_apply_smart = QPushButton("Apply Rule")
+        self.btn_apply_smart.setStyleSheet("color: #58a6ff; font-weight: bold;")
+        self.btn_apply_smart.clicked.connect(self.apply_smart_selection)
+
+        # Action Tools
+        self.btn_view_safe = QPushButton("👁️ View Safe Files")
+        self.btn_view_safe.clicked.connect(self.view_safe_files)
+        
         self.btn_apply_tag = QPushButton("🏷️ Assign Custom Tag")
         self.btn_apply_tag.setStyleSheet("background-color: #1f6feb; font-weight: bold; color: white;")
         self.btn_apply_tag.clicked.connect(self.assign_tags_selected)
-        scan_lay.addWidget(self.btn_apply_tag)
-        layout.addLayout(scan_lay)
+        
+        self.btn_delete = QPushButton("🗑️ Delete Checked")
+        self.btn_delete.setStyleSheet("background-color: #8b0000; font-weight: bold; color: white;")
+        self.btn_delete.clicked.connect(self.delete_selected)
+
+        sel_lay.addWidget(self.btn_select_all)
+        sel_lay.addWidget(self.btn_check_hl)
+        sel_lay.addWidget(self.btn_uncheck_hl)
+        sel_lay.addSpacing(15) 
+        sel_lay.addWidget(self.combo_smart_select)
+        sel_lay.addWidget(self.btn_apply_smart)
+        sel_lay.addStretch() # Pushes Action tools to the right
+        sel_lay.addWidget(self.btn_view_safe)
+        sel_lay.addWidget(self.btn_apply_tag)
+        sel_lay.addWidget(self.btn_delete)
+        layout.addLayout(sel_lay)
+
+    def apply_smart_selection(self):
+        rule = self.combo_smart_select.currentText()
+        if self.table.rowCount() == 0: return
+
+        # 1. Group all table rows by their exact Duplicate signature
+        groups = {}
+        for r in range(self.table.rowCount()):
+            typ = self.table.item(r, 1).text()
+            if "Duplicate" in typ or "Version" in typ or "Paradox" in typ:
+                # Use Hash as primary group key, fallback to Name+Size if no hash exists
+                key = self.table.item(r, 7).text() 
+                if not key or key == "Not Computed":
+                    key = self.table.item(r, 2).text() + "_" + self.table.item(r, 5).text() 
+                
+                if key not in groups: groups[key] = []
+                
+                mod_str = self.table.item(r, 6).text()
+                loc = self.table.item(r, 3).text()
+                try: dt = datetime.strptime(mod_str, "%Y-%m-%d %H:%M:%S")
+                except Exception: dt = datetime.min
+                
+                groups[key].append({'row': r, 'dt': dt, 'loc': loc})
+        
+        target_folder = ""
+        if "specific Virtual Folder" in rule:
+            target_folder, ok = QInputDialog.getText(self, "Protect Folder", "Enter the Virtual Folder to KEEP (e.g. /Offline_Archive_Drive/):\n\nAll duplicates outside this folder will be checked for deletion.")
+            if not ok or not target_folder.strip(): return
+            target_folder = target_folder.strip()
+
+        # 2. Apply rules to each group
+        for key, items in groups.items():
+            if len(items) < 2: continue # Needs at least 2 to be a duplicate conflict
+            
+            # Sort items based on the active rule
+            if "Keep Oldest" in rule:
+                items.sort(key=lambda x: x['dt']) # Oldest is index 0
+            elif "Keep Newest" in rule:
+                items.sort(key=lambda x: x['dt'], reverse=True) # Newest is index 0
+            elif "specific Virtual Folder" in rule:
+                # Sort so items inside the protected folder jump to the top (index 0)
+                items.sort(key=lambda x: 0 if target_folder in x['loc'] else 1)
+
+            # Keep the 1st item (Uncheck), flag the rest for deletion (Check)
+            for i, item_data in enumerate(items):
+                chk_state = Qt.Unchecked if i == 0 else Qt.Checked
+                self.table.item(item_data['row'], 0).setCheckState(chk_state)
+                
+        QMessageBox.information(self, "Smart Select Applied", "Checked items based on your rule.\n\nPlease review the selections before clicking Delete.")
 
     def assign_tags_selected(self):
         ids = [int(self.table.item(r, 8).text()) for r in range(self.table.rowCount()) if self.table.item(r, 0).checkState() == Qt.Checked]
@@ -2931,10 +3031,11 @@ class SpaceAnalyzerDialog(QDialog):
         
         with sqlite3.connect(self.db_path) as conn:
             cur = conn.cursor()
-            cur.execute(f"SELECT sha256, COUNT(*) as c FROM virtual_fs WHERE is_folder=0 AND in_trash=0 AND ({cond}) AND sha256 IS NOT NULL AND sha256 != '' GROUP BY sha256 HAVING c > 1", params)
+            # FIX: Ensure Exact Hash scanner also respects intentional duplicates
+            cur.execute(f"SELECT sha256, COUNT(*) as c FROM virtual_fs WHERE is_folder=0 AND in_trash=0 AND hash_verified=0 AND ({cond}) AND sha256 IS NOT NULL AND sha256 != '' GROUP BY sha256 HAVING c > 1", params)
             duplicates = cur.fetchall()
             for sha, count in duplicates:
-                cur.execute(f"SELECT id, name, parent_path, extension, size, modified FROM virtual_fs WHERE sha256=? AND ({cond}) AND is_folder=0 AND in_trash=0", (sha,) + params)
+                cur.execute(f"SELECT id, name, parent_path, extension, size, modified FROM virtual_fs WHERE sha256=? AND ({cond}) AND is_folder=0 AND in_trash=0 AND hash_verified=0", (sha,) + params)
                 files = cur.fetchall()
                 for idx, f in enumerate(files):
                     chk_state = Qt.Checked if idx > 0 else Qt.Unchecked
@@ -3380,18 +3481,32 @@ class LazyImageLabel(QLabel):
         super().__init__()
         self.path = path
         self.loaded = False
+        self.loading = False
         self.setMinimumHeight(600)
         self.setAlignment(Qt.AlignCenter)
-        self.setStyleSheet("background: transparent; margin-bottom: 20px;")
+        self.setStyleSheet("background: #161b22; margin-bottom: 20px; border-radius: 8px; color: #8b949e;")
+        self.setText("Waiting for drive...") # Visual feedback
 
     def load_if_needed(self, view_width):
-        if not self.loaded:
-            img = QImage(self.path)
-            if not img.isNull() and img.width() > 0:
-                pm = QPixmap.fromImage(img).scaledToWidth(view_width - 40, Qt.SmoothTransformation)
-                self.setPixmap(pm)
-                self.setMinimumHeight(pm.height())
-            self.loaded = True
+        if not self.loaded and not self.loading:
+            self.loading = True
+            self.setText("Loading from USB...")
+            
+            # ASYNC FIX: Send the heavy disk read to a background thread
+            self.loader = ImageLoader(self.path, max_size=(view_width - 40, 4000), parent=self)
+            self.loader.finished.connect(self._on_loaded)
+            self.loader.start()
+
+    def _on_loaded(self, path, image):
+        if image and not image.isNull() and image.width() > 0:
+            self.setPixmap(QPixmap.fromImage(image))
+            self.setMinimumHeight(image.height())
+        else:
+            self.setText("Failed to load image.")
+            
+        self.loaded = True
+        self.loading = False
+        self.loader.deleteLater()
 
 
 class VerticalStripViewer(QScrollArea):
@@ -3405,6 +3520,8 @@ class VerticalStripViewer(QScrollArea):
         self.layout.setAlignment(Qt.AlignTop | Qt.AlignHCenter)
         self.setWidget(self.container)
         self.labels = []
+        self.playlist = []
+        self._render_idx = 0
         self.verticalScrollBar().valueChanged.connect(self.check_visibility)
         
     def load_playlist(self, playlist):
@@ -3413,19 +3530,35 @@ class VerticalStripViewer(QScrollArea):
             if item.widget(): item.widget().deleteLater()
         self.labels.clear()
         
-        for item in playlist:
-            if item['ext'] in ['.png', '.jpg', '.jpeg', '.bmp', '.gif', '.webp']:
-                lbl = LazyImageLabel(item['path'])
-                self.layout.addWidget(lbl)
-                self.labels.append(lbl)
-        QTimer.singleShot(100, self.check_visibility)
+        self.playlist = [i for i in playlist if i['ext'] in ['.png', '.jpg', '.jpeg', '.bmp', '.gif', '.webp']]
+        self._render_idx = 0
+        self.verticalScrollBar().setValue(0)
+        
+        # Load only first 5 initially so UI instantly responds
+        self._render_next_batch(5)
+        
+    def _render_next_batch(self, count=5):
+        end = min(self._render_idx + count, len(self.playlist))
+        for i in range(self._render_idx, end):
+            item = self.playlist[i]
+            lbl = LazyImageLabel(item['path'])
+            self.layout.addWidget(lbl)
+            self.labels.append(lbl)
+        self._render_idx = end
+        QTimer.singleShot(50, self.check_visibility)
         
     def check_visibility(self):
         vw = self.viewport().width()
-        rect = self.viewport().rect().adjusted(0, -1500, 0, 1500) # Preload buffer
+        rect = self.viewport().rect().adjusted(0, -1500, 0, 1500)
+        scroll_y = self.verticalScrollBar().value()
+        scroll_max = self.verticalScrollBar().maximum()
+        
+        # Smooth chunking: if approaching bottom, load next batch
+        if scroll_y >= scroll_max - 2000 and self._render_idx < len(self.playlist):
+            self._render_next_batch(5)
+            
         for lbl in self.labels:
             lbl_y = lbl.mapTo(self.container, lbl.rect().topLeft()).y()
-            scroll_y = self.verticalScrollBar().value()
             if lbl_y + lbl.height() >= scroll_y - 1500 and lbl_y <= scroll_y + rect.height():
                 lbl.load_if_needed(vw)
                 
@@ -3459,11 +3592,12 @@ class vmanViewer(QDialog):
         self.main_layout.setContentsMargins(0, 0, 0, 0)
         self.main_layout.setSpacing(0)
         
-        # Slideshow Running Line (Progress Bar)
-        self.slide_progress = QFrame()
+        # Slideshow Running Line (Native QProgressBar)
+        self.slide_progress = QProgressBar()
         self.slide_progress.setFixedHeight(4)
-        self.slide_progress.setStyleSheet("background-color: #58a6ff;")
-        self.slide_progress.setFixedWidth(0)
+        self.slide_progress.setTextVisible(False)
+        self.slide_progress.setRange(0, 100)
+        self.slide_progress.setStyleSheet("QProgressBar { border: none; background: transparent; } QProgressBar::chunk { background-color: #58a6ff; }")
         self.slide_progress.hide()
         self.main_layout.addWidget(self.slide_progress)
 
@@ -3686,22 +3820,32 @@ class vmanViewer(QDialog):
     def _toggle_slide(self):
         if self.btn_slide.isChecked():
             self.slide_elapsed = 0
+            self.slide_progress.setValue(0)
             self.slide_progress.show()
             self.slide_tick_timer.start(30) # High-speed ticks for smooth line
         else:
             self.slide_tick_timer.stop()
             self.slide_progress.hide()
-            self.slide_progress.setFixedWidth(0)
+            self.slide_progress.setValue(0)
 
     def _slide_tick(self):
         target_ms = int(self.cb_speed.currentText().replace("s", "")) * 1000
         self.slide_elapsed += 30
         pct = self.slide_elapsed / target_ms
-        self.slide_progress.setFixedWidth(int(self.width() * pct))
+        
+        # FIX: Update the value (0-100) instead of forcing layout pixel width
+        self.slide_progress.setValue(int(pct * 100))
         
         if self.slide_elapsed >= target_ms:
             self.slide_elapsed = 0
-            self._next_item()
+            
+            # Check if we are at the end of the playlist
+            if self.current_index < len(self.playlist) - 1:
+                self._next_item()
+            else:
+                # Stop the timer gracefully at the end
+                self._toggle_slide()
+                self.btn_slide.setChecked(False)
 
     def _apply_img_transform(self):
         if hasattr(self, 'orig_pm'):
@@ -3751,6 +3895,25 @@ class vmanViewer(QDialog):
             
         super().closeEvent(ev)
 
+class ThumbnailGeneratorThread(QThread):
+    progress = Signal(int)
+    def __init__(self, items, parent=None):
+        super().__init__(parent)
+        self.items = items
+        self.is_cancelled = False
+    def cancel(self): self.is_cancelled = True
+    def run(self):
+        for i, (typ, rp, db_id) in enumerate(self.items):
+            if self.is_cancelled: break
+            if rp and os.path.exists(rp) and rp.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.webp')):
+                try:
+                    img = QImage(rp)
+                    if not img.isNull():
+                        scaled = img.scaled(120, 120, Qt.KeepAspectRatio, Qt.FastTransformation)
+                        scaled.save(str(THUMBS_DIR / f"{db_id}.png"), "PNG")
+                except Exception: pass
+            self.progress.emit(i + 1)
+
 # ---------------- Main Application Window ----------------
 class vmanVirtualManager(QMainWindow):
     def __init__(self):
@@ -3782,8 +3945,12 @@ class vmanVirtualManager(QMainWindow):
         self.render_progress = None
 
         ensure_dirs()
+        ICONS_DIR.mkdir(parents=True, exist_ok=True)
+        THUMBS_DIR.mkdir(parents=True, exist_ok=True)
         self.db = vmanDB(DB_FILE)
         self.setWindowTitle(APP_TITLE)
+        
+        self._load_custom_icons() # Load custom ext icons into RAM
         self.resize(1600, 950)
         self.setFont(QFont("Segoe UI", 10))
         self.setWindowIcon(QIcon("icons/vman.png"))
@@ -3792,6 +3959,52 @@ class vmanVirtualManager(QMainWindow):
         self._setup_shortcuts()
         self.apply_theme("Dark") 
         self.refresh_all()
+        
+        ensure_dirs()
+        ICONS_DIR.mkdir(parents=True, exist_ok=True)
+        THUMBS_DIR.mkdir(parents=True, exist_ok=True)
+        self.db = vmanDB(DB_FILE)
+        self.setWindowTitle(APP_TITLE)
+        
+        self._load_custom_icons() # Load custom ext icons into RAM
+        
+    def clean_orphaned_thumbnails(self):
+        if not THUMBS_DIR.exists(): 
+            return QMessageBox.information(self, "Cleanup", "Thumbnails directory does not exist yet.")
+            
+        thumb_files = list(THUMBS_DIR.glob("*.png"))
+        if not thumb_files: 
+            return QMessageBox.information(self, "Cleanup", "No thumbnails found to clean.")
+        
+        db_ids = []
+        for f in thumb_files:
+            try: db_ids.append(int(f.stem))
+            except ValueError: pass
+            
+        if not db_ids: return
+        
+        valid_ids = set()
+        deleted_count = 0
+        try:
+            with sqlite3.connect(self.db.path) as conn:
+                cur = conn.cursor()
+                # Batch in chunks of 900 to respect SQLite's variable limits
+                for i in range(0, len(db_ids), 900): 
+                    chunk = db_ids[i:i+900]
+                    cur.execute(f"SELECT id FROM virtual_fs WHERE id IN ({','.join('?'*len(chunk))})", chunk)
+                    valid_ids.update(r[0] for r in cur.fetchall())
+                    
+            for f in thumb_files:
+                try:
+                    if int(f.stem) not in valid_ids:
+                        f.unlink() # Delete the orphaned thumbnail
+                        deleted_count += 1
+                except ValueError: pass
+                
+            QMessageBox.information(self, "Cleanup Complete", f"Successfully cleared {deleted_count} orphaned thumbnails from the drive.")
+            self.sys_log(f"Manual cleanup: Removed {deleted_count} orphaned thumbnails.")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to clean thumbnails: {e}")
 
     def sys_log(self, message):
         timestamp = datetime.now().strftime("%H:%M:%S")
@@ -3824,7 +4037,8 @@ class vmanVirtualManager(QMainWindow):
         act_new_file = QAction("📄 File", self)
         act_new_file.triggered.connect(self.create_virtual_file)
         
-        act_timeline = QAction("📅 Timeline Diary", self)
+        act_timeline = QAction("📅 Timeline", self)
+        act_timeline.setToolTip("Timeline Diary")
         act_timeline.triggered.connect(lambda: TimelineDiaryDialog(self.active_db_path, self).exec())
         
         act_analyzer = QAction("🧹 Analyzer", self)
@@ -3837,6 +4051,7 @@ class vmanVirtualManager(QMainWindow):
         act_load_ext.triggered.connect(self.load_external_db)
         
         act_csv_lib = QAction("📚 Tag Library", self)
+        act_csv_lib.setToolTip("Tag Library")
         act_csv_lib.triggered.connect(self.open_tag_library)
 
         act_set_storage = QAction("💾 Set Storage", self)
@@ -3846,7 +4061,15 @@ class vmanVirtualManager(QMainWindow):
         self.act_view_mode = QAction("🖼 Grid View", self)
         self.act_view_mode.triggered.connect(self.toggle_view_mode)
         
+        self.act_fast_mode = QAction("⚡", self)
+        self.act_fast_mode.setCheckable(True)
+        self.act_fast_mode.setChecked(True) # Default to True for massive DBs
+        self.act_fast_mode.setToolTip("Disable disk I/O and deep folder calculations for maximum speed.")
+        self.act_fast_mode.triggered.connect(self.clear_cache)
+        self.act_fast_mode.triggered.connect(lambda: self.load_directory(self.current_prefix))
+        
         self.act_sec_name = QAction("🏷", self)
+        self.act_sec_name.setToolTip("Toggle Secondary Names")
         self.act_sec_name.setCheckable(True)
         self.act_sec_name.triggered.connect(self.toggle_secondary_names)
         tb.addAction(self.act_sec_name)
@@ -3870,11 +4093,12 @@ class vmanVirtualManager(QMainWindow):
         tb.addSeparator()
         
  
-        tb.addActions([act_timeline, act_analyzer, act_bulk_del, act_load_ext, act_csv_lib, act_set_storage])
+        tb.addActions([act_analyzer, act_bulk_del, act_timeline, act_csv_lib, act_load_ext, act_set_storage])
         tb.addSeparator()
 
-        # --- ADDING THE GRID VIEW BUTTON TO THE UI ---
-        tb.addActions([self.act_view_mode, self.act_toggle_sidebar, act_toggle_log])       
+
+        # --- ADDING THE GRID VIEW AND FAST MODE BUTTONS TO THE UI ---
+        tb.addActions([self.act_view_mode, self.act_toggle_sidebar, act_toggle_log, self.act_fast_mode])
         
         empty = QWidget()
         empty.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
@@ -4080,6 +4304,27 @@ class vmanVirtualManager(QMainWindow):
         self.status = QStatusBar()
         self.setStatusBar(self.status)
 
+    def generate_thumbnails_current_view(self):
+        items = []
+        model = self.file_table.model()
+        for r in range(model.rowCount()):
+            data = model.data(model.index(r, 0), Qt.UserRole)
+            if data and data[0] == "file":
+                items.append(data)
+        
+        if not items: return
+        
+        self.thumb_dlg = QProgressDialog("Extracting Thumbnails...", "Cancel", 0, len(items), self)
+        self.thumb_dlg.setWindowModality(Qt.WindowModal)
+        self.thumb_dlg.show()
+        
+        self.thumb_worker = ThumbnailGeneratorThread(items, self)
+        self.thumb_worker.progress.connect(lambda i: self.thumb_dlg.setValue(i))
+        self.thumb_worker.finished.connect(lambda: (self.thumb_dlg.close(), self.clear_cache(), self.refresh_all()))
+        self.thumb_dlg.canceled.connect(self.thumb_worker.cancel)
+        self._register_worker(self.thumb_worker)
+        self.thumb_worker.start()
+
     def cmd_map_folder(self, item):
         typ, v_path, db_id = item
         if typ != "folder": return
@@ -4254,16 +4499,37 @@ Ctrl+C/V/X    : Copy, Paste, Cut (Fully functional across Main and Isolated data
         
     def toggle_sidebar(self): self.right_dock.setVisible(not self.right_dock.isVisible())
 
-    def _get_native_icon(self, real_path: str, is_folder: bool, ext: str = "") -> QIcon:
-        if is_folder: return self.style().standardIcon(QStyle.SP_DirIcon)
-        ext = str(ext).lower()
-        if ext in ['.png', '.jpg', '.jpeg', '.bmp', '.gif', '.webp'] and real_path and os.path.exists(real_path):
-            if real_path not in self._icon_cache:
-                try: self._icon_cache[real_path] = QIcon(QPixmap(real_path).scaled(96, 96, Qt.KeepAspectRatio, Qt.SmoothTransformation))
-                except Exception: pass
-            return self._icon_cache.get(real_path, self.style().standardIcon(QStyle.SP_FileIcon))
+    def _load_custom_icons(self):
+        if ICONS_DIR.exists():
+            for f in ICONS_DIR.iterdir():
+                if f.is_file() and f.suffix.lower() in ('.png', '.ico', '.jpg', '.jpeg'):
+                    ext_name = f.stem.lower()
+                    self._icon_cache[ext_name] = QIcon(str(f))
+
+    def _get_native_icon(self, real_path: str, is_folder: bool, ext: str = "", db_id: int = -1) -> QIcon:
+        if is_folder: 
+            return self.style().standardIcon(QStyle.SP_DirIcon)
+            
+        # 1. Check if a manual thumbnail was generated for this specific file
+        if db_id != -1:
+            thumb_path = THUMBS_DIR / f"{db_id}.png"
+            cache_key = f"thumb_{db_id}"
+            
+            if cache_key in self._icon_cache:
+                return self._icon_cache[cache_key]
+                
+            if thumb_path.exists():
+                self._icon_cache[cache_key] = QIcon(str(thumb_path))
+                return self._icon_cache[cache_key]
+
+        # 2. Fallback to extension icons (jpg.png, txt.png)
+        ext = str(ext).lower().strip('.')
+        if not ext: 
+            return self.style().standardIcon(QStyle.SP_FileIcon)
+
         if ext not in self._icon_cache:
-            self._icon_cache[ext] = self.icon_provider.icon(QFileInfo(real_path)) if HAS_ICON_PROVIDER and self.icon_provider and real_path and os.path.exists(real_path) else self.style().standardIcon(QStyle.SP_FileIcon)
+            self._icon_cache[ext] = self.style().standardIcon(QStyle.SP_FileIcon)
+            
         return self._icon_cache[ext]
 
     def _is_smart_path(self, p):
@@ -4358,7 +4624,11 @@ Ctrl+C/V/X    : Copy, Paste, Cut (Fully functional across Main and Isolated data
             self.loader_thread.cancel(); self.loader_thread.quit(); self.loader_thread.wait()
 
         self.status.showMessage("Computing View...")
-        self.loader_thread = DataLoaderThread(self.active_db_path, target_path, self.show_hidden, self)
+        
+        # Fetch the Fast Mode UI state and pass it to the loader
+        is_fast = self.act_fast_mode.isChecked() if hasattr(self, 'act_fast_mode') else False
+        self.loader_thread = DataLoaderThread(self.active_db_path, target_path, self.show_hidden, is_fast, self)
+        
         self.loader_thread.data_ready.connect(lambda f, fl: self._start_ui_render(f, fl, cached=False))
         self.loader_thread.start()
 
@@ -4419,7 +4689,11 @@ Ctrl+C/V/X    : Copy, Paste, Cut (Fully functional across Main and Isolated data
                 self.table_rows_buffer.append({"display": [disp_name, "", human_size(size), "N/A", f"Virtual Folder ({count})", pp, c_tag], "sort_keys": [(0, f_name.lower()), (0, ""), (0, size), (0, ""), (0, count), (0, pp.lower()), (0, c_tag)], "user_data": ("folder", v_path, db_id), "color_tag": c_tag, "is_hidden": is_h, "icon": dir_icon})
             else:
                 db_id, n, s, ext, rp, mod, c_tag, sec_n, is_h = item[:9]
-                icon = self._get_native_icon(rp, False, ext); s_val = s if s else 0; ext_str = str(ext) if ext else ""
+                
+                # UPDATED: Pass db_id to _get_native_icon to enable the new custom thumbnail engine
+                icon = self._get_native_icon(rp, False, ext, db_id)
+                s_val = s if s else 0
+                ext_str = str(ext) if ext else ""
                 
                 # FIXED: Uses 'n' instead of 'f_name' for virtual files!
                 disp_name = sec_n if (self.show_secondary_names and sec_n) else (f"{n}\n({sec_n})" if sec_n else f"{n}")
@@ -4702,6 +4976,9 @@ Ctrl+C/V/X    : Copy, Paste, Cut (Fully functional across Main and Isolated data
             create_menu.addAction("📂 Create Virtual Folder (Ctrl+Shift+N)", self.create_folder)
             create_menu.addAction("📥 Import Real Files", self.import_real_files)
             create_menu.addAction("📁 Import Real Folder", self.import_real_folder)
+            
+            menu.addAction("🖼️ Generate Thumbnails (Current Folder)", self.generate_thumbnails_current_view)
+            menu.addAction("🧹 Clean Orphaned Thumbnails", self.clean_orphaned_thumbnails)
 
         # 3. Operations on Selected Items
         if sel_items:
