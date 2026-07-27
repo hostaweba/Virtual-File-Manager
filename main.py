@@ -261,9 +261,9 @@ class MaterializeThread(QThread):
 
     def run(self):
         try:
-            conn = sqlite3.connect(self.db_path)
-            cur = conn.cursor()
-            all_exports = [] 
+            with sqlite3.connect(self.db_path) as conn:
+                cur = conn.cursor()
+                all_exports = []
 
             for typ, path_val, db_id in self.items:
                 if self.is_cancelled: return
@@ -393,6 +393,30 @@ class BulkHashCalculator(QThread):
             self.finished.emit(computed)
         except Exception: pass
 
+class TagLibraryLoaderThread(QThread):
+    finished_loading = Signal(dict)
+    
+    def __init__(self, db_path, base_v_path, parent=None):
+        super().__init__(parent)
+        self.db_path = db_path
+        self.base_v_path = base_v_path
+
+    def run(self):
+        tag_cache = {}
+        try:
+            with sqlite3.connect(self.db_path, timeout=10) as conn:
+                cur = conn.cursor()
+                cur.execute("SELECT parent_path, name, custom_tags, is_folder FROM virtual_fs WHERE parent_path LIKE ?", (f"{self.base_v_path}%",))
+                for pp, name, tags, is_folder in cur.fetchall():
+                    full_path = f"{pp}{name}/" if is_folder else f"{pp}{name}"
+                    full_path = full_path.replace("//", "/")
+                    
+                    # Store ALL files and folders so the columns explore completely
+                    tag_cache[full_path] = [t.strip() for t in str(tags).split(',')] if tags else []
+        except Exception as e: 
+            print(f"DB Load Error: {e}")
+            
+        self.finished_loading.emit(tag_cache)
 
 class DataLoaderThread(QThread):
     data_ready = Signal(list, list) 
@@ -539,11 +563,11 @@ class SpaceScannerThread(QThread):
     
     def run(self):
         try:
-            conn = sqlite3.connect(self.db_path)
-            cur = conn.cursor()
-            
-            path_cond = " OR ".join(["parent_path LIKE ?"] * len(self.scan_roots))
-            path_params = tuple(f"{p}%" for p in self.scan_roots)
+            with sqlite3.connect(self.db_path) as conn:
+                cur = conn.cursor()
+                
+                path_cond = " OR ".join(["parent_path LIKE ?"] * len(self.scan_roots))
+                path_params = tuple(f"{p}%" for p in self.scan_roots)
             
             self.progress.emit(10, 100, "Scanning for Junk...")
             # FIX: Added hash_verified=0 to ignore intentionally marked safe files
@@ -570,7 +594,6 @@ class SpaceScannerThread(QThread):
             
             self.progress.emit(100, 100, "Scan Complete.")
         finally:
-            if 'conn' in locals(): conn.close()
             self.finished_scan.emit()
 
 class ImportFilesThread(QThread):
@@ -1243,6 +1266,7 @@ class vmanTagLibraryDialog(QDialog):
         
         self.setWindowTitle("Universal Tag Engine & Analytics")
         self.resize(1300, 800)
+        self.setWindowFlags(self.windowFlags() | Qt.WindowMaximizeButtonHint | Qt.WindowMinimizeButtonHint)
         
         if self.main_app and hasattr(self.main_app, 'theme_combo'):
             self.setStyleSheet(THEMES.get(self.main_app.theme_combo.currentText(), THEMES["Dark"]))
@@ -1342,7 +1366,7 @@ class vmanTagLibraryDialog(QDialog):
         
         self.top_toolbar.addStretch() 
         
-        self.radio_folders = QRadioButton("Folders")
+        self.radio_folders = QRadioButton("Dirs")
         self.radio_files = QRadioButton("Files")
         self.radio_folders.setChecked(True)
         
@@ -1350,18 +1374,17 @@ class vmanTagLibraryDialog(QDialog):
         self.global_search_box.setPlaceholderText("Global Search ...")
         self.global_search_box.setFixedWidth(250)
         
+        # --- Add the explicit search button ---
+        self.btn_search = QPushButton("🔍")
+        self.btn_search.clicked.connect(lambda: self.run_global_search(self.global_search_box.text()))
         
         self.top_toolbar.addWidget(self.radio_folders)
         self.top_toolbar.addWidget(self.radio_files)
         self.top_toolbar.addWidget(self.global_search_box)
+        self.top_toolbar.addWidget(self.btn_search) # Added to layout
         
-        self.search_timer = QTimer(self)
-        self.search_timer.setSingleShot(True)
-        self.search_timer.setInterval(500) 
-        self.search_timer.timeout.connect(lambda: self.run_global_search(self.global_search_box.text()))
-        
-        self.global_search_box.textChanged.connect(self.search_timer.start)
-        self.global_search_box.returnPressed.connect(self.search_timer.stop)
+        # We removed the auto-search QTimer here so it ONLY searches 
+        # when you click the button or press Enter.
         self.global_search_box.returnPressed.connect(lambda: self.run_global_search(self.global_search_box.text()))
         self.radio_folders.toggled.connect(lambda: self.run_global_search(self.global_search_box.text()))
         
@@ -1407,30 +1430,37 @@ class vmanTagLibraryDialog(QDialog):
             QMessageBox.information(self, "Saved", "Hierarchy names saved for all future sessions.\n\nNote: Close and reopen the Tag Library to update the Analytics Tab names.")
 
     def refresh_memory_cache(self):
-        self.tag_cache.clear()
-        try:
-            with sqlite3.connect(self.db_path, timeout=10) as conn:
-                cur = conn.cursor()
-                cur.execute("SELECT parent_path, name, custom_tags, is_folder FROM virtual_fs WHERE parent_path LIKE ?", (f"{self.base_v_path}%",))
-                for pp, name, tags, is_folder in cur.fetchall():
-                    full_path = f"{pp}{name}/" if is_folder else f"{pp}{name}"
-                    full_path = full_path.replace("//", "/")
-                    tag_list = [t.strip() for t in str(tags).split(',')] if tags else []
-                    if tag_list or is_folder:
-                        self.tag_cache[full_path] = tag_list
-        except Exception as e: print(f"DB Load Error: {e}")
-        
-        self.update_analytics_data()
-
+        # Clear existing UI elements securely
         while self.dynamic_lists:
             col_data = self.dynamic_lists.pop()
             col_data['widget'].setParent(None)
             col_data['widget'].deleteLater()
-            
-        self._add_column(0, self.l0_name)
-        self._populate_level(0, self.base_v_path)
-        self._populate_all_tags()
 
+        self.tag_list.clear()
+        self.tag_cache.clear()
+
+        # Prevent UI interaction and show loading text to prevent freezing
+        self.tabs.setEnabled(False)
+        self.setWindowTitle(f"Universal Tag Engine & Analytics - [LOADING {self.base_v_path} ...]")
+
+        # Run the heavy loading in the background thread
+        self.loader_thread = TagLibraryLoaderThread(self.db_path, self.base_v_path, self)
+        self.loader_thread.finished_loading.connect(self._on_cache_loaded)
+        self.loader_thread.start()
+        
+    def _on_cache_loaded(self, loaded_cache):
+            self.tag_cache = loaded_cache
+            
+            # Restore UI State
+            self.setWindowTitle("Universal Tag Engine & Analytics")
+            self.tabs.setEnabled(True)
+
+            # Now safely run your original analytics and UI population
+            self.update_analytics_data()
+            self._add_column(0, self.l0_name)
+            self._populate_level(0, self.base_v_path)
+            self._populate_all_tags()       
+        
     def update_analytics_data(self):
         tags_data, l0_data, l1_data, l2_data, l3_data, l4_data = {}, {}, {}, {}, {}, {}
         total_items = 0
@@ -1646,8 +1676,9 @@ class vmanTagLibraryDialog(QDialog):
     def _populate_all_tags(self):
         all_tags = set(tag for tags in self.tag_cache.values() for tag in tags if tag)
         self.tag_list.clear()
-        for t in sorted(list(all_tags)): self.tag_list.addItem(QListWidgetItem(t))
-
+        for t in sorted(list(all_tags)): 
+            self.tag_list.addItem(QListWidgetItem(t))
+            
     def on_level_clicked(self, level_index, item):
         v_path = item.data(Qt.UserRole)
         
@@ -1672,9 +1703,27 @@ class vmanTagLibraryDialog(QDialog):
 
     def on_tag_clicked(self, item):
         target_tag = item.text()
-        valid_paths = [p for p, tags in self.tag_cache.items() if target_tag in tags]
-        base_depth = len([p for p in self.base_v_path.split('/') if p])
         
+        prog = QProgressDialog(f"Loading tag '{target_tag}'...", "Cancel", 0, 100, self)
+        prog.setWindowModality(Qt.WindowModal)
+        prog.setMinimumDuration(0)
+        prog.show()
+
+        valid_paths = []
+        keys = list(self.tag_cache.items())
+        total = len(keys)
+        if total == 0: total = 1
+        
+        # Phase 1: Filter
+        for i, (p, tags) in enumerate(keys):
+            if i % 2000 == 0:
+                prog.setValue(int((i / total) * 30))
+                QApplication.processEvents()
+            if prog.wasCanceled(): return
+            if target_tag in tags:
+                valid_paths.append(p)
+        
+        base_depth = len([p for p in self.base_v_path.split('/') if p])
         max_depth = 0
         for vp in valid_paths:
             parts = [p for p in vp.split('/') if p]
@@ -1687,16 +1736,28 @@ class vmanTagLibraryDialog(QDialog):
             col['widget'].deleteLater()
             
         for i in range(len(self.dynamic_lists), max_depth):
-            title = self.hierarchy_levels[i] if i < len(self.hierarchy_levels) else f"Level {i + 1}"
+            title = self.hierarchy_levels[i] if hasattr(self, 'hierarchy_levels') and i < len(self.hierarchy_levels) else f"Level {i + 1}"
             self._add_column(i, title)
             
+        total_vp = len(valid_paths)
+        
+        # Phase 2: Build UI
         for i in range(max_depth):
+            if prog.wasCanceled(): break
+            prog.setLabelText(f"Building Structure for Column {i+1} of {max_depth}...")
+            
             lst = self.dynamic_lists[i]['list']
-            lst.blockSignals(True) 
+            lst.blockSignals(True)
             lst.clear()
             
             level_nodes = {}
-            for vp in valid_paths:
+            for j, vp in enumerate(valid_paths):
+                if j % 2000 == 0:
+                    col_base_pct = 30 + (i / max(1, max_depth)) * 70
+                    col_progress = (j / max(1, total_vp)) * (70 / max(1, max_depth))
+                    prog.setValue(int(col_base_pct + col_progress))
+                    QApplication.processEvents()
+                    
                 parts = [p for p in vp.split('/') if p]
                 if len(parts) > base_depth + i:
                     name = parts[base_depth + i]
@@ -1704,15 +1765,17 @@ class vmanTagLibraryDialog(QDialog):
                     node_v_path = "/" + "/".join(parts[:base_depth + i + 1]) + ("/" if is_folder else "")
                     level_nodes[name] = (node_v_path, is_folder)
             
-            for name in sorted(level_nodes.keys()):
+            sorted_names = sorted(level_nodes.keys())
+            display_names = sorted_names[:1000]
+            
+            for j, name in enumerate(display_names):
+                if j % 100 == 0: QApplication.processEvents()
                 node_v_path, is_folder = level_nodes[name]
                 l_item = QListWidgetItem(name)
                 l_item.setData(Qt.UserRole, node_v_path)
                 
-                if is_folder:
-                    l_item.setIcon(self.style().standardIcon(QStyle.SP_DirIcon))
-                else:
-                    l_item.setIcon(self.style().standardIcon(QStyle.SP_FileIcon))
+                if is_folder: l_item.setIcon(self.style().standardIcon(QStyle.SP_DirIcon))
+                else: l_item.setIcon(self.style().standardIcon(QStyle.SP_FileIcon))
                 
                 if node_v_path in self.tag_cache and target_tag in self.tag_cache[node_v_path]:
                     l_item.setForeground(QBrush(QColor("#58a6ff")))
@@ -1722,7 +1785,18 @@ class vmanTagLibraryDialog(QDialog):
                     
                 lst.addItem(l_item)
                 
+            if len(sorted_names) > 1000:
+                warning_item = QListWidgetItem(f"... and {len(sorted_names) - 1000} more items (Refine search)")
+                warning_item.setForeground(QBrush(QColor("#e3b341")))
+                font = warning_item.font()
+                font.setItalic(True)
+                warning_item.setFont(font)
+                lst.addItem(warning_item)
+                
             lst.blockSignals(False)
+
+        prog.setValue(100)
+        prog.close()
 
     def run_global_search(self, text):
         query = text.lower()
@@ -1734,20 +1808,40 @@ class vmanTagLibraryDialog(QDialog):
         include_folders = self.radio_folders.isChecked()
         include_files = self.radio_files.isChecked()
 
-        for p in self.tag_cache.keys():
+        total_items = len(self.tag_cache)
+        if total_items == 0: total_items = 1
+
+        # Use a strict 0-100 percentage scale to guarantee smooth progress
+        prog = QProgressDialog("Searching memory cache...", "Cancel", 0, 100, self)
+        prog.setWindowModality(Qt.WindowModal)
+        prog.setMinimumDuration(0) # Force it to show immediately
+        prog.show()
+
+        # Phase 1: 100% RAM-Based Search (Allocated 0% to 50% of the progress bar)
+        keys = list(self.tag_cache.keys())
+        for i, p in enumerate(keys):
+            # Keep UI perfectly freeze-free
+            if i % 2000 == 0:
+                prog.setValue(int((i / total_items) * 50))
+                QApplication.processEvents()
+            if prog.wasCanceled():
+                return
+
             is_fldr = p.endswith('/')
             if (is_fldr and not include_folders) or (not is_fldr and not include_files):
                 continue 
-            if query in p.lower():
+            
+            parts = [part for part in p.split('/') if part]
+            target_name = parts[-1] if parts else ""
+            
+            if query in target_name.lower():
                 valid_paths.add(p)
                 
-        if self.radio_files.isChecked():
-            with sqlite3.connect(self.db_path) as conn:
-                cur = conn.cursor()
-                cur.execute("SELECT parent_path, name FROM virtual_fs WHERE is_folder=0 AND in_trash=0 AND name LIKE ?", (f"%{query}%",))
-                for pp, name in cur.fetchall():
-                    valid_paths.add(f"{pp}{name}")
-                    
+        if not valid_paths:
+            prog.close()
+            QMessageBox.information(self, "Search Results", f"No items found matching '{text}' in this folder.")
+            return
+
         valid_paths = list(valid_paths)
         base_depth = len([p for p in self.base_v_path.split('/') if p])
         
@@ -1766,13 +1860,28 @@ class vmanTagLibraryDialog(QDialog):
             title = self.hierarchy_levels[i] if hasattr(self, 'hierarchy_levels') and i < len(self.hierarchy_levels) else f"Level {i + 1}"
             self._add_column(i, title)
             
+        # Phase 2: UI & Column Building (Allocated 50% to 100% of the progress bar)
+        # This was the heavy silent loop. Now it feeds directly into the progress bar.
+        total_vp = len(valid_paths)
+        
         for i in range(max_depth):
+            if prog.wasCanceled(): break
+            
+            prog.setLabelText(f"Building Structure for Column {i+1} of {max_depth}...")
+            
             lst = self.dynamic_lists[i]['list']
             lst.blockSignals(True)
             lst.clear()
             
             level_nodes = {}
-            for vp in valid_paths:
+            for j, vp in enumerate(valid_paths):
+                # Update progress perfectly without freezing
+                if j % 2000 == 0:
+                    col_base_pct = 50 + (i / max(1, max_depth)) * 50
+                    col_progress = (j / max(1, total_vp)) * (50 / max(1, max_depth))
+                    prog.setValue(int(col_base_pct + col_progress))
+                    QApplication.processEvents()
+                    
                 parts = [p for p in vp.split('/') if p]
                 if len(parts) > base_depth + i:
                     name = parts[base_depth + i]
@@ -1780,7 +1889,14 @@ class vmanTagLibraryDialog(QDialog):
                     node_v_path = "/" + "/".join(parts[:base_depth + i + 1]) + ("/" if is_folder else "")
                     level_nodes[name] = (node_v_path, is_folder)
             
-            for name in sorted(level_nodes.keys()):
+            # --- FREEZE PREVENTION: Cap UI rendering to 1000 items per column ---
+            sorted_names = sorted(level_nodes.keys())
+            display_names = sorted_names[:1000]
+            
+            for j, name in enumerate(display_names):
+                if j % 100 == 0:
+                    QApplication.processEvents() # Keeps UI responsive while drawing
+                    
                 node_v_path, is_folder = level_nodes[name]
                 l_item = QListWidgetItem(name)
                 l_item.setData(Qt.UserRole, node_v_path)
@@ -1798,7 +1914,19 @@ class vmanTagLibraryDialog(QDialog):
                     
                 lst.addItem(l_item)
                 
+            # Warn user if they need to narrow their search down
+            if len(sorted_names) > 1000:
+                warning_item = QListWidgetItem(f"... and {len(sorted_names) - 1000} more items (Refine search)")
+                warning_item.setForeground(QBrush(QColor("#e3b341")))
+                font = warning_item.font()
+                font.setItalic(True)
+                warning_item.setFont(font)
+                lst.addItem(warning_item)
+                
             lst.blockSignals(False)
+
+        prog.setValue(100)
+        prog.close()
 
     def _filter_list(self, list_widget, text):
         query = text.lower()
@@ -1839,6 +1967,7 @@ class vmanTagLibraryDialog(QDialog):
         is_folder = v_path.endswith('/')
         
         action_open = menu.addAction("🚀 Open in Native OS Explorer")
+        action_vman = menu.addAction("🎞 Open in vman Viewer")
         if is_folder:
             action_link = menu.addAction("🔗 Map THIS Folder to Physical OS")
         else: 
@@ -1860,6 +1989,19 @@ class vmanTagLibraryDialog(QDialog):
             self.edit_tags_for_item(item)
         elif action == action_link: 
             self.link_specific_path(item)
+        elif action == action_vman: # <-- ADD THIS BLOCK
+            if is_folder:
+                QMessageBox.warning(self, "Viewer", "Please select a file to view, not a folder.")
+            else:
+                real_p = self._get_real_path_for_item(item)
+                if not real_p or not os.path.exists(real_p):
+                    QMessageBox.warning(self, "Viewer", "Physical file not found.")
+                else:
+                    ext = os.path.splitext(real_p)[1].lower()
+                    playlist = [{'path': real_p, 'name': item.text(), 'ext': ext}]
+                    self.viewer = vmanViewer(playlist, 0, self.main_app if self.main_app else self)
+                    self.viewer.show()    
+            
         elif action == action_open: 
             self.jump_to_virtual_or_real_path(item, force_real=True)
         elif action == action_copy_v: 
@@ -2114,7 +2256,8 @@ class TimelineDiaryDialog(QDialog):
         super().__init__(parent)
         self.db_path = db_path
         self.setWindowTitle("Timeline Diary & Analytics")
-        
+        # --Add Minimize, Maximize, and Restore buttons ---
+        self.setWindowFlags(self.windowFlags() | Qt.WindowMaximizeButtonHint | Qt.WindowMinimizeButtonHint)
         self.resize(1100, 670)
         self.setMinimumSize(950, 660)
         
@@ -2555,10 +2698,12 @@ class TimelineDiaryDialog(QDialog):
         
         menu = QMenu(self)
         act_open = menu.addAction("🚀 Open Native File")
+        act_vman = menu.addAction("🎞 Open in vman Viewer")
         act_loc = menu.addAction("📂 Open OS Location")
         menu.addSeparator()
         act_copy_p = menu.addAction("📋 Copy Virtual Path")
         act_props = menu.addAction("📊 Show Properties")
+        act_bulk_tag = menu.addAction("🏷️ Bulk Assign Custom Tag") 
         menu.addSeparator()
         act_trash = menu.addAction("🗑️ Move to Trash")
         act_perm = menu.addAction("🧨 Delete Permanently")
@@ -2567,13 +2712,44 @@ class TimelineDiaryDialog(QDialog):
         
         if not self.parent(): return
         if action == act_open: self.parent().open_local_file_system(db_id)
+        elif action == act_vman:
+            if typ == "folder":
+                QMessageBox.warning(self, "Viewer", "Please select a file, not a folder.")
+            else:
+                with sqlite3.connect(self.db_path) as conn:
+                    res = conn.cursor().execute("SELECT real_path, extension FROM virtual_fs WHERE id=?", (db_id,)).fetchone()
+                if not res or not res[0] or not os.path.exists(res[0]):
+                    QMessageBox.warning(self, "Viewer", "Physical file not found.")
+                else:
+                    playlist = [{'path': res[0], 'name': name, 'ext': res[1].lower() if res[1] else ''}]
+                    self.viewer = vmanViewer(playlist, 0, self.parent())
+                    self.viewer.show()
+                    self.viewer.raise_()
+                    self.viewer.activateWindow()
         elif action == act_loc: self.parent().open_file_location(db_id)
         elif action == act_copy_p: QApplication.clipboard().setText(full_v_path)
         elif action == act_props: self.parent().show_properties(typ, full_v_path, db_id)
+        elif action == act_bulk_tag: self.bulk_assign_tags()
         elif action == act_trash: self.trash_selected_items(permanent=False)
         elif action == act_perm:
             if QMessageBox.question(self, "Delete", "Permanently delete selected files?", QMessageBox.Yes|QMessageBox.No) == QMessageBox.Yes:
                 self.trash_selected_items(permanent=True)
+
+    def bulk_assign_tags(self):
+        selected_rows = set(idx.row() for idx in self.table.selectedIndexes())
+        if not selected_rows: return
+        tags, ok = QInputDialog.getText(self, "Assign Tag", "Enter Custom Tag(s) separated by comma:")
+        if ok and tags.strip():
+            with sqlite3.connect(self.db_path) as conn:
+                cur = conn.cursor()
+                for r in selected_rows:
+                    db_id = int(self.table.item(r, 5).text())
+                    old = cur.execute("SELECT custom_tags FROM virtual_fs WHERE id=?", (db_id,)).fetchone()[0]
+                    new_val = f"{old}, {tags.strip()}".strip(", ") if old else tags.strip()
+                    cur.execute("UPDATE virtual_fs SET custom_tags=? WHERE id=?", (new_val, db_id))
+                conn.commit()
+            QMessageBox.information(self, "Complete", "Tags assigned successfully.")
+            self.load_by_filters()
 
     def open_scanned_file(self, index):
         if self.parent(): self.parent().open_local_file_system(int(self.table.item(index.row(), 5).text()))
@@ -2601,6 +2777,7 @@ class TimelineDiaryDialog(QDialog):
         # Reload the current active date/filters to reflect the deleted items
         self.load_html_diary(self.calendar.selectedDate())
         self.force_chart_redraw()
+        QMessageBox.information(self, "Deletion Complete", f"Successfully {'permanently deleted' if permanent else 'moved to Virtual Trash'} {len(ids_to_del)} items from the VMan Database.")
 
 
     def sync_calendar_highlights(self, date_strings):
@@ -2629,6 +2806,7 @@ class SpaceAnalyzerDialog(QDialog):
         # --- Increased width to 1350 to perfectly fit all 9 columns ---
         self.resize(1350, 700) 
         self.setMinimumSize(1100, 500)
+        self.setWindowFlags(self.windowFlags() | Qt.WindowMaximizeButtonHint | Qt.WindowMinimizeButtonHint)
         # ----------------------------------------------------------------------
         
         layout = QVBoxLayout(self)
@@ -3146,7 +3324,7 @@ class SpaceAnalyzerDialog(QDialog):
             for r in sorted(rows_to_remove, reverse=True):
                 self.table.removeRow(r)
                 
-            QMessageBox.information(self, "Success", "Items deleted.")
+            QMessageBox.information(self, "Deletion Complete", f"Successfully permanently deleted {len(ids)} items from the VMan Database.")
 
 
 class BulkOperationEngine(QDialog):
@@ -3586,6 +3764,7 @@ class vmanViewer(QDialog):
         super().__init__(parent)
         self.playlist, self.current_index = playlist, start_index
         self.setWindowTitle("VMan Media Engine"); self.resize(1100, 800)
+        self.setWindowFlags(self.windowFlags() | Qt.WindowMaximizeButtonHint | Qt.WindowMinimizeButtonHint)
         self.setStyleSheet(THEMES.get(parent.theme_combo.currentText() if parent else "Dark", THEMES["Dark"]))
         
         self.main_layout = QVBoxLayout(self)
@@ -3830,22 +4009,28 @@ class vmanViewer(QDialog):
 
     def _slide_tick(self):
         target_ms = int(self.cb_speed.currentText().replace("s", "")) * 1000
-        self.slide_elapsed += 30
-        pct = self.slide_elapsed / target_ms
         
-        # FIX: Update the value (0-100) instead of forcing layout pixel width
-        self.slide_progress.setValue(int(pct * 100))
-        
-        if self.slide_elapsed >= target_ms:
-            self.slide_elapsed = 0
-            
-            # Check if we are at the end of the playlist
-            if self.current_index < len(self.playlist) - 1:
-                self._next_item()
-            else:
-                # Stop the timer gracefully at the end
+        if self.btn_vert_mode.isChecked():
+            # Webpage Mode Auto-Scroll
+            bar = self.vert_view.verticalScrollBar()
+            bar.setValue(bar.value() + 2) # Adjust scroll speed here
+            if bar.value() >= bar.maximum():
                 self._toggle_slide()
                 self.btn_slide.setChecked(False)
+        else:
+            # Traditional Slideshow Mode
+            self.slide_elapsed += 30
+            pct = self.slide_elapsed / target_ms
+            
+            self.slide_progress.setValue(int(pct * 100))
+            
+            if self.slide_elapsed >= target_ms:
+                self.slide_elapsed = 0
+                if self.current_index < len(self.playlist) - 1:
+                    self._next_item()
+                else:
+                    self._toggle_slide()
+                    self.btn_slide.setChecked(False)
 
     def _apply_img_transform(self):
         if hasattr(self, 'orig_pm'):
@@ -4039,7 +4224,7 @@ class vmanVirtualManager(QMainWindow):
         
         act_timeline = QAction("📅 Timeline", self)
         act_timeline.setToolTip("Timeline Diary")
-        act_timeline.triggered.connect(lambda: TimelineDiaryDialog(self.active_db_path, self).exec())
+        act_timeline.triggered.connect(self.open_timeline_diary)
         
         act_analyzer = QAction("🧹 Analyzer", self)
         act_analyzer.triggered.connect(lambda: SpaceAnalyzerDialog(self.active_db_path, self).exec())
@@ -4304,6 +4489,21 @@ class vmanVirtualManager(QMainWindow):
         self.status = QStatusBar()
         self.setStatusBar(self.status)
 
+    def open_timeline_diary(self):
+        # Create it once and keep it in memory, just like the Tag Library
+        if not hasattr(self, 'timeline_diary_instance') or self.timeline_diary_instance is None:
+            self.timeline_diary_instance = TimelineDiaryDialog(self.active_db_path, self)
+        else:
+            # If the database changed, update it
+            if self.timeline_diary_instance.db_path != self.active_db_path:
+                self.timeline_diary_instance.db_path = self.active_db_path
+                self.timeline_diary_instance.populate_dropdowns()
+                
+        # Show it as a standard non-blocking window!
+        self.timeline_diary_instance.show()
+        self.timeline_diary_instance.raise_()
+        self.timeline_diary_instance.activateWindow()
+
     def generate_thumbnails_current_view(self):
         items = []
         model = self.file_table.model()
@@ -4386,21 +4586,50 @@ class vmanVirtualManager(QMainWindow):
             return
 
         if QMessageBox.question(self, "Physical Deletion", f"WARNING: This will delete {len(items)} items from your REAL hard drive permanently.\n\nAre you sure?", QMessageBox.Yes|QMessageBox.No) != QMessageBox.Yes: return
+        
         deleted = 0
+        
+        # --- NEW: Freeze-Free Progress Dialog ---
+        prog = QProgressDialog(f"Preparing to delete {len(items)} items...", "Cancel", 0, len(items), self)
+        prog.setWindowTitle("Physical Deletion")
+        prog.setWindowModality(Qt.WindowModal)
+        prog.show()
+        
         with sqlite3.connect(self.db.path) as conn:
             cur = conn.cursor()
-            for typ, path, db_id in items:
+            for i, (typ, path, db_id) in enumerate(items):
+                if prog.wasCanceled(): break
                 if db_id == -1: continue
-                rp = cur.execute("SELECT real_path FROM virtual_fs WHERE id=?", (db_id,)).fetchone()
-                if rp and rp[0] and os.path.exists(rp[0]):
-                    try:
-                        shutil.rmtree(rp[0]) if os.path.isdir(rp[0]) else os.remove(rp[0])
-                        deleted += 1
-                    except Exception as e: QMessageBox.warning(self, "Error", f"Failed to delete {rp[0]}: {e}")
+                
+                # Keep UI responsive and show exactly what is being deleted
+                prog.setLabelText(f"Deleting physical data for: {path}")
+                prog.setValue(i)
+                QApplication.processEvents()
+                
+                # Retrieve all real paths for this item (and its children if it's a folder)
+                if typ == "folder":
+                    real_paths = cur.execute("SELECT real_path FROM virtual_fs WHERE (parent_path LIKE ? OR id=?) AND real_path != '' AND real_path IS NOT NULL", (f"{path}%", db_id)).fetchall()
+                else:
+                    real_paths = cur.execute("SELECT real_path FROM virtual_fs WHERE id=? AND real_path != '' AND real_path IS NOT NULL", (db_id,)).fetchall()
+                
+                for (rpath,) in real_paths:
+                    if os.path.exists(rpath):
+                        try:
+                            shutil.rmtree(rpath) if os.path.isdir(rpath) else os.remove(rpath)
+                            deleted += 1
+                        except Exception as e:
+                            print(f"Failed to delete {rpath}: {e}")
+                            
                 if typ == "file": cur.execute("DELETE FROM virtual_fs WHERE id=?", (db_id,))
                 else: cur.execute("DELETE FROM virtual_fs WHERE parent_path LIKE ? OR id=?", (f"{path}%", db_id))
             conn.commit()
+            
+        # Clean up progress bar
+        prog.setValue(len(items))
+        prog.close()
+        
         self.clear_cache(); self.refresh_all(); self.status.showMessage(f"Physically deleted {deleted} items from disk.")
+        QMessageBox.information(self, "Physical Deletion Complete", f"Successfully deleted {deleted} physical files directly from your Hard Drive / OS.")
 
     def cmd_map_parent_drive(self, item):
         db_id = item[2]
@@ -5153,6 +5382,7 @@ Ctrl+C/V/X    : Copy, Paste, Cut (Fully functional across Main and Isolated data
             conn.commit()
             
         self.clear_cache(); self.refresh_all(); self.sys_log(f"{'Permanently deleted' if is_permanent else 'Trashed'} {len(clean_items)} items.")
+        QMessageBox.information(self, "Deletion Complete", f"Successfully {'permanently deleted' if is_permanent else 'moved to Virtual Trash'} {len(clean_items)} items from the VMan Database.")
 
     def empty_trash(self):
         if QMessageBox.question(self, "Empty Trash", "Are you sure you want to permanently delete ALL items in the Virtual Trash?\n\nThis cannot be undone.", QMessageBox.Yes | QMessageBox.No) == QMessageBox.Yes:
