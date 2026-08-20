@@ -2099,8 +2099,13 @@ class vmanTagLibraryDialog(QDialog):
                 else:
                     ext = os.path.splitext(real_p)[1].lower()
                     playlist = [{'path': real_p, 'name': item.text(), 'ext': ext}]
-                    self.viewer = vmanViewer(playlist, 0, self.main_app if self.main_app else self)
-                    self.viewer.show()    
+                    new_viewer = vmanViewer(playlist, 0, self.main_app if self.main_app else self)
+                    
+                    # Store in the appropriate parent list
+                    parent_ref = self.main_app if self.main_app else self
+                    if not hasattr(parent_ref, 'active_viewers'): parent_ref.active_viewers = []
+                    parent_ref.active_viewers.append(new_viewer)
+                    new_viewer.show() 
             
         elif action == action_open: 
             self.jump_to_virtual_or_real_path(item, force_real=True)
@@ -2843,10 +2848,16 @@ class TimelineDiaryDialog(QDialog):
                     QMessageBox.warning(self, "Viewer", "Physical file not found.")
                 else:
                     playlist = [{'path': res[0], 'name': name, 'ext': res[1].lower() if res[1] else ''}]
-                    self.viewer = vmanViewer(playlist, 0, self.parent())
-                    self.viewer.show()
-                    self.viewer.raise_()
-                    self.viewer.activateWindow()
+                    new_viewer = vmanViewer(playlist, 0, self.parent())
+                    
+                    p = self.parent()
+                    if p:
+                        if not hasattr(p, 'active_viewers'): p.active_viewers = []
+                        p.active_viewers.append(new_viewer)
+                        
+                    new_viewer.show()
+                    new_viewer.raise_()
+                    new_viewer.activateWindow()
         elif action == act_loc: self.parent().open_file_location(db_id)
         elif action == act_copy_p: QApplication.clipboard().setText(full_v_path)
         elif action == act_props: self.parent().show_properties(typ, full_v_path, db_id)
@@ -4488,6 +4499,11 @@ class vmanViewer(QDialog):
             self.sc_mute.deleteLater()
             del self.sc_mute
             
+        # Clean up reference from parent's list to free RAM
+        parent_win = self.parent()
+        if parent_win and hasattr(parent_win, 'active_viewers') and self in parent_win.active_viewers:
+            parent_win.active_viewers.remove(self)
+            
         super().closeEvent(ev)
 
 class ThumbnailGeneratorThread(QThread):
@@ -4534,6 +4550,7 @@ class vmanVirtualManager(QMainWindow):
         self.render_queue = []
         self.table_rows_buffer = []
         self.view_cache = {} 
+        self.active_viewers = []  # Stores multiple open viewer windows
         
         self.render_timer = QTimer(self)
         self.render_timer.timeout.connect(self._render_chunk)
@@ -4728,7 +4745,7 @@ class vmanVirtualManager(QMainWindow):
         self.search_box.setMaximumWidth(300)
         self.search_box.returnPressed.connect(self.run_global_search)
         
-        self.btn_type_address = QPushButton("📍 Type Path")
+        self.btn_type_address = QPushButton("📍")
         self.btn_type_address.clicked.connect(self.prompt_type_address)
         nav_row.addWidget(self.btn_type_address)
         
@@ -5485,13 +5502,11 @@ Ctrl+C/V/X    : Copy, Paste, Cut (Fully functional across Main and Isolated data
                 playlist.append({'path': data[1], 'name': name.split('\n')[0], 'ext': os.path.splitext(data[1])[1].lower()})
                 if data[2] == target_db_id: start_index = len(playlist) - 1
 
-        # CLEANUP OLD VIEWER TO PREVENT BACKGROUND CONFLICTS
-        if hasattr(self, 'viewer') and self.viewer is not None:
-            self.viewer.close()
-            self.viewer.deleteLater()
-            self.viewer = None
-
-        self.viewer = vmanViewer(playlist, start_index, self); self.viewer.show()
+        # Launch a new viewer and store it in the active list to allow multiple windows
+        new_viewer = vmanViewer(playlist, start_index, self)
+        if not hasattr(self, 'active_viewers'): self.active_viewers = []
+        self.active_viewers.append(new_viewer)
+        new_viewer.show()
 
     def open_local_file_system(self, db_id):
         row = self.db.conn.cursor().execute("SELECT real_path FROM virtual_fs WHERE id = ?", (db_id,)).fetchone()
