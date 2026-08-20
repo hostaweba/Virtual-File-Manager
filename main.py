@@ -991,57 +991,253 @@ class InternalTreeWidget(QTreeWidget):
 class DriveComparatorDialog(QDialog):
     def __init__(self, main_db, target_db=None, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Drive Hash Comparator & Bitrot Detector")
-        self.resize(800, 500)
+        self.setWindowTitle("Advanced Drive Comparator & Bitrot Auditing")
+        self.resize(1150, 750)
         self.main_db = main_db
         self.target_db = target_db
+        
+        if parent and hasattr(parent, 'styleSheet'):
+            self.setStyleSheet(parent.styleSheet())
+            
         layout = QVBoxLayout(self)
         
-        if not self.target_db:
-            self.btn_select_db = QPushButton("Select Secondary DB to Compare/Merge")
-            self.btn_select_db.clicked.connect(self.run_comparison)
-            layout.addWidget(self.btn_select_db)
+        # --- 1. Config UI (Top Bar) ---
+        config_grp = QGroupBox("Scan Configuration")
+        config_lay = QGridLayout(config_grp)
         
-        self.log = QTextBrowser()
-        layout.addWidget(self.log)
+        self.lbl_target = QLabel(f"<b>Target DB:</b> {Path(target_db).name if target_db else 'None Selected'}")
+        btn_select = QPushButton("📂 Select Target DB")
+        btn_select.clicked.connect(self.select_target)
         
-        # Auto-run if triggered from Context Menu
+        self.combo_match = QComboBox()
+        self.combo_match.addItems(["Match Engine: Real OS Path", "Match Engine: Virtual VMan Path"])
+        
+        self.chk_bitrot = QCheckBox("Detect Bitrot (Hash Mismatch)")
+        self.chk_bitrot.setChecked(True)
+        self.chk_missing = QCheckBox("Detect Missing (In Target, Not in Main)")
+        self.chk_missing.setChecked(True)
+        self.chk_moved = QCheckBox("Detect Moved/Renamed (Same Hash, Diff Path)")
+        self.chk_moved.setChecked(False) # Off by default as it can be heavy
+        
+        btn_scan = QPushButton("🔍 Run Advanced Scan")
+        btn_scan.setStyleSheet("background-color: #1f6feb; color: white; font-weight: bold; padding: 6px;")
+        btn_scan.clicked.connect(self.run_scan)
+        
+        config_lay.addWidget(self.lbl_target, 0, 0, 1, 2)
+        config_lay.addWidget(btn_select, 0, 2)
+        config_lay.addWidget(self.combo_match, 1, 0)
+        config_lay.addWidget(self.chk_bitrot, 1, 1)
+        config_lay.addWidget(self.chk_missing, 1, 2)
+        config_lay.addWidget(self.chk_moved, 1, 3)
+        config_lay.addWidget(btn_scan, 0, 3, 1, 1)
+        layout.addWidget(config_grp)
+        
+        # --- 2. Interactive Data Table ---
+        self.table = QTableWidget(0, 7)
+        self.table.setHorizontalHeaderLabels(["Select", "Detection Type", "File Name", "Main DB Info", "Target DB Info", "Main ID", "Target ID"])
+        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.setColumnWidth(0, 50)
+        self.table.setColumnWidth(1, 150)
+        self.table.setColumnWidth(2, 200)
+        self.table.setColumnWidth(3, 300)
+        self.table.setColumnWidth(4, 300)
+        self.table.setColumnHidden(5, True) # Hide IDs but keep them for logic
+        self.table.setColumnHidden(6, True)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        layout.addWidget(self.table)
+        
+        # --- 3. Action Tools ---
+        action_lay = QHBoxLayout()
+        btn_sel_all = QPushButton("☑ Toggle All")
+        btn_sel_all.clicked.connect(self.toggle_all)
+        
+        self.btn_export = QPushButton("📤 Export CSV Report")
+        self.btn_export.clicked.connect(self.export_report)
+        
+        self.combo_resolve = QComboBox()
+        self.combo_resolve.addItems([
+            "Action: Overwrite Main Hash with Target Hash",
+            "Action: Overwrite Target Hash with Main Hash"
+        ])
+        
+        self.btn_resolve = QPushButton("⚡ Resolve Selected Issues")
+        self.btn_resolve.setStyleSheet("background-color: #2ea043; color: white; font-weight: bold; padding: 6px 15px;")
+        self.btn_resolve.clicked.connect(self.resolve_selected)
+        
+        action_lay.addWidget(btn_sel_all)
+        action_lay.addWidget(self.btn_export)
+        action_lay.addStretch()
+        action_lay.addWidget(self.combo_resolve)
+        action_lay.addWidget(self.btn_resolve)
+        layout.addLayout(action_lay)
+        
         if self.target_db:
-            QTimer.singleShot(100, self.run_comparison)
-            
-    def run_comparison(self):
+            QTimer.singleShot(100, self.run_scan)
+
+    def select_target(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Select Secondary Database", "", "Database (*.db)")
+        if path:
+            self.target_db = path
+            self.lbl_target.setText(f"<b>Target DB:</b> {Path(path).name}")
+
+    def add_row(self, type_str, name, m_info, t_info, m_id, t_id):
+        row = self.table.rowCount()
+        self.table.insertRow(row)
+        chk = QTableWidgetItem()
+        chk.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
+        chk.setCheckState(Qt.Unchecked)
+        self.table.setItem(row, 0, chk)
+        self.table.setItem(row, 1, QTableWidgetItem(type_str))
+        self.table.setItem(row, 2, QTableWidgetItem(name))
+        self.table.setItem(row, 3, QTableWidgetItem(m_info))
+        self.table.setItem(row, 4, QTableWidgetItem(t_info))
+        self.table.setItem(row, 5, QTableWidgetItem(str(m_id)))
+        self.table.setItem(row, 6, QTableWidgetItem(str(t_id)))
+
+    def toggle_all(self):
+        state = Qt.Checked if getattr(self, 'all_checked', False) else Qt.Unchecked
+        self.all_checked = not getattr(self, 'all_checked', False)
+        for r in range(self.table.rowCount()):
+            if self.table.item(r, 0): self.table.item(r, 0).setCheckState(state)
+
+    def run_scan(self):
         if not self.target_db:
-            self.target_db, _ = QFileDialog.getOpenFileName(self, "Select Second DB", "", "Database (*.db)")
-        if not self.target_db: return
+            return QMessageBox.warning(self, "Missing Target", "Please select a Target Database first.")
+            
+        self.table.setRowCount(0)
+        match_virtual = (self.combo_match.currentIndex() == 1)
         
-        self.log.append(f"Analyzing {Path(self.main_db).name} vs {Path(self.target_db).name}...")
-        QApplication.processEvents()
+        prog = QProgressDialog("Cross-referencing databases...", "Cancel", 0, 0, self)
+        prog.setWindowModality(Qt.WindowModal)
+        prog.setMinimumDuration(0)   # <--- Forces instant display
+        prog.setValue(0)             # <--- Sets initial state
+        prog.show()
+        QApplication.processEvents() # <--- Forces the OS to paint the UI immediately
         
         try:
             with sqlite3.connect(self.main_db) as conn:
                 cur = conn.cursor()
                 cur.execute(f"ATTACH DATABASE '{self.target_db}' AS target")
                 
-                # Find Bitrot (Same Path, Different Hash)
-                cur.execute("SELECT main.virtual_fs.name, main.virtual_fs.real_path, main.virtual_fs.sha256, target.virtual_fs.sha256 FROM main.virtual_fs JOIN target.virtual_fs ON main.virtual_fs.real_path = target.virtual_fs.real_path WHERE main.virtual_fs.sha256 != target.virtual_fs.sha256 AND main.virtual_fs.sha256 != '' AND target.virtual_fs.sha256 != '' AND main.virtual_fs.is_folder=0")
-                bitrot = cur.fetchall()
+                join_cond = "m.parent_path = t.parent_path AND m.name = t.name" if match_virtual else "m.real_path = t.real_path"
                 
-                if bitrot:
-                    self.log.append(f"<h3 style='color:red;'>⚠️ BITROT / MODIFICATION DETECTED: {len(bitrot)} files</h3>")
-                    for name, rp, h1, h2 in bitrot:
-                        self.log.append(f"<b>{name}</b><br>Path: {rp}<br>DB 1 Hash: {h1}<br>DB 2 Hash: {h2}<br>")
-                else:
-                    self.log.append("<h3 style='color:green;'>✅ No Bitrot detected between shared files.</h3>")
-                
-                # Combine / Merge missing files
-                if QMessageBox.question(self, "Merge", "Merge unique files from target DB into the Main DB?", QMessageBox.Yes|QMessageBox.No) == QMessageBox.Yes:
-                    cur.execute("INSERT INTO main.virtual_fs (parent_path, name, is_folder, real_path, size, extension, modified, sha256) SELECT parent_path, name, is_folder, real_path, size, extension, modified, sha256 FROM target.virtual_fs WHERE target.virtual_fs.sha256 NOT IN (SELECT sha256 FROM main.virtual_fs WHERE sha256 != '')")
-                    conn.commit()
-                    self.log.append("<b>Merge complete!</b> Unique items from target DB transferred.")
-                    
+                # 1. Detect Bitrot (Hash Mismatch)
+                if self.chk_bitrot.isChecked():
+                    cur.execute(f"""
+                        SELECT m.id, t.id, m.name, m.sha256, t.sha256, m.real_path
+                        FROM main.virtual_fs m JOIN target.virtual_fs t ON {join_cond}
+                        WHERE m.sha256 != t.sha256 AND m.sha256 != '' AND t.sha256 != '' AND m.is_folder=0
+                    """)
+                    for mid, tid, name, m_hash, t_hash, rp in cur.fetchall():
+                        self.add_row("⚠️ Bitrot Conflict", name, f"Hash: {m_hash}", f"Hash: {t_hash}", mid, tid)
+                        
+                # 2. Detect Missing Files
+                if self.chk_missing.isChecked():
+                    where_missing = "t.parent_path || t.name NOT IN (SELECT parent_path || name FROM main.virtual_fs)" if match_virtual else "t.real_path NOT IN (SELECT real_path FROM main.virtual_fs WHERE real_path != '') AND t.real_path != ''"
+                    cur.execute(f"SELECT t.id, t.name, t.real_path, t.size FROM target.virtual_fs t WHERE {where_missing} AND t.is_folder=0")
+                    for tid, name, rp, size in cur.fetchall():
+                        self.add_row("➕ Missing in Main", name, "File Not Found", f"Size: {human_size(size)} | Target OS: {rp}", -1, tid)
+
+                # 3. Detect Moved / Renamed Files
+                if self.chk_moved.isChecked():
+                    field = "parent_path || name" if match_virtual else "real_path"
+                    cur.execute(f"""
+                        SELECT m.id, t.id, m.name, m.{field.split('||')[0].strip()}, t.{field.split('||')[0].strip()}
+                        FROM main.virtual_fs m JOIN target.virtual_fs t ON m.sha256 = t.sha256
+                        WHERE m.sha256 != '' AND m.{field} != t.{field} AND m.is_folder=0
+                    """)
+                    for mid, tid, name, m_path, t_path in cur.fetchall():
+                        self.add_row("🔄 Moved/Renamed", name, f"Main: {m_path}", f"Target: {t_path}", mid, tid)
+
                 cur.execute("DETACH DATABASE target")
+            prog.close()
+            QMessageBox.information(self, "Scan Complete", f"Deep scan finished. Found {self.table.rowCount()} actionable anomalies.")
         except Exception as e:
-            self.log.append(f"Error: {e}")
+            prog.close()
+            QMessageBox.critical(self, "Scan Error", str(e))
+
+    def resolve_selected(self):
+        selected = [r for r in range(self.table.rowCount()) if self.table.item(r, 0).checkState() == Qt.Checked]
+        if not selected: return QMessageBox.information(self, "No Selection", "Please check the items you want to resolve.")
+        
+        if QMessageBox.question(self, "Resolve", f"Apply resolutions to {len(selected)} selected items?", QMessageBox.Yes|QMessageBox.No) != QMessageBox.Yes: return
+
+        bitrot_strat = self.combo_resolve.currentIndex() # 0 = Overwrite Main, 1 = Overwrite Target
+        
+        prog = QProgressDialog(f"Resolving {len(selected)} items...", "Cancel", 0, len(selected), self)
+        prog.setWindowModality(Qt.WindowModal)
+        prog.setMinimumDuration(0)
+        prog.setValue(0)
+        prog.show()
+        QApplication.processEvents()
+
+        try:
+            with sqlite3.connect(self.main_db) as conn_m:
+                cur_m = conn_m.cursor()
+                cur_m.execute(f"ATTACH DATABASE '{self.target_db}' AS target")
+                
+                for i, r in enumerate(selected):
+                    if prog.wasCanceled(): break
+                    
+                    # ... [existing resolution logic remains exactly the same] ...
+
+                    prog.setValue(i+1)
+                    if i % 10 == 0: QApplication.processEvents() # <--- Keeps UI responsive
+                    issue_type = self.table.item(r, 1).text()
+                    m_id = int(self.table.item(r, 5).text())
+                    t_id = int(self.table.item(r, 6).text())
+                    
+                    if "Missing" in issue_type:
+                        # Copy the entire row from Target to Main
+                        cur_m.execute("""
+                            INSERT INTO main.virtual_fs (parent_path, name, is_folder, real_path, size, extension, modified, sha256, custom_tags, color_tag, secondary_name, hash_verified, creation_date)
+                            SELECT parent_path, name, is_folder, real_path, size, extension, modified, sha256, custom_tags, color_tag, secondary_name, hash_verified, creation_date
+                            FROM target.virtual_fs WHERE id=?
+                        """, (t_id,))
+                        
+                    elif "Bitrot" in issue_type:
+                        if bitrot_strat == 0: # Overwrite Main
+                            cur_m.execute("UPDATE main.virtual_fs SET sha256 = (SELECT sha256 FROM target.virtual_fs WHERE id=?) WHERE id=?", (t_id, m_id))
+                        else: # Overwrite Target
+                            cur_m.execute("UPDATE target.virtual_fs SET sha256 = (SELECT sha256 FROM main.virtual_fs WHERE id=?) WHERE id=?", (m_id, t_id))
+                            
+                    elif "Moved" in issue_type:
+                        # Auto-sync Main DB's path to match Target DB's path
+                        cur_m.execute("UPDATE main.virtual_fs SET real_path = (SELECT real_path FROM target.virtual_fs WHERE id=?), parent_path = (SELECT parent_path FROM target.virtual_fs WHERE id=?), name = (SELECT name FROM target.virtual_fs WHERE id=?) WHERE id=?", (t_id, t_id, t_id, m_id))
+
+                    prog.setValue(i+1)
+                    if i % 10 == 0: QApplication.processEvents() # <--- Keeps UI responsive
+                    
+                cur_m.execute("DETACH DATABASE target")
+                conn_m.commit()
+                
+            prog.close()
+            QMessageBox.information(self, "Success", f"Successfully resolved {len(selected)} anomalies.")
+            
+            # Auto-Refresh Main UI & Table
+            if self.parent():
+                self.parent().clear_cache()
+                self.parent().refresh_all()
+            self.run_scan()
+                
+        except Exception as e:
+            prog.close()
+            QMessageBox.critical(self, "Resolve Error", str(e))
+
+    def export_report(self):
+        if self.table.rowCount() == 0: return
+        path, _ = QFileDialog.getSaveFileName(self, "Export Audit Report", "", "CSV Files (*.csv)")
+        if not path: return
+        try:
+            import csv
+            with open(path, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                writer.writerow(["Issue Type", "File Name", "Main DB Details", "Target DB Details"])
+                for r in range(self.table.rowCount()):
+                    writer.writerow([self.table.item(r, 1).text(), self.table.item(r, 2).text(), self.table.item(r, 3).text(), self.table.item(r, 4).text()])
+            QMessageBox.information(self, "Exported", "Audit report saved successfully.")
+        except Exception as e:
+            QMessageBox.warning(self, "Export Error", str(e))
 
 
 class DuplicateProofDialog(QDialog):
@@ -3323,11 +3519,12 @@ class SpaceAnalyzerDialog(QDialog):
         
         self.prog_dlg = QProgressDialog(f"Scanning directories...", "Cancel", 0, 100, self)
         self.prog_dlg.setWindowModality(Qt.WindowModal)
-        self.scanner.progress.connect(lambda v, t, txt: (self.prog_dlg.setValue(v), self.prog_dlg.setLabelText(txt)))
-        self.prog_dlg.canceled.connect(self.scanner.cancel)
-        self.scanner.finished_scan.connect(self.on_scan_finished)
-        self.scanner.start()
+        self.prog_dlg.setMinimumDuration(0)
+        self.prog_dlg.setValue(0)
         self.prog_dlg.show()
+        QApplication.processEvents()
+        
+        self.scanner.progress.connect(lambda v, t, txt: (self.prog_dlg.setValue(v), self.prog_dlg.setLabelText(txt)))
 
     def on_scan_finished(self):
         self.prog_dlg.close()
@@ -3695,7 +3892,11 @@ class BulkOperationEngine(QDialog):
             return
             
         prog = QProgressDialog(f"Applying {action_type}...", "Cancel", 0, len(self.matched_ids), self)
-        prog.setWindowModality(Qt.WindowModal); prog.show()
+        prog.setWindowModality(Qt.WindowModal)
+        prog.setMinimumDuration(0)
+        prog.setValue(0)
+        prog.show()
+        QApplication.processEvents()
         
         success_count = 0
         with sqlite3.connect(self.db_path) as conn:
@@ -3720,6 +3921,7 @@ class BulkOperationEngine(QDialog):
                 
                 success_count += 1
                 prog.setValue(i+1)
+                if i % 25 == 0: QApplication.processEvents() # <--- Keeps UI responsive
             conn.commit()
             
         self.btn_exec.setEnabled(False)
@@ -5307,7 +5509,11 @@ Ctrl+C/V/X    : Copy, Paste, Cut (Fully functional across Main and Isolated data
         
         if total > CHUNK_SIZE:
             self.render_progress = QProgressDialog(f"{'Loading from RAM Cache' if cached else 'Rendering'} {total} items...", "Cancel", 0, total, self)
-            self.render_progress.setWindowModality(Qt.WindowModal); self.render_progress.show()
+            self.render_progress.setWindowModality(Qt.WindowModal)
+            self.render_progress.setMinimumDuration(0)
+            self.render_progress.setValue(0)
+            self.render_progress.show()
+            QApplication.processEvents()
         else: self.render_progress = None
 
         self.file_table.setUpdatesEnabled(False); self.file_grid.setUpdatesEnabled(False)
@@ -5816,7 +6022,13 @@ Ctrl+C/V/X    : Copy, Paste, Cut (Fully functional across Main and Isolated data
         
         with sqlite3.connect(self.db.path) as conn:
             cur = conn.cursor()
-            prog = QProgressDialog(f"Deleting {len(clean_items)} items...", "Cancel", 0, len(clean_items), self); prog.setWindowModality(Qt.WindowModal); prog.show()
+            prog = QProgressDialog(f"Deleting {len(clean_items)} items...", "Cancel", 0, len(clean_items), self)
+            prog.setWindowModality(Qt.WindowModal)
+            prog.setMinimumDuration(0)
+            prog.setValue(0)
+            prog.show()
+            QApplication.processEvents()
+            
             for i, (typ, path, db_id) in enumerate(clean_items):
                 if prog.wasCanceled(): break
                 if is_permanent:
@@ -5826,6 +6038,7 @@ Ctrl+C/V/X    : Copy, Paste, Cut (Fully functional across Main and Isolated data
                     if typ == "file": cur.execute("UPDATE virtual_fs SET in_trash = 1 WHERE id = ?", (db_id,))
                     else: cur.execute("UPDATE virtual_fs SET in_trash = 1 WHERE parent_path LIKE ? OR id = ?", (f"{path}%", db_id))
                 prog.setValue(i+1)
+                if i % 25 == 0: QApplication.processEvents() # <--- Keeps UI responsive
             conn.commit()
             
         self.clear_cache(); self.refresh_all(); self.sys_log(f"{'Permanently deleted' if is_permanent else 'Trashed'} {len(clean_items)} items.")
@@ -5988,16 +6201,16 @@ Ctrl+C/V/X    : Copy, Paste, Cut (Fully functional across Main and Isolated data
 
     def on_files_dropped(self, paths):
         if self._is_smart_path(self.current_prefix) or self.current_prefix.startswith("trash://"): return QMessageBox.warning(self, "Error", "Cannot import directly into Smart Views.")
-        self.import_dlg = QProgressDialog("Importing files into Virtual Sandbox...", "Cancel", 0, 100, self); self.import_dlg.setWindowModality(Qt.WindowModal); self.import_dlg.show()
+        
+        self.import_dlg = QProgressDialog("Importing files into Virtual Sandbox...", "Cancel", 0, 100, self)
+        self.import_dlg.setWindowModality(Qt.WindowModal)
+        self.import_dlg.setMinimumDuration(0)
+        self.import_dlg.setValue(0)
+        self.import_dlg.show()
+        QApplication.processEvents()
+        
         self.import_thread = ImportFilesThread(str(self.db.path), self.current_prefix, paths, self)
-        self.import_thread.progress.connect(lambda c,t,m: (self.import_dlg.setMaximum(t), self.import_dlg.setValue(c), self.import_dlg.setLabelText(m)))
-        self.import_dlg.canceled.connect(self.import_thread.cancel)
-        def on_import_finished(f_cnt, d_cnt):
-            self.import_dlg.close(); self.clear_cache(); self.refresh_all(); self.status.showMessage(f"Imported {f_cnt} files and {d_cnt} folders.", 5000); self.sys_log(f"Successfully Sandbox Imported {f_cnt} files.")
-        self.import_thread.finished_import.connect(on_import_finished)
-        self.import_thread.error.connect(lambda e: (self.import_dlg.close(), QMessageBox.critical(self, "Import Error", e)))
-        self._register_worker(self.import_thread); self.import_thread.start()
-
+        
     def compile_current_view(self):
         name, ok = QInputDialog.getText(self, "Compile DB View", "Enter name for new separate database (e.g., 'Project_Backup'):")
         if not ok or not name.strip(): return
