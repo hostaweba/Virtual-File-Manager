@@ -54,6 +54,9 @@ except Exception: MATPLOTLIB_AVAILABLE = False
 from datetime import timedelta 
 import re
 
+def natural_sort_key(s):
+    return [int(text) if text.isdigit() else text.lower() for text in re.split('([0-9]+)', str(s))]
+
 import matplotlib
 matplotlib.use('QtAgg')
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
@@ -92,9 +95,10 @@ SMART_PROTOCOLS = {
 
 THEMES = {
     "Dark": """
-        QMainWindow, QDialog, QDockWidget { background-color: #0d1117; color: #c9d1d9; font-family: 'Segoe UI'; font-size: 13px; }
+        QMainWindow, QDialog, QDockWidget, QGroupBox { background-color: #0d1117; color: #c9d1d9; font-family: 'Segoe UI'; font-size: 13px; }
         QWidget { color: #c9d1d9; }
-        QDockWidget::title { background: #161b22; padding: 8px; border-top-left-radius: 8px; border-top-right-radius: 8px; font-weight: bold; }
+        QMenu { background-color: #161b22; color: #c9d1d9; border: 1px solid #30363d; }
+        QMenu::item:selected { background-color: #1f6feb; color: white; }
         QLineEdit, QComboBox, QSpinBox { background-color: #0d1117; border: 1px solid #30363d; border-radius: 6px; padding: 6px 10px; color: #58a6ff; }
         QPushButton { background-color: #21262d; border: 1px solid #30363d; border-radius: 6px; padding: 6px 12px; font-weight: bold; color: #c9d1d9; }
         QPushButton:hover { background-color: #30363d; border: 1px solid #8b949e; }
@@ -110,9 +114,10 @@ THEMES = {
         QTableView::indicator:checked { background-color: #58a6ff; }
     """,
     "Light": """
-        QMainWindow, QDialog, QDockWidget { background-color: #f6f8fa; color: #24292f; font-family: 'Segoe UI'; font-size: 13px; }
+        QMainWindow, QDialog, QDockWidget, QGroupBox { background-color: #f6f8fa; color: #24292f; font-family: 'Segoe UI'; font-size: 13px; }
         QWidget { color: #24292f; }
-        QDockWidget::title { background: #e1e4e8; padding: 8px; border-top-left-radius: 8px; border-top-right-radius: 8px; font-weight: bold; color: #24292f; }
+        QMenu { background-color: #ffffff; color: #24292f; border: 1px solid #d0d7de; }
+        QMenu::item:selected { background-color: #0969da; color: white; }
         QLineEdit, QComboBox, QSpinBox { background-color: #ffffff; border: 1px solid #d0d7de; border-radius: 6px; padding: 6px 10px; color: #0969da; }
         QPushButton { background-color: #f3f4f6; border: 1px solid #d0d7de; border-radius: 6px; padding: 6px 12px; font-weight: bold; color: #24292f; }
         QPushButton:hover { background-color: #ebecf0; border: 1px solid #8c959f; }
@@ -882,7 +887,8 @@ class ScaledImageLabel(QLabel):
         super().__init__()
         self.setMinimumHeight(200)
         self.setAlignment(Qt.AlignCenter)
-        self.setStyleSheet("background-color: transparent; border: 1px solid #30363d; border-radius: 8px; padding: 5px;")
+        self.setStyleSheet("background: #161b22; border-radius: 8px; color: #8b949e;")
+        self.setText("Waiting for drive...") # Visual feedback
         self._pixmap = None
         self.eff = QGraphicsOpacityEffect(self)
         self.setGraphicsEffect(self.eff)
@@ -982,6 +988,62 @@ class InternalTreeWidget(QTreeWidget):
             event.acceptProposedAction()
 
 # ---------------- Dialogs ----------------
+class DriveComparatorDialog(QDialog):
+    def __init__(self, main_db, target_db=None, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Drive Hash Comparator & Bitrot Detector")
+        self.resize(800, 500)
+        self.main_db = main_db
+        self.target_db = target_db
+        layout = QVBoxLayout(self)
+        
+        if not self.target_db:
+            self.btn_select_db = QPushButton("Select Secondary DB to Compare/Merge")
+            self.btn_select_db.clicked.connect(self.run_comparison)
+            layout.addWidget(self.btn_select_db)
+        
+        self.log = QTextBrowser()
+        layout.addWidget(self.log)
+        
+        # Auto-run if triggered from Context Menu
+        if self.target_db:
+            QTimer.singleShot(100, self.run_comparison)
+            
+    def run_comparison(self):
+        if not self.target_db:
+            self.target_db, _ = QFileDialog.getOpenFileName(self, "Select Second DB", "", "Database (*.db)")
+        if not self.target_db: return
+        
+        self.log.append(f"Analyzing {Path(self.main_db).name} vs {Path(self.target_db).name}...")
+        QApplication.processEvents()
+        
+        try:
+            with sqlite3.connect(self.main_db) as conn:
+                cur = conn.cursor()
+                cur.execute(f"ATTACH DATABASE '{self.target_db}' AS target")
+                
+                # Find Bitrot (Same Path, Different Hash)
+                cur.execute("SELECT main.virtual_fs.name, main.virtual_fs.real_path, main.virtual_fs.sha256, target.virtual_fs.sha256 FROM main.virtual_fs JOIN target.virtual_fs ON main.virtual_fs.real_path = target.virtual_fs.real_path WHERE main.virtual_fs.sha256 != target.virtual_fs.sha256 AND main.virtual_fs.sha256 != '' AND target.virtual_fs.sha256 != '' AND main.virtual_fs.is_folder=0")
+                bitrot = cur.fetchall()
+                
+                if bitrot:
+                    self.log.append(f"<h3 style='color:red;'>⚠️ BITROT / MODIFICATION DETECTED: {len(bitrot)} files</h3>")
+                    for name, rp, h1, h2 in bitrot:
+                        self.log.append(f"<b>{name}</b><br>Path: {rp}<br>DB 1 Hash: {h1}<br>DB 2 Hash: {h2}<br>")
+                else:
+                    self.log.append("<h3 style='color:green;'>✅ No Bitrot detected between shared files.</h3>")
+                
+                # Combine / Merge missing files
+                if QMessageBox.question(self, "Merge", "Merge unique files from target DB into the Main DB?", QMessageBox.Yes|QMessageBox.No) == QMessageBox.Yes:
+                    cur.execute("INSERT INTO main.virtual_fs (parent_path, name, is_folder, real_path, size, extension, modified, sha256) SELECT parent_path, name, is_folder, real_path, size, extension, modified, sha256 FROM target.virtual_fs WHERE target.virtual_fs.sha256 NOT IN (SELECT sha256 FROM main.virtual_fs WHERE sha256 != '')")
+                    conn.commit()
+                    self.log.append("<b>Merge complete!</b> Unique items from target DB transferred.")
+                    
+                cur.execute("DETACH DATABASE target")
+        except Exception as e:
+            self.log.append(f"Error: {e}")
+
+
 class DuplicateProofDialog(QDialog):
     def __init__(self, db_path, query, params, match_type, main_app, parent=None):
         super().__init__(parent)
@@ -1213,6 +1275,16 @@ class TagListWidget(QListWidget):
         else:
             super().keyPressEvent(event)
 
+    def contextMenuEvent(self, event):
+        item = self.itemAt(event.pos())
+        if not item: return
+        menu = QMenu(self)
+        act_edit = menu.addAction("✏️ Edit Tag Globally")
+        act_del = menu.addAction("🗑️ Delete Tag Globally")
+        action = menu.exec(self.mapToGlobal(event.pos()))
+        if action == act_edit: self.parent_dialog.edit_global_tag(item.text())
+        elif action == act_del: self.parent_dialog.delete_global_tag(item.text())
+
 class ColumnListWidget(QListWidget):
     def __init__(self, level_index, parent_dialog):
         super().__init__()
@@ -1343,6 +1415,34 @@ class vmanTagLibraryDialog(QDialog):
         self._populate_base_contexts()
         self.refresh_memory_cache()
         self._setup_shortcuts()
+
+    def edit_global_tag(self, old_tag):
+        new_tag, ok = QInputDialog.getText(self, "Edit Tag", f"Rename '{old_tag}' to:")
+        if not ok or not new_tag.strip() or new_tag.strip() == old_tag: return
+        new_tag = new_tag.strip()
+        with sqlite3.connect(self.db_path) as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT id, custom_tags FROM virtual_fs WHERE custom_tags LIKE ?", (f"%{old_tag}%",))
+            for db_id, tags in cur.fetchall():
+                tag_list = [t.strip() for t in tags.split(',')]
+                if old_tag in tag_list:
+                    tag_list = [new_tag if t == old_tag else t for t in tag_list]
+                    cur.execute("UPDATE virtual_fs SET custom_tags=? WHERE id=?", (", ".join(tag_list), db_id))
+            conn.commit()
+        self.refresh_memory_cache()
+
+    def delete_global_tag(self, target_tag):
+        if QMessageBox.question(self, "Delete Tag", f"Remove '{target_tag}' from ALL files?", QMessageBox.Yes|QMessageBox.No) != QMessageBox.Yes: return
+        with sqlite3.connect(self.db_path) as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT id, custom_tags FROM virtual_fs WHERE custom_tags LIKE ?", (f"%{target_tag}%",))
+            for db_id, tags in cur.fetchall():
+                tag_list = [t.strip() for t in tags.split(',')]
+                if target_tag in tag_list:
+                    tag_list.remove(target_tag)
+                    cur.execute("UPDATE virtual_fs SET custom_tags=? WHERE id=?", (", ".join(tag_list), db_id))
+            conn.commit()
+        self.refresh_memory_cache()
 
     def _setup_shortcuts(self):
         QShortcut(QKeySequence("Ctrl+F"), self, self.global_search_box.setFocus)
@@ -2285,13 +2385,19 @@ class TimelineDiaryDialog(QDialog):
         self.date_mode_mod = QRadioButton("Modified")
         self.date_mode_mod.setChecked(True)
         self.date_mode_cre = QRadioButton("Created")
+        self.date_mode_cm = QRadioButton("C+M")
+        self.date_mode_both = QRadioButton("Both")
         
         self.date_mode_mod.toggled.connect(self.on_date_mode_changed)
         self.date_mode_cre.toggled.connect(self.on_date_mode_changed)
+        self.date_mode_cm.toggled.connect(self.on_date_mode_changed)
+        self.date_mode_both.toggled.connect(self.on_date_mode_changed)
         
         rb_lay = QHBoxLayout()
         rb_lay.addWidget(self.date_mode_mod)
         rb_lay.addWidget(self.date_mode_cre)
+        rb_lay.addWidget(self.date_mode_cm)
+        rb_lay.addWidget(self.date_mode_both)
         left_lay.addLayout(rb_lay)
         
 
@@ -2456,9 +2562,18 @@ class TimelineDiaryDialog(QDialog):
 
     def highlight_month(self, year, month):
         self.calendar.setDateTextFormat(QDate(), QTextCharFormat())
-        col = "creation_date" if self.date_mode_cre.isChecked() else "modified"
         with sqlite3.connect(self.db_path) as conn:
-            days = [r[0] for r in conn.cursor().execute(f"SELECT DISTINCT SUBSTR({col}, 9, 2) FROM virtual_fs WHERE is_folder=0 AND in_trash=0 AND {col} LIKE ?", (f"{year}-{month:02d}-%",)).fetchall()]
+            cur = conn.cursor()
+            query_mod = f"SELECT DISTINCT SUBSTR(modified, 9, 2) FROM virtual_fs WHERE is_folder=0 AND in_trash=0 AND modified LIKE '{year}-{month:02d}-%'"
+            query_cre = f"SELECT DISTINCT SUBSTR(creation_date, 9, 2) FROM virtual_fs WHERE is_folder=0 AND in_trash=0 AND creation_date LIKE '{year}-{month:02d}-%'"
+            
+            mod_days = set(r[0] for r in cur.execute(query_mod).fetchall())
+            cre_days = set(r[0] for r in cur.execute(query_cre).fetchall())
+            
+            if self.date_mode_mod.isChecked(): days = mod_days
+            elif self.date_mode_cre.isChecked(): days = cre_days
+            elif self.date_mode_cm.isChecked(): days = mod_days.intersection(cre_days)
+            else: days = mod_days.union(cre_days)
         
         fmt = QTextCharFormat()
         fmt.setBackground(QColor("#2ea043")); fmt.setForeground(QColor("white")); fmt.setFontWeight(QFont.Bold)
@@ -2477,14 +2592,20 @@ class TimelineDiaryDialog(QDialog):
 
     def load_by_date(self, date):
         date_str = date.toString("yyyy-MM-dd")
-        col = "creation_date" if self.date_mode_cre.isChecked() else "modified"
+        col = "creation_date" 
+        if self.date_mode_mod.isChecked() or self.date_mode_cm.isChecked(): col = "modified"
+        elif self.date_mode_cre.isChecked(): col = "creation_date"
+        else: col = "modified" # 'Both' defaults query to modified for standard fetching
         query = f"SELECT id, name, is_folder, extension, size, parent_path, {col}, custom_tags FROM virtual_fs WHERE {col} LIKE ? AND in_trash=0"
         
         self.execute_search(query, (f"{date_str}%",), update_highlights=False)
 
     def load_html_diary(self, date):
         dt_str = date.toString("yyyy-MM-dd")
-        col = "creation_date" if self.date_mode_cre.isChecked() else "modified"
+        col = "creation_date"
+        if self.date_mode_mod.isChecked() or self.date_mode_cm.isChecked(): col = "modified"
+        elif self.date_mode_cre.isChecked(): col = "creation_date"
+        else: col = "modified" # 'Both' defaults query to modified for standard fetching
         with sqlite3.connect(self.db_path) as conn:
             entries = conn.cursor().execute(f"SELECT SUBSTR({col}, 12, 8), name, parent_path, size, category FROM virtual_fs WHERE {col} LIKE ? AND is_folder=0 AND in_trash=0 ORDER BY {col} ASC", (f"{dt_str}%",)).fetchall()
         
@@ -3607,10 +3728,9 @@ class AdvancedImageViewer(QGraphicsView):
         self.scene.clear(); self._pixmap_item = self.scene.addPixmap(pixmap)
         self.setSceneRect(self._pixmap_item.boundingRect()); self.fitInView(self.sceneRect(), Qt.KeepAspectRatio)
     def wheelEvent(self, event):
-        if event.modifiers() == Qt.ControlModifier:
-            if event.angleDelta().y() > 0: self.scale(self.zoom_factor, self.zoom_factor)
-            else: self.scale(1 / self.zoom_factor, 1 / self.zoom_factor)
-        else: super().wheelEvent(event)
+        # Allow scroll zoom without Ctrl key
+        if event.angleDelta().y() > 0: self.scale(self.zoom_factor, self.zoom_factor)
+        else: self.scale(1 / self.zoom_factor, 1 / self.zoom_factor)
         
     def keyPressEvent(self, event):
         # Ignore these keys so the main Viewer dialog catches them for navigation/media controls!
@@ -3695,6 +3815,7 @@ class VerticalStripViewer(QScrollArea):
         self.container = QWidget()
         self.layout = QVBoxLayout(self.container)
         self.layout.setContentsMargins(0, 0, 0, 0)
+        self.layout.setSpacing(20) # Default adjustable spacing
         self.layout.setAlignment(Qt.AlignTop | Qt.AlignHCenter)
         self.setWidget(self.container)
         self.labels = []
@@ -3717,11 +3838,18 @@ class VerticalStripViewer(QScrollArea):
         
     def _render_next_batch(self, count=5):
         end = min(self._render_idx + count, len(self.playlist))
+        
+        # Check current layout spacing to maintain seamless merge on newly loaded images
+        current_spacing = self.layout.spacing()
+        radius = "0px" if current_spacing == 0 else "8px"
+        
         for i in range(self._render_idx, end):
             item = self.playlist[i]
             lbl = LazyImageLabel(item['path'])
+            lbl.setStyleSheet(f"background: #161b22; border-radius: {radius}; color: #8b949e;")
             self.layout.addWidget(lbl)
             self.labels.append(lbl)
+            
         self._render_idx = end
         QTimer.singleShot(50, self.check_visibility)
         
@@ -3758,6 +3886,88 @@ class VerticalStripViewer(QScrollArea):
         else:
             super().keyPressEvent(event)
 
+class AdvancedLoopDialog(QDialog):
+    def __init__(self, current_raw, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Advanced Programmable Loop Engine")
+        self.resize(600, 380)
+        if parent and hasattr(parent, 'styleSheet'):
+            self.setStyleSheet(parent.styleSheet())
+
+        layout = QVBoxLayout(self)
+
+        lbl_info = QLabel("<b>Program your loop using Image Serial Numbers.</b><br>"
+                          "Format: <code>[images][:speed_msXloops][:transform]</code><br><br>"
+                          "<i>Defaults:</i> Speed uses your 'A-B Loop GIF Speed', Repetition is x1.<br>"
+                          "<i>Optional Transforms:</i> hf, vf, c90, c180, c270, cc90, cc270<br>"
+                          "<i>Examples:</i><br>"
+                          "• Minimal: <code>1-2,3,5</code> <i>(Plays once at default speed)</i><br>"
+                          "• Speed only: <code>1-5:200</code><br>"
+                          "• Transform only: <code>1-5:hf</code><br>"
+                          "• Loops only: <code>1-5:x5</code><br>"
+                          "• Full string: <code>1-2:150x3:vf</code>")
+        layout.addWidget(lbl_info)
+
+        self.txt_input = QPlainTextEdit()
+        self.txt_input.setPlainText(current_raw)
+        self.txt_input.setPlaceholderText("Enter your sequence here...")
+        layout.addWidget(self.txt_input)
+
+        btn_lay = QHBoxLayout()
+        self.btn_load = QPushButton("📂 Load")
+        self.btn_save = QPushButton("💾 Save")
+        self.btn_clear = QPushButton("🗑️ Clear Input")
+        
+        self.btn_deactivate = QPushButton("🛑 Deactivate Loop")
+        self.btn_deactivate.setStyleSheet("color: #f85149; font-weight: bold;")
+        
+        self.btn_apply = QPushButton("🚀 Apply & Run")
+        self.btn_apply.setStyleSheet("color: #58a6ff; font-weight: bold;")
+
+        self.btn_load.clicked.connect(self.load_file)
+        self.btn_save.clicked.connect(self.save_file)
+        self.btn_clear.clicked.connect(self.txt_input.clear)
+        self.btn_deactivate.clicked.connect(self.deactivate)
+        self.btn_apply.clicked.connect(self.accept)
+
+        btn_lay.addWidget(self.btn_load)
+        btn_lay.addWidget(self.btn_save)
+        btn_lay.addWidget(self.btn_clear)
+        btn_lay.addStretch()
+        btn_lay.addWidget(self.btn_deactivate)
+        btn_lay.addWidget(self.btn_apply)
+
+        layout.addLayout(btn_lay)
+        self.result_raw = current_raw
+
+    def load_file(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Load Loop Sequence", "", "Loop Files (*.vloop);;Text Files (*.txt);;All Files (*.*)")
+        if path:
+            try:
+                with open(path, 'r', encoding='utf-8') as f:
+                    self.txt_input.setPlainText(f.read().strip())
+            except Exception as e:
+                QMessageBox.warning(self, "Load Error", str(e))
+
+    def save_file(self):
+        path, _ = QFileDialog.getSaveFileName(self, "Save Loop Sequence", "", "Loop Files (*.vloop);;Text Files (*.txt)")
+        if path:
+            try:
+                with open(path, 'w', encoding='utf-8') as f:
+                    f.write(self.txt_input.toPlainText().strip())
+                QMessageBox.information(self, "Saved", "Loop sequence saved successfully.")
+            except Exception as e:
+                QMessageBox.warning(self, "Save Error", str(e))
+
+    def deactivate(self):
+        self.result_raw = ""
+        super().accept()
+
+    def accept(self):
+        self.result_raw = self.txt_input.toPlainText().strip()
+        super().accept()
+
+
 
 class vmanViewer(QDialog):
     def __init__(self, playlist, start_index, parent=None):
@@ -3770,6 +3980,11 @@ class vmanViewer(QDialog):
         self.main_layout = QVBoxLayout(self)
         self.main_layout.setContentsMargins(0, 0, 0, 0)
         self.main_layout.setSpacing(0)
+        
+        self.slide_tick_timer = QTimer(self); self.slide_tick_timer.timeout.connect(self._slide_tick)
+        self.slide_elapsed = 0
+        self.rot_angle = 0; self.flip_h = False
+        self.ab_gif_speed_ms = 150  # Default fast GIF speed (150ms per frame)
         
         # Slideshow Running Line (Native QProgressBar)
         self.slide_progress = QProgressBar()
@@ -3874,7 +4089,135 @@ class vmanViewer(QDialog):
         QShortcut(QKeySequence(Qt.Key_Up), self, self._vol_up)
         QShortcut(QKeySequence(Qt.Key_Down), self, self._vol_down)
 
+        # Floating Nav Buttons (Must be defined AFTER self.stack is created)
+        self.btn_float_prev = QPushButton("◀", self)
+        self.btn_float_next = QPushButton("▶", self)
+        for btn in [self.btn_float_prev, self.btn_float_next]:
+            btn.setFixedSize(40, 40)
+            btn.setStyleSheet("background-color: rgba(22, 27, 34, 0.7); color: white; border-radius: 20px; font-weight: bold;")
+            btn.hide() # Hidden by default, activated via Context Menu
+        self.btn_float_prev.clicked.connect(self._prev_item)
+        self.btn_float_next.clicked.connect(self._next_item)
+        self.stack.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.stack.customContextMenuRequested.connect(self.show_viewer_menu)
+
         self._load_current_item()
+
+    def show_viewer_menu(self, pos):
+        menu = QMenu(self)
+        act_float = menu.addAction("Toggle Floating Nav Buttons")
+        act_prog_line = menu.addAction("Toggle Slideshow Progress Line")
+        
+        # Only show spacing adjustment if we are in Webpage Mode
+        if self.stack.currentIndex() == 3: 
+            act_spacing = menu.addAction("↕️ Adjust Webpage Image Spacing")
+        else:
+            act_spacing = None
+            
+        menu.addSeparator()
+        act_speed = menu.addAction("⏱️ Set A-B Loop GIF Speed...")
+        act_adv_loop = menu.addAction("🚀 Advanced Programmable Loop...")
+        
+        action = menu.exec(self.stack.mapToGlobal(pos))
+        
+        if action == act_float:
+            visible = not self.btn_float_prev.isVisible()
+            self.btn_float_prev.setVisible(visible)
+            self.btn_float_next.setVisible(visible)
+            
+        elif action == act_prog_line:
+            self.show_progress_line = not getattr(self, 'show_progress_line', True)
+            if not self.show_progress_line:
+                self.slide_progress.hide()
+            elif self.btn_slide.isChecked():
+                self.slide_progress.show()
+                
+        elif action == act_spacing and act_spacing is not None:
+            current_spacing = self.vert_view.layout.spacing()
+            val, ok = QInputDialog.getInt(self, "Image Spacing", "Enter distance between images in pixels (0-200):", current_spacing, 0, 200, 5)
+            if ok:
+                self.vert_view.layout.setSpacing(val)
+                # If spacing is 0, completely remove the border radius for a seamless edge-to-edge merge
+                radius = "0px" if val == 0 else "8px"
+                for lbl in self.vert_view.labels:
+                    lbl.setStyleSheet(f"background: #161b22; border-radius: {radius}; color: #8b949e;")
+                
+        elif action == act_speed:
+            val, ok = QInputDialog.getInt(self, "GIF Speed", "Enter A-B Loop speed in milliseconds\n(e.g., 50 for ultra-fast, 200 for normal GIF):", getattr(self, 'ab_gif_speed_ms', 150), 10, 5000, 10)
+            if ok: 
+                self.ab_gif_speed_ms = val
+                
+        elif action == act_adv_loop:
+            dlg = AdvancedLoopDialog(getattr(self, 'adv_loop_raw', ""), self)
+            if dlg.exec():
+                text = dlg.result_raw
+                self.adv_loop_raw = text
+                
+                if not text:
+                    self.adv_loop_sequence = []
+                    QMessageBox.information(self, "Deactivated", "Advanced loop deactivated and cleared.")
+                    return
+
+                try:
+                    seq = []
+                    for block in text.split():
+                        parts = block.split(':')
+                        frames_str = parts[0]
+                        
+                        # --- 1. Set Defaults ---
+                        speed = getattr(self, 'ab_gif_speed_ms', 150)
+                        loops = 1
+                        transform_str = ""
+                        
+                        # --- 2. Smart Parsing of Optional Segments ---
+                        if len(parts) > 1:
+                            p1 = parts[1].lower()
+                            # Check if the second part is a Speed/Loop config (starts with a number or 'x')
+                            if p1 and (p1[0].isdigit() or p1.startswith('x')):
+                                if 'x' in p1:
+                                    s_str, l_str = p1.split('x', 1)
+                                    if s_str: speed = int(s_str)
+                                    if l_str: loops = int(l_str)
+                                else:
+                                    speed = int(p1)
+                                    
+                                # If there's a 3rd part, it must be the transform
+                                if len(parts) > 2:
+                                    transform_str = parts[2].lower()
+                            else:
+                                # Second part was alphabetic, so it's a transform (e.g., "1-5:hf")
+                                transform_str = p1
+
+                        # --- 3. Parse Frames ---
+                        frames = []
+                        for f_part in frames_str.split(','):
+                            if '-' in f_part:
+                                start_f, end_f = map(int, f_part.split('-'))
+                                step = 1 if start_f <= end_f else -1
+                                frames.extend(range(start_f - 1, end_f - 1 + step, step))
+                            else:
+                                frames.append(int(f_part) - 1)
+                        
+                        # --- 4. Build Sequence ---
+                        for _ in range(loops):
+                            for f in frames:
+                                if 0 <= f < len(self.playlist):
+                                    seq.append((f, speed, transform_str))
+                                    
+                    if seq:
+                        self.adv_loop_sequence = seq
+                        self.adv_loop_idx = 0
+                        self.current_index = seq[0][0]
+                        self._load_current_item()
+                        self._apply_adv_transform(seq[0][2])
+                        QMessageBox.information(self, "Programmed", f"Loaded {len(seq)} total frames into memory.\nPress Spacebar or click 'Slideshow' to execute.")
+                except Exception as e:
+                    QMessageBox.warning(self, "Parse Error", f"Failed to parse sequence.\nPlease check your format.\nError: {e}")
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.btn_float_prev.move(20, self.height() // 2 - 20)
+        self.btn_float_next.move(self.width() - 60, self.height() // 2 - 20)
 
     def _toggle_vert_mode(self):
         if self.btn_vert_mode.isChecked():
@@ -3921,7 +4264,8 @@ class vmanViewer(QDialog):
         if not self.playlist: return
         item = self.playlist[self.current_index]
         self.lbl_title.setText(f"{item['name']} ({self.current_index + 1}/{len(self.playlist)})")
-        if hasattr(self, 'player'): self.player.stop(); self.loop_a = -1; self.loop_b = -1; self.btn_ab.setText("A-B Loop")
+        
+        if hasattr(self, 'player'): self.player.stop()
         
         self.btn_flip.hide(); self.btn_rot.hide(); self.btn_slide.hide(); self.wave_vis.hide(); self.btn_ab.hide()
         self.btn_vert_mode.hide(); self.cb_speed.hide()
@@ -3931,6 +4275,7 @@ class vmanViewer(QDialog):
         
         if item['ext'] in ['.png', '.jpg', '.jpeg', '.bmp', '.gif', '.webp']: 
             self.btn_vert_mode.show(); self.cb_speed.show(); self.btn_slide.show()
+            self.btn_ab.show() # <-- Added to allow image looping
             if self.btn_vert_mode.isChecked():
                 self.stack.setCurrentIndex(3)
                 self.vert_view.scroll_to_index(self.current_index)
@@ -3989,18 +4334,32 @@ class vmanViewer(QDialog):
         self.lbl_title.setVisible(is_visible)
 
     def _check_loop(self, pos):
-        if self.loop_b > 0 and pos >= self.loop_b: self.player.setPosition(max(0, self.loop_a))
+        if getattr(self, 'loop_is_media', False) and getattr(self, 'loop_b', -1) > 0 and pos >= self.loop_b:
+            self.player.setPosition(max(0, getattr(self, 'loop_a', 0)))
 
     def _set_ab_loop(self):
-        if self.loop_a == -1: self.loop_a = self.player.position(); self.btn_ab.setText("Set B")
-        elif self.loop_b == -1: self.loop_b = self.player.position(); self.btn_ab.setText("Clear A-B")
-        else: self.loop_a = -1; self.loop_b = -1; self.btn_ab.setText("A-B Loop")
+        is_media = (self.stack.currentIndex() == 2 and HAS_MULTIMEDIA)
+        current_pos = self.player.position() if is_media else self.current_index
+        
+        if getattr(self, 'loop_a', -1) == -1: 
+            self.loop_a = current_pos
+            self.loop_is_media = is_media
+            self.btn_ab.setText("Set B")
+        elif getattr(self, 'loop_b', -1) == -1: 
+            self.loop_b = current_pos
+            self.btn_ab.setText("Clear A-B")
+        else: 
+            self.loop_a = -1
+            self.loop_b = -1
+            self.btn_ab.setText("A-B Loop")
 
     def _toggle_slide(self):
         if self.btn_slide.isChecked():
             self.slide_elapsed = 0
             self.slide_progress.setValue(0)
-            self.slide_progress.show()
+            # Only show if the user hasn't disabled it
+            if getattr(self, 'show_progress_line', True):
+                self.slide_progress.show()
             self.slide_tick_timer.start(30) # High-speed ticks for smooth line
         else:
             self.slide_tick_timer.stop()
@@ -4008,41 +4367,92 @@ class vmanViewer(QDialog):
             self.slide_progress.setValue(0)
 
     def _slide_tick(self):
-        target_ms = int(self.cb_speed.currentText().replace("s", "")) * 1000
+        # 1. Determine active loop states
+        is_adv_loop = hasattr(self, 'adv_loop_sequence') and len(self.adv_loop_sequence) > 0
+        is_ab_loop = getattr(self, 'loop_a', -1) != -1 and getattr(self, 'loop_b', -1) != -1 and not getattr(self, 'loop_is_media', False)
         
+        # 2. Determine exact target speed in milliseconds
+        if is_adv_loop:
+            target_ms = self.adv_loop_sequence[self.adv_loop_idx][1]
+        elif is_ab_loop:
+            target_ms = getattr(self, 'ab_gif_speed_ms', 150)
+        else:
+            target_ms = int(self.cb_speed.currentText().replace("s", "")) * 1000
+        
+        # 3. Webpage Auto-Scroll Mode
         if self.btn_vert_mode.isChecked():
-            # Webpage Mode Auto-Scroll
             bar = self.vert_view.verticalScrollBar()
-            bar.setValue(bar.value() + 2) # Adjust scroll speed here
+            bar.setValue(bar.value() + 2) 
             if bar.value() >= bar.maximum():
                 self._toggle_slide()
                 self.btn_slide.setChecked(False)
+                
+        # 4. Image Slideshow / Sequence Engine Mode
         else:
-            # Traditional Slideshow Mode
             self.slide_elapsed += 30
             pct = self.slide_elapsed / target_ms
             
-            self.slide_progress.setValue(int(pct * 100))
+            self.slide_progress.setValue(min(100, int(pct * 100)))
             
             if self.slide_elapsed >= target_ms:
                 self.slide_elapsed = 0
-                if self.current_index < len(self.playlist) - 1:
-                    self._next_item()
+                
+                # --- Execute Advanced Macro Sequence ---
+                if is_adv_loop:
+                    self.adv_loop_idx = (self.adv_loop_idx + 1) % len(self.adv_loop_sequence)
+                    self.current_index = self.adv_loop_sequence[self.adv_loop_idx][0]
+                    self._load_current_item()
+                    self._apply_adv_transform(self.adv_loop_sequence[self.adv_loop_idx][2])
+                    
+                # --- Execute Standard or A-B Loop Sequence ---
                 else:
-                    self._toggle_slide()
-                    self.btn_slide.setChecked(False)
+                    end_limit = self.loop_b if getattr(self, 'loop_b', -1) != -1 and not getattr(self, 'loop_is_media', False) else len(self.playlist) - 1
+                    
+                    if self.current_index < end_limit:
+                        self._next_item()
+                    else:
+                        if getattr(self, 'loop_a', -1) != -1 and not getattr(self, 'loop_is_media', False): 
+                            self.current_index = self.loop_a
+                            self._load_current_item()
+                        else:
+                            self._toggle_slide()
+                            self.btn_slide.setChecked(False)
 
     def _apply_img_transform(self):
         if hasattr(self, 'orig_pm'):
             img = self.orig_pm.toImage()
-            if self.flip_h: img = img.mirrored(True, False)
-            pm = QPixmap.fromImage(img).transformed(QTransform().rotate(self.rot_angle))
+            flip_h = getattr(self, 'flip_h', False)
+            flip_v = getattr(self, 'flip_v', False)
+            
+            # Now supports both Horizontal and Vertical flips cleanly
+            if flip_h or flip_v: 
+                img = img.mirrored(flip_h, flip_v)
+                
+            pm = QPixmap.fromImage(img).transformed(QTransform().rotate(getattr(self, 'rot_angle', 0)))
             self.img_view.set_image(pm)
+
+    def _apply_adv_transform(self, transform_str):
+        if not transform_str or self.stack.currentIndex() != 1: return
+        t = transform_str.lower()
+        if 'hf' in t: self.flip_h = True
+        if 'vf' in t: self.flip_v = True
+        
+        if 'c90' in t: self.rot_angle = 90
+        elif 'c180' in t: self.rot_angle = 180
+        elif 'c270' in t or 'cc90' in t: self.rot_angle = 270
+        elif 'cc270' in t: self.rot_angle = 90
+        
+        self._apply_img_transform()
 
     def _toggle_fullscreen(self): self.showNormal() if self.isFullScreen() else self.showFullScreen()
     
     def _toggle_playback(self):
-        if hasattr(self, 'player'):
+        # If we are viewing an image or vertical webpage mode, Spacebar toggles the slideshow
+        if self.stack.currentIndex() in [1, 3]:
+            self.btn_slide.setChecked(not self.btn_slide.isChecked())
+            self._toggle_slide()
+        # Otherwise, if it's media (video/audio), Spacebar toggles play/pause
+        elif hasattr(self, 'player'):
             if self.player.playbackState() == QMediaPlayer.PlayingState: self.player.pause()
             else: self.player.play()
 
@@ -4318,6 +4728,10 @@ class vmanVirtualManager(QMainWindow):
         self.search_box.setMaximumWidth(300)
         self.search_box.returnPressed.connect(self.run_global_search)
         
+        self.btn_type_address = QPushButton("📍 Type Path")
+        self.btn_type_address.clicked.connect(self.prompt_type_address)
+        nav_row.addWidget(self.btn_type_address)
+        
         nav_row.addWidget(self.breadcrumb_scroll, stretch=1)
         nav_row.addWidget(self.local_filter)
         nav_row.addWidget(self.search_box)
@@ -4488,6 +4902,14 @@ class vmanVirtualManager(QMainWindow):
         self.addDockWidget(Qt.RightDockWidgetArea, self.right_dock)
         self.status = QStatusBar()
         self.setStatusBar(self.status)
+
+    def prompt_type_address(self):
+        path, ok = QInputDialog.getText(self, "Navigate", "Enter Virtual Path (e.g., /Images/Vacation/):", QLineEdit.Normal, self.current_prefix)
+        if ok and path:
+            if not path.startswith("y_m_f://") and not path.startswith("tags://") and not path.startswith("trash://") and not path.startswith("fav://"):
+                if not path.endswith('/'): path += '/'
+                if not path.startswith('/'): path = '/' + path
+            self.nav_to_path(path)
 
     def open_timeline_diary(self):
         # Create it once and keep it in memory, just like the Tag Library
@@ -4915,19 +5337,16 @@ Ctrl+C/V/X    : Copy, Paste, Cut (Fully functional across Main and Isolated data
                 v_path = f"{pp}{f_name}/" if not f_name.endswith("/") else f"{pp}{f_name}"
                 disp_name = sec_n if (self.show_secondary_names and sec_n) else (f"{f_name}\n({sec_n})" if sec_n else f"{f_name}")
                 
-                self.table_rows_buffer.append({"display": [disp_name, "", human_size(size), "N/A", f"Virtual Folder ({count})", pp, c_tag], "sort_keys": [(0, f_name.lower()), (0, ""), (0, size), (0, ""), (0, count), (0, pp.lower()), (0, c_tag)], "user_data": ("folder", v_path, db_id), "color_tag": c_tag, "is_hidden": is_h, "icon": dir_icon})
+                self.table_rows_buffer.append({"display": [disp_name, "", human_size(size), "N/A", f"Virtual Folder ({count})", pp, c_tag], "sort_keys": [(0, natural_sort_key(f_name)), (0, ""), (0, size), (0, ""), (0, count), (0, natural_sort_key(pp)), (0, c_tag)], "user_data": ("folder", v_path, db_id), "color_tag": c_tag, "is_hidden": is_h, "icon": dir_icon})
             else:
                 db_id, n, s, ext, rp, mod, c_tag, sec_n, is_h = item[:9]
-                
-                # UPDATED: Pass db_id to _get_native_icon to enable the new custom thumbnail engine
                 icon = self._get_native_icon(rp, False, ext, db_id)
                 s_val = s if s else 0
                 ext_str = str(ext) if ext else ""
-                
-                # FIXED: Uses 'n' instead of 'f_name' for virtual files!
                 disp_name = sec_n if (self.show_secondary_names and sec_n) else (f"{n}\n({sec_n})" if sec_n else f"{n}")
                 
-                self.table_rows_buffer.append({"display": [disp_name, ext_str, human_size(s_val), str(mod), "Virtual File", str(rp) if rp else "", c_tag], "sort_keys": [(1, str(n).lower()), (1, ext_str.lower()), (1, s_val), (1, str(mod)), (1, "Virtual File"), (1, str(rp).lower() if rp else ""), (1, c_tag)], "user_data": ("file", str(rp), db_id), "color_tag": c_tag, "is_hidden": is_h, "icon": icon})
+                # Replace the file append
+                self.table_rows_buffer.append({"display": [disp_name, ext_str, human_size(s_val), str(mod), "Virtual File", str(rp) if rp else "", c_tag], "sort_keys": [(1, natural_sort_key(n)), (1, ext_str.lower()), (1, s_val), (1, str(mod)), (1, "Virtual File"), (1, natural_sort_key(rp) if rp else ""), (1, c_tag)], "user_data": ("file", str(rp), db_id), "color_tag": c_tag, "is_hidden": is_h, "icon": icon})
 
         if self.render_progress: self.render_progress.setValue(self.render_progress.maximum() - len(self.render_queue))
 
@@ -5002,6 +5421,19 @@ Ctrl+C/V/X    : Copy, Paste, Cut (Fully functional across Main and Isolated data
             pp, old_name = cur.execute("SELECT parent_path, name FROM virtual_fs WHERE id = ?", (db_id,)).fetchone()
             cur.execute("UPDATE virtual_fs SET name=?, secondary_name=?, color_tag=?, custom_tags=? WHERE id=?", (new_name, new_sec, new_tag, new_custom_tags, db_id))
             cur.execute("UPDATE virtual_fs SET parent_path = ? || SUBSTR(parent_path, LENGTH(?) + 1) WHERE parent_path LIKE ?", (f"{pp}{new_name}/", f"{pp}{old_name}/", f"{pp}{old_name}/%"))
+            
+            # Recursive Tagging with Progress Bar
+            if new_custom_tags:
+                children = cur.execute("SELECT id FROM virtual_fs WHERE parent_path LIKE ?", (f"{pp}{new_name}/%",)).fetchall()
+                if children:
+                    prog = QProgressDialog("Applying tags to contents...", "Cancel", 0, len(children), self)
+                    prog.setWindowModality(Qt.WindowModal)
+                    prog.show()
+                    for i, (child_id,) in enumerate(children):
+                        if prog.wasCanceled(): break
+                        cur.execute("UPDATE virtual_fs SET custom_tags=? WHERE id=?", (new_custom_tags, child_id))
+                        if i % 50 == 0: prog.setValue(i); QApplication.processEvents()
+                    prog.setValue(len(children))
         else: cur.execute("UPDATE virtual_fs SET name=?, secondary_name=?, color_tag=?, custom_tags=? WHERE id=?", (new_name, new_sec, new_tag, new_custom_tags, db_id))
             
         self.db.conn.commit(); self.clear_cache(); self.load_directory(self.current_prefix)
@@ -5690,6 +6122,9 @@ Ctrl+C/V/X    : Copy, Paste, Cut (Fully functional across Main and Isolated data
             menu = QMenu(self)
             act_rename = menu.addAction("✏️ Rename Database")
             act_delete = menu.addAction("🗑️ Delete Database")
+            menu.addSeparator()
+            act_compare = menu.addAction("⚖️ Compare Drives (Bitrot)")
+            
             action = menu.exec(self.folder_tree.viewport().mapToGlobal(pos))
             
             if action == act_rename:
@@ -5732,6 +6167,9 @@ Ctrl+C/V/X    : Copy, Paste, Cut (Fully functional across Main and Isolated data
                         self.sys_log(f"Deleted database '{db_name}'")
                     except Exception as e:
                         QMessageBox.critical(self, "Error", f"Failed to delete: {e}")
+                        
+            elif action == act_compare:
+                DriveComparatorDialog(self.active_db_path, str(db_file), self).exec()
 
     def toggle_hidden_files(self):
         self.show_hidden = not self.show_hidden
