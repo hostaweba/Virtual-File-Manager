@@ -605,57 +605,97 @@ class ImportFilesThread(QThread):
     progress = Signal(int, int, str)
     finished_import = Signal(int, int)
     error = Signal(str)
+    
     def __init__(self, db_path, target_prefix, paths, parent=None):
         super().__init__(parent)
         self.db_path, self.target_prefix, self.paths = db_path, target_prefix, paths
         self.is_cancelled = False
+        
     def cancel(self): self.is_cancelled = True
+    
     def run(self):
         try:
-            conn = sqlite3.connect(str(self.db_path))
+            # Added a timeout to prevent SQLite database locks from freezing the import
+            conn = sqlite3.connect(str(self.db_path), timeout=30)
             cur = conn.cursor()
             added_f, added_d = 0, 0
             all_files_to_process = []
+            
+            self.progress.emit(0, 100, "Calculating files to import...")
+            
             for p in self.paths:
                 if os.path.isdir(p):
                     for root, _, files in os.walk(p):
                         for f in files: all_files_to_process.append(os.path.join(root, f))
                 else: all_files_to_process.append(p)
+                
             total = len(all_files_to_process)
+            if total == 0:
+                self.finished_import.emit(0, 0)
+                conn.close()
+                return
             
             for p in self.paths:
                 if self.is_cancelled: break
+                
                 if os.path.isdir(p):
                     folder_name = os.path.basename(p)
                     cur.execute("INSERT OR IGNORE INTO virtual_fs (parent_path, name, is_folder, modified) VALUES (?,?,1,?)", (self.target_prefix, folder_name, now_ts()))
                     added_d += 1
+                    
                     for root, dirs, files in os.walk(p):
                         if self.is_cancelled: break
+                        
                         curr_parent = self.target_prefix + folder_name + "/" + os.path.relpath(root, p).replace("\\", "/") + "/" if os.path.relpath(root, p) != "." else self.target_prefix + folder_name + "/"
+                        
                         for d in dirs: 
                             cur.execute("INSERT OR IGNORE INTO virtual_fs (parent_path, name, is_folder, modified) VALUES (?,?,1,?)", (curr_parent, d, now_ts()))
                             added_d += 1
+                            
                         records = []
                         for f in files:
+                            if self.is_cancelled: break
                             fp = os.path.join(root, f)
-                            ext = os.path.splitext(f)[1].lower()
-                            mod = datetime.fromtimestamp(os.path.getmtime(fp)).strftime("%Y-%m-%d %H:%M:%S")
-                            cre = datetime.fromtimestamp(os.path.getctime(fp)).strftime("%Y-%m-%d %H:%M:%S")
-                            records.append((curr_parent, f, 0, fp, os.path.getsize(fp), ext, mod, get_category_for_ext(ext), mod[0:4], mod[5:7], cre))
+                            
+                            # CRITICAL FIX: Wrapped in try-except so permission errors on a single file don't crash the entire batch
+                            try:
+                                sz = os.path.getsize(fp)
+                                ext = os.path.splitext(f)[1].lower()
+                                mod = datetime.fromtimestamp(os.path.getmtime(fp)).strftime("%Y-%m-%d %H:%M:%S")
+                                cre = datetime.fromtimestamp(os.path.getctime(fp)).strftime("%Y-%m-%d %H:%M:%S")
+                                records.append((curr_parent, f, 0, fp, sz, ext, mod, get_category_for_ext(ext), mod[0:4], mod[5:7], cre))
+                            except Exception:
+                                pass # Skip unreadable files (like system files or broken symlinks)
+                                
                             added_f += 1
-                        cur.executemany("INSERT INTO virtual_fs (parent_path, name, is_folder, real_path, size, extension, modified, category, year, month, creation_date) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", records)
-                        self.progress.emit(added_f, total, f"Imported {added_f}/{total} files...")
+                            
+                            # Update progress smoothly during iteration
+                            if added_f % 20 == 0:
+                                self.progress.emit(added_f, total, f"Imported {added_f}/{total} files...")
+                                
+                        if records:
+                            cur.executemany("INSERT INTO virtual_fs (parent_path, name, is_folder, real_path, size, extension, modified, category, year, month, creation_date) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", records)
+                            conn.commit() # Commit chunks to clear RAM
                 else:
-                    ext = os.path.splitext(p)[1].lower()
-                    mod = datetime.fromtimestamp(os.path.getmtime(p)).strftime("%Y-%m-%d %H:%M:%S")
-                    cre = datetime.fromtimestamp(os.path.getctime(p)).strftime("%Y-%m-%d %H:%M:%S")
-                    cur.execute("INSERT INTO virtual_fs (parent_path, name, is_folder, real_path, size, extension, modified, category, year, month, creation_date) VALUES (?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?)", (self.target_prefix, os.path.basename(p), p, os.path.getsize(p), ext, mod, get_category_for_ext(ext), mod[0:4], mod[5:7], cre))
+                    try:
+                        sz = os.path.getsize(p)
+                        ext = os.path.splitext(p)[1].lower()
+                        mod = datetime.fromtimestamp(os.path.getmtime(p)).strftime("%Y-%m-%d %H:%M:%S")
+                        cre = datetime.fromtimestamp(os.path.getctime(p)).strftime("%Y-%m-%d %H:%M:%S")
+                        cur.execute("INSERT INTO virtual_fs (parent_path, name, is_folder, real_path, size, extension, modified, category, year, month, creation_date) VALUES (?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?)", (self.target_prefix, os.path.basename(p), p, sz, ext, mod, get_category_for_ext(ext), mod[0:4], mod[5:7], cre))
+                    except Exception:
+                        pass
+                        
                     added_f += 1
-                    self.progress.emit(added_f, total, f"Imported {added_f}/{total} files...")
+                    if added_f % 10 == 0:
+                        self.progress.emit(added_f, total, f"Imported {added_f}/{total} files...")
+                        
             conn.commit()
             conn.close()
+            self.progress.emit(total, total, "Import Complete!")
             self.finished_import.emit(added_f, added_d)
-        except Exception as e: self.error.emit(str(e))
+        except Exception as e: 
+            self.error.emit(str(e))
 
 class CompilerThread(QThread):
     progress = Signal(int, int, str)
@@ -6200,8 +6240,10 @@ Ctrl+C/V/X    : Copy, Paste, Cut (Fully functional across Main and Isolated data
             if folder: self.on_files_dropped([folder])
 
     def on_files_dropped(self, paths):
-        if self._is_smart_path(self.current_prefix) or self.current_prefix.startswith("trash://"): return QMessageBox.warning(self, "Error", "Cannot import directly into Smart Views.")
-        
+        if self._is_smart_path(self.current_prefix) or self.current_prefix.startswith("trash://"): 
+            return QMessageBox.warning(self, "Error", "Cannot import directly into Smart Views.")
+            
+        # 1. Setup the UI Progress Dialog
         self.import_dlg = QProgressDialog("Importing files into Virtual Sandbox...", "Cancel", 0, 100, self)
         self.import_dlg.setWindowModality(Qt.WindowModal)
         self.import_dlg.setMinimumDuration(0)
@@ -6209,7 +6251,26 @@ Ctrl+C/V/X    : Copy, Paste, Cut (Fully functional across Main and Isolated data
         self.import_dlg.show()
         QApplication.processEvents()
         
+        # 2. Initialize the background thread
         self.import_thread = ImportFilesThread(str(self.db.path), self.current_prefix, paths, self)
+        
+        # 3. Connect ALL the necessary signals
+        self.import_thread.progress.connect(lambda c, t, m: (self.import_dlg.setMaximum(max(1, t)), self.import_dlg.setValue(c), self.import_dlg.setLabelText(m)))
+        self.import_dlg.canceled.connect(self.import_thread.cancel)
+        
+        def on_import_finished(f_cnt, d_cnt):
+            self.import_dlg.close()
+            self.clear_cache()
+            self.refresh_all()
+            self.status.showMessage(f"Imported {f_cnt} files and {d_cnt} folders.", 5000)
+            self.sys_log(f"Successfully Sandbox Imported {f_cnt} files.")
+            
+        self.import_thread.finished_import.connect(on_import_finished)
+        self.import_thread.error.connect(lambda e: (self.import_dlg.close(), QMessageBox.critical(self, "Import Error", e)))
+        
+        # 4. Start the background thread!
+        self._register_worker(self.import_thread)
+        self.import_thread.start()
         
     def compile_current_view(self):
         name, ok = QInputDialog.getText(self, "Compile DB View", "Enter name for new separate database (e.g., 'Project_Backup'):")
