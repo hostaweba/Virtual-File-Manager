@@ -4143,7 +4143,7 @@ class AdvancedLoopDialog(QDialog):
     def __init__(self, current_raw, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Advanced Programmable Loop Engine")
-        self.resize(600, 380)
+        self.resize(600, 600)
         if parent and hasattr(parent, 'styleSheet'):
             self.setStyleSheet(parent.styleSheet())
 
@@ -4151,19 +4151,27 @@ class AdvancedLoopDialog(QDialog):
 
         lbl_info = QLabel("<b>Program your loop using Image Serial Numbers.</b><br>"
                           "Format: <code>[images][:speed_msXloops][:transform]</code><br><br>"
+                          "<i>Features:</i><br>"
+                          "• <b>Comments:</b> Start a line with <code>rem</code> to ignore it (e.g., <code>rem Intro Phase</code>).<br>"
+                          "• <b>Multi-line:</b> Write scripts across multiple lines for readability.<br><br>"
                           "<i>Defaults:</i> Speed uses your 'A-B Loop GIF Speed', Repetition is x1.<br>"
-                          "<i>Optional Transforms:</i> hf, vf, c90, c180, c270, cc90, cc270<br>"
+                          "<i>Optional Transforms:</i> hf, vf, c90, c180, c270, cc90, cc270<br><br>"
                           "<i>Examples:</i><br>"
-                          "• Minimal: <code>1-2,3,5</code> <i>(Plays once at default speed)</i><br>"
-                          "• Speed only: <code>1-5:200</code><br>"
-                          "• Transform only: <code>1-5:hf</code><br>"
-                          "• Loops only: <code>1-5:x5</code><br>"
-                          "• Full string: <code>1-2:150x3:vf</code>")
+                          "<code>rem This line is ignored</code><br>"
+                          "<code>1-5:200x2     rem Inline comments work too!</code><br>"
+                          "<code>6-10:150x3:hf rem Flip horizontal</code>")
         layout.addWidget(lbl_info)
 
         self.txt_input = QPlainTextEdit()
         self.txt_input.setPlainText(current_raw)
-        self.txt_input.setPlaceholderText("Enter your sequence here...")
+        self.txt_input.setPlaceholderText("rem Enter your sequence here...\n1-10:150x2")
+        
+        # --- NEW: Code Editor Styling ---
+        font = QFont("Consolas", 11)
+        font.setStyleHint(QFont.Monospace)
+        self.txt_input.setFont(font)
+        self.txt_input.setLineWrapMode(QPlainTextEdit.NoWrap) # Prevents messy visual line breaks
+        
         layout.addWidget(self.txt_input)
 
         btn_lay = QHBoxLayout()
@@ -4413,50 +4421,61 @@ class vmanViewer(QDialog):
 
                 try:
                     seq = []
-                    for block in text.split():
-                        parts = block.split(':')
-                        frames_str = parts[0]
+                    # --- NEW: Process line by line to support comments and clean multi-line scripts ---
+                    for line in text.splitlines():
+                        clean_line = line.strip()
                         
-                        # --- 1. Set Defaults ---
-                        speed = getattr(self, 'ab_gif_speed_ms', 150)
-                        loops = 1
-                        transform_str = ""
-                        
-                        # --- 2. Smart Parsing of Optional Segments ---
-                        if len(parts) > 1:
-                            p1 = parts[1].lower()
-                            # Check if the second part is a Speed/Loop config (starts with a number or 'x')
-                            if p1 and (p1[0].isdigit() or p1.startswith('x')):
-                                if 'x' in p1:
-                                    s_str, l_str = p1.split('x', 1)
-                                    if s_str: speed = int(s_str)
-                                    if l_str: loops = int(l_str)
+                        # 1. Skip empty lines and lines starting with 'rem'
+                        if not clean_line or clean_line.lower().startswith("rem"):
+                            continue
+                            
+                        # 2. Strip out inline comments (e.g. "1-2:150x1 rem test")
+                        rem_idx = clean_line.lower().find(" rem ")
+                        if rem_idx != -1:
+                            clean_line = clean_line[:rem_idx].strip()
+                            
+                        # 3. Parse the remaining valid blocks on this line
+                        for block in clean_line.split():
+                            parts = block.split(':')
+                            frames_str = parts[0]
+                            
+                            # --- Set Defaults ---
+                            speed = getattr(self, 'ab_gif_speed_ms', 150)
+                            loops = 1
+                            transform_str = ""
+                            
+                            # --- Smart Parsing of Optional Segments ---
+                            if len(parts) > 1:
+                                p1 = parts[1].lower()
+                                if p1 and (p1[0].isdigit() or p1.startswith('x')):
+                                    if 'x' in p1:
+                                        s_str, l_str = p1.split('x', 1)
+                                        if s_str: speed = int(s_str)
+                                        if l_str: loops = int(l_str)
+                                    else:
+                                        speed = int(p1)
+                                        
+                                    if len(parts) > 2:
+                                        transform_str = parts[2].lower()
                                 else:
-                                    speed = int(p1)
-                                    
-                                # If there's a 3rd part, it must be the transform
-                                if len(parts) > 2:
-                                    transform_str = parts[2].lower()
-                            else:
-                                # Second part was alphabetic, so it's a transform (e.g., "1-5:hf")
-                                transform_str = p1
+                                    transform_str = p1
 
-                        # --- 3. Parse Frames ---
-                        frames = []
-                        for f_part in frames_str.split(','):
-                            if '-' in f_part:
-                                start_f, end_f = map(int, f_part.split('-'))
-                                step = 1 if start_f <= end_f else -1
-                                frames.extend(range(start_f - 1, end_f - 1 + step, step))
-                            else:
-                                frames.append(int(f_part) - 1)
-                        
-                        # --- 4. Build Sequence ---
-                        for _ in range(loops):
-                            for f in frames:
-                                if 0 <= f < len(self.playlist):
-                                    seq.append((f, speed, transform_str))
-                                    
+                            # --- Parse Frames ---
+                            frames = []
+                            for f_part in frames_str.split(','):
+                                if '-' in f_part:
+                                    start_f, end_f = map(int, f_part.split('-'))
+                                    step = 1 if start_f <= end_f else -1
+                                    frames.extend(range(start_f - 1, end_f - 1 + step, step))
+                                else:
+                                    frames.append(int(f_part) - 1)
+                            
+                            # --- Build Sequence ---
+                            for _ in range(loops):
+                                for f in frames:
+                                    if 0 <= f < len(self.playlist):
+                                        seq.append((f, speed, transform_str))
+                                        
                     if seq:
                         self.adv_loop_sequence = seq
                         self.adv_loop_idx = 0
@@ -4464,6 +4483,8 @@ class vmanViewer(QDialog):
                         self._load_current_item()
                         self._apply_adv_transform(seq[0][2])
                         QMessageBox.information(self, "Programmed", f"Loaded {len(seq)} total frames into memory.\nPress Spacebar or click 'Slideshow' to execute.")
+                    else:
+                        QMessageBox.warning(self, "Empty Loop", "No valid frame sequences were found (maybe they were all commented out?).")
                 except Exception as e:
                     QMessageBox.warning(self, "Parse Error", f"Failed to parse sequence.\nPlease check your format.\nError: {e}")
 
@@ -4988,6 +5009,8 @@ class vmanVirtualManager(QMainWindow):
         self.search_box.returnPressed.connect(self.run_global_search)
         
         self.btn_type_address = QPushButton("📍")
+        self.btn_type_address.setFixedSize(15, 15) # Makes it a small, neat square
+        self.btn_type_address.setToolTip("Type Address / Navigate")
         self.btn_type_address.clicked.connect(self.prompt_type_address)
         nav_row.addWidget(self.btn_type_address)
         
