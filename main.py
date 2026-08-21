@@ -578,36 +578,36 @@ class SpaceScannerThread(QThread):
     
     def run(self):
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with sqlite3.connect(self.db_path, timeout=30) as conn:
                 cur = conn.cursor()
                 
                 path_cond = " OR ".join(["parent_path LIKE ?"] * len(self.scan_roots))
                 path_params = tuple(f"{p}%" for p in self.scan_roots)
             
-            self.progress.emit(10, 100, "Scanning for Junk...")
-            # FIX: Added hash_verified=0 to ignore intentionally marked safe files
-            cur.execute(f"SELECT id, name, parent_path, extension, size, modified, sha256 FROM virtual_fs WHERE is_folder=0 AND in_trash=0 AND hash_verified=0 AND ({path_cond}) AND (extension IN ('.tmp', '.bak', '.log', '.cache') OR name LIKE '%cache%')", path_params)
-            for r in cur.fetchall():
-                if self.is_cancelled: return
-                self.found.emit("Junk File", r[1], r[2], r[3] or "", r[4] or 0, r[5] or "Unknown", r[6] or "", r[0])
-            
-            self.progress.emit(40, 100, "Scanning for Huge Files...")
-            cur.execute(f"SELECT id, name, parent_path, extension, size, modified, sha256 FROM virtual_fs WHERE is_folder=0 AND in_trash=0 AND hash_verified=0 AND ({path_cond}) AND size > 524288000 ORDER BY size DESC", path_params)
-            for r in cur.fetchall():
-                if self.is_cancelled: return
-                self.found.emit("Huge File (>500MB)", r[1], r[2], r[3] or "", r[4] or 0, r[5] or "Unknown", r[6] or "", r[0])
-            
-            self.progress.emit(70, 100, "Scanning for Duplicates...")
-            # FIX: Strict duplicate scan excluding safe files
-            cur.execute(f"SELECT size, extension, COUNT(*) as c FROM virtual_fs WHERE is_folder=0 AND in_trash=0 AND hash_verified=0 AND ({path_cond}) AND size > 0 GROUP BY size, extension HAVING c > 1", path_params)
-            for size, ext, count in cur.fetchall():
-                if self.is_cancelled: return
-                cur.execute(f"SELECT id, name, parent_path, extension, modified, sha256 FROM virtual_fs WHERE size=? AND extension=? AND is_folder=0 AND in_trash=0 AND hash_verified=0 AND ({path_cond})", (size, ext) + path_params)
-                files = cur.fetchall()
-                for f in files[1:]: 
-                    self.found.emit("Duplicate File", f[1], f[2], f[3] or "", size or 0, f[4] or "Unknown", f[5] or "", f[0])
-            
-            self.progress.emit(100, 100, "Scan Complete.")
+                self.progress.emit(10, 100, "Scanning for Junk...")
+                cur.execute(f"SELECT id, name, parent_path, extension, size, modified, sha256 FROM virtual_fs WHERE is_folder=0 AND in_trash=0 AND hash_verified=0 AND ({path_cond}) AND (extension IN ('.tmp', '.bak', '.log', '.cache') OR name LIKE '%cache%')", path_params)
+                for r in cur.fetchall():
+                    if self.is_cancelled: return
+                    self.found.emit("Junk File", r[1], r[2], r[3] or "", r[4] or 0, r[5] or "Unknown", r[6] or "", r[0])
+                
+                self.progress.emit(40, 100, "Scanning for Huge Files...")
+                cur.execute(f"SELECT id, name, parent_path, extension, size, modified, sha256 FROM virtual_fs WHERE is_folder=0 AND in_trash=0 AND hash_verified=0 AND ({path_cond}) AND size > 524288000 ORDER BY size DESC", path_params)
+                for r in cur.fetchall():
+                    if self.is_cancelled: return
+                    self.found.emit("Huge File (>500MB)", r[1], r[2], r[3] or "", r[4] or 0, r[5] or "Unknown", r[6] or "", r[0])
+                
+                self.progress.emit(70, 100, "Scanning for Duplicates...")
+                cur.execute(f"SELECT size, extension, COUNT(*) as c FROM virtual_fs WHERE is_folder=0 AND in_trash=0 AND hash_verified=0 AND ({path_cond}) AND size > 0 GROUP BY size, extension HAVING c > 1", path_params)
+                for size, ext, count in cur.fetchall():
+                    if self.is_cancelled: return
+                    cur.execute(f"SELECT id, name, parent_path, extension, modified, sha256 FROM virtual_fs WHERE size=? AND extension=? AND is_folder=0 AND in_trash=0 AND hash_verified=0 AND ({path_cond})", (size, ext) + path_params)
+                    files = cur.fetchall()
+                    for f in files[1:]: 
+                        self.found.emit("Duplicate File", f[1], f[2], f[3] or "", size or 0, f[4] or "Unknown", f[5] or "", f[0])
+                
+                self.progress.emit(100, 100, "Scan Complete.")
+        except Exception as e:
+            print(f"Space Scanner Error: {e}")
         finally:
             self.finished_scan.emit()
 
@@ -3650,7 +3650,12 @@ class SpaceAnalyzerDialog(QDialog):
         self.prog_dlg.show()
         QApplication.processEvents()
         
+        # Correctly wire up all signals AND start the thread
         self.scanner.progress.connect(lambda v, t, txt: (self.prog_dlg.setValue(v), self.prog_dlg.setLabelText(txt)))
+        self.prog_dlg.canceled.connect(self.scanner.cancel)
+        self.scanner.finished_scan.connect(self.on_scan_finished)
+        
+        self.scanner.start() # <--- This is what was missing!
 
     def on_scan_finished(self):
         self.prog_dlg.close()
