@@ -369,18 +369,28 @@ class MaterializeThread(QThread):
 class BulkHashCalculator(QThread):
     progress = Signal(int, int, str)
     finished = Signal(int)
-    def __init__(self, db_path, target_v_path, parent=None):
+    def __init__(self, db_path, target_v_path=None, target_ids=None, parent=None):
         super().__init__(parent)
         self.db_path = db_path
         self.target_v_path = target_v_path
+        self.target_ids = target_ids
         self.is_cancelled = False
     def cancel(self): self.is_cancelled = True
     def run(self):
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with sqlite3.connect(self.db_path, timeout=30) as conn:
                 cur = conn.cursor()
-                cur.execute("SELECT id, real_path, name FROM virtual_fs WHERE parent_path LIKE ? AND is_folder=0", (f"{self.target_v_path}%",))
-                files = cur.fetchall()
+                if self.target_ids is not None:
+                    # Fetch paths directly using provided IDs
+                    files = []
+                    for i in range(0, len(self.target_ids), 900):
+                        chunk = self.target_ids[i:i+900]
+                        cur.execute(f"SELECT id, real_path, name FROM virtual_fs WHERE id IN ({','.join(['?']*len(chunk))}) AND is_folder=0", chunk)
+                        files.extend(cur.fetchall())
+                else:
+                    cur.execute("SELECT id, real_path, name FROM virtual_fs WHERE parent_path LIKE ? AND is_folder=0", (f"{self.target_v_path}%",))
+                    files = cur.fetchall()
+                    
                 total = len(files)
                 computed = 0
                 for i, (db_id, rp, name) in enumerate(files):
@@ -1033,6 +1043,7 @@ class DriveComparatorDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Advanced Drive Comparator & Bitrot Auditing")
         self.resize(1150, 750)
+        self.setWindowFlags(self.windowFlags() | Qt.WindowMaximizeButtonHint | Qt.WindowMinimizeButtonHint)
         self.main_db = main_db
         self.target_db = target_db
         
@@ -1041,7 +1052,7 @@ class DriveComparatorDialog(QDialog):
             
         layout = QVBoxLayout(self)
         
-        # --- 1. Config UI (Top Bar) ---
+        # Config UI
         config_grp = QGroupBox("Scan Configuration")
         config_lay = QGridLayout(config_grp)
         
@@ -1057,7 +1068,7 @@ class DriveComparatorDialog(QDialog):
         self.chk_missing = QCheckBox("Detect Missing (In Target, Not in Main)")
         self.chk_missing.setChecked(True)
         self.chk_moved = QCheckBox("Detect Moved/Renamed (Same Hash, Diff Path)")
-        self.chk_moved.setChecked(False) # Off by default as it can be heavy
+        self.chk_moved.setChecked(False) 
         
         btn_scan = QPushButton("🔍 Run Advanced Scan")
         btn_scan.setStyleSheet("background-color: #1f6feb; color: white; font-weight: bold; padding: 6px;")
@@ -1072,21 +1083,23 @@ class DriveComparatorDialog(QDialog):
         config_lay.addWidget(btn_scan, 0, 3, 1, 1)
         layout.addWidget(config_grp)
         
-        # --- 2. Interactive Data Table ---
+        # Interactive Table
         self.table = QTableWidget(0, 7)
         self.table.setHorizontalHeaderLabels(["Select", "Detection Type", "File Name", "Main DB Info", "Target DB Info", "Main ID", "Target ID"])
         self.table.horizontalHeader().setStretchLastSection(True)
-        self.table.setColumnWidth(0, 50)
-        self.table.setColumnWidth(1, 150)
-        self.table.setColumnWidth(2, 200)
-        self.table.setColumnWidth(3, 300)
-        self.table.setColumnWidth(4, 300)
-        self.table.setColumnHidden(5, True) # Hide IDs but keep them for logic
-        self.table.setColumnHidden(6, True)
+        self.table.setColumnWidth(0, 50); self.table.setColumnWidth(1, 150)
+        self.table.setColumnWidth(2, 200); self.table.setColumnWidth(3, 300); self.table.setColumnWidth(4, 300)
+        self.table.setColumnHidden(5, True); self.table.setColumnHidden(6, True)
+        
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.ExtendedSelection) # Enables Shift+Click
+        self.table.setSortingEnabled(True)
+        
+        self.table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self.show_context_menu)
         layout.addWidget(self.table)
         
-        # --- 3. Action Tools ---
+        # Action Tools
         action_lay = QHBoxLayout()
         btn_sel_all = QPushButton("☑ Toggle All")
         btn_sel_all.clicked.connect(self.toggle_all)
@@ -1096,11 +1109,13 @@ class DriveComparatorDialog(QDialog):
         
         self.combo_resolve = QComboBox()
         self.combo_resolve.addItems([
-            "Action: Overwrite Main Hash with Target Hash",
-            "Action: Overwrite Target Hash with Main Hash"
+            "Overwrite Main Hash with Target Hash",
+            "Overwrite Target Hash with Main Hash",
+            "Merge Target Data into Main DB (Updates Only)",
+            "Merge Unique Target Items to NEW 3rd Database"
         ])
         
-        self.btn_resolve = QPushButton("⚡ Resolve Selected Issues")
+        self.btn_resolve = QPushButton("⚡ Resolve Selected")
         self.btn_resolve.setStyleSheet("background-color: #2ea043; color: white; font-weight: bold; padding: 6px 15px;")
         self.btn_resolve.clicked.connect(self.resolve_selected)
         
@@ -1111,14 +1126,24 @@ class DriveComparatorDialog(QDialog):
         action_lay.addWidget(self.btn_resolve)
         layout.addLayout(action_lay)
         
-        if self.target_db:
-            QTimer.singleShot(100, self.run_scan)
+        if self.target_db: QTimer.singleShot(100, self.run_scan)
 
     def select_target(self):
         path, _ = QFileDialog.getOpenFileName(self, "Select Secondary Database", "", "Database (*.db)")
         if path:
             self.target_db = path
             self.lbl_target.setText(f"<b>Target DB:</b> {Path(path).name}")
+
+    def show_context_menu(self, pos):
+        menu = QMenu(self)
+        act_check = menu.addAction("☑ Check Highlighted")
+        act_uncheck = menu.addAction("☐ Uncheck Highlighted")
+        action = menu.exec(self.table.viewport().mapToGlobal(pos))
+        
+        if action in [act_check, act_uncheck]:
+            state = Qt.Checked if action == act_check else Qt.Unchecked
+            for idx in self.table.selectionModel().selectedRows():
+                self.table.item(idx.row(), 0).setCheckState(state)
 
     def add_row(self, type_str, name, m_info, t_info, m_id, t_id):
         row = self.table.rowCount()
@@ -1131,8 +1156,14 @@ class DriveComparatorDialog(QDialog):
         self.table.setItem(row, 2, QTableWidgetItem(name))
         self.table.setItem(row, 3, QTableWidgetItem(m_info))
         self.table.setItem(row, 4, QTableWidgetItem(t_info))
-        self.table.setItem(row, 5, QTableWidgetItem(str(m_id)))
-        self.table.setItem(row, 6, QTableWidgetItem(str(t_id)))
+        
+        m_id_item = QTableWidgetItem()
+        m_id_item.setData(Qt.DisplayRole, m_id)
+        self.table.setItem(row, 5, m_id_item)
+        
+        t_id_item = QTableWidgetItem()
+        t_id_item.setData(Qt.DisplayRole, t_id)
+        self.table.setItem(row, 6, t_id_item)
 
     def toggle_all(self):
         state = Qt.Checked if getattr(self, 'all_checked', False) else Qt.Unchecked
@@ -1141,128 +1172,119 @@ class DriveComparatorDialog(QDialog):
             if self.table.item(r, 0): self.table.item(r, 0).setCheckState(state)
 
     def run_scan(self):
-        if not self.target_db:
-            return QMessageBox.warning(self, "Missing Target", "Please select a Target Database first.")
-            
+        if not self.target_db: return QMessageBox.warning(self, "Missing Target", "Please select a Target Database first.")
+        
+        self.table.setSortingEnabled(False)
         self.table.setRowCount(0)
         match_virtual = (self.combo_match.currentIndex() == 1)
         
         prog = QProgressDialog("Cross-referencing databases...", "Cancel", 0, 0, self)
-        prog.setWindowModality(Qt.WindowModal)
-        prog.setMinimumDuration(0)   # <--- Forces instant display
-        prog.setValue(0)             # <--- Sets initial state
-        prog.show()
-        QApplication.processEvents() # <--- Forces the OS to paint the UI immediately
+        prog.setWindowModality(Qt.WindowModal); prog.setMinimumDuration(0); prog.show()
+        QApplication.processEvents()
         
         try:
-            with sqlite3.connect(self.main_db) as conn:
+            # Force the main app to release any pending background locks
+            if self.parent() and hasattr(self.parent(), 'db'):
+                self.parent().db.conn.commit()
+
+            conn = sqlite3.connect(self.main_db, timeout=30)
+            try:
                 cur = conn.cursor()
                 cur.execute(f"ATTACH DATABASE '{self.target_db}' AS target")
                 
                 join_cond = "m.parent_path = t.parent_path AND m.name = t.name" if match_virtual else "m.real_path = t.real_path"
                 
-                # 1. Detect Bitrot (Hash Mismatch)
                 if self.chk_bitrot.isChecked():
-                    cur.execute(f"""
-                        SELECT m.id, t.id, m.name, m.sha256, t.sha256, m.real_path
-                        FROM main.virtual_fs m JOIN target.virtual_fs t ON {join_cond}
-                        WHERE m.sha256 != t.sha256 AND m.sha256 != '' AND t.sha256 != '' AND m.is_folder=0
-                    """)
+                    cur.execute(f"SELECT m.id, t.id, m.name, m.sha256, t.sha256, m.real_path FROM main.virtual_fs m JOIN target.virtual_fs t ON {join_cond} WHERE m.sha256 != t.sha256 AND m.sha256 != '' AND t.sha256 != '' AND m.is_folder=0")
                     for mid, tid, name, m_hash, t_hash, rp in cur.fetchall():
                         self.add_row("⚠️ Bitrot Conflict", name, f"Hash: {m_hash}", f"Hash: {t_hash}", mid, tid)
                         
-                # 2. Detect Missing Files
                 if self.chk_missing.isChecked():
                     where_missing = "t.parent_path || t.name NOT IN (SELECT parent_path || name FROM main.virtual_fs)" if match_virtual else "t.real_path NOT IN (SELECT real_path FROM main.virtual_fs WHERE real_path != '') AND t.real_path != ''"
                     cur.execute(f"SELECT t.id, t.name, t.real_path, t.size FROM target.virtual_fs t WHERE {where_missing} AND t.is_folder=0")
                     for tid, name, rp, size in cur.fetchall():
-                        self.add_row("➕ Missing in Main", name, "File Not Found", f"Size: {human_size(size)} | Target OS: {rp}", -1, tid)
+                        self.add_row("➕ Missing in Main", name, "File Not Found", f"Size: {size} | OS: {rp}", -1, tid)
 
-                # 3. Detect Moved / Renamed Files
                 if self.chk_moved.isChecked():
                     field = "parent_path || name" if match_virtual else "real_path"
-                    cur.execute(f"""
-                        SELECT m.id, t.id, m.name, m.{field.split('||')[0].strip()}, t.{field.split('||')[0].strip()}
-                        FROM main.virtual_fs m JOIN target.virtual_fs t ON m.sha256 = t.sha256
-                        WHERE m.sha256 != '' AND m.{field} != t.{field} AND m.is_folder=0
-                    """)
+                    cur.execute(f"SELECT m.id, t.id, m.name, m.{field.split('||')[0].strip()}, t.{field.split('||')[0].strip()} FROM main.virtual_fs m JOIN target.virtual_fs t ON m.sha256 = t.sha256 WHERE m.sha256 != '' AND m.{field} != t.{field} AND m.is_folder=0")
                     for mid, tid, name, m_path, t_path in cur.fetchall():
                         self.add_row("🔄 Moved/Renamed", name, f"Main: {m_path}", f"Target: {t_path}", mid, tid)
-
+                        
                 cur.execute("DETACH DATABASE target")
+            finally:
+                conn.close() # <--- CRITICAL FIX: Explicitly release the database lock!
+                
+            self.table.setSortingEnabled(True)
             prog.close()
-            QMessageBox.information(self, "Scan Complete", f"Deep scan finished. Found {self.table.rowCount()} actionable anomalies.")
+            QMessageBox.information(self, "Scan Complete", f"Deep scan finished. Found {self.table.rowCount()} anomalies.")
         except Exception as e:
-            prog.close()
-            QMessageBox.critical(self, "Scan Error", str(e))
+            prog.close(); QMessageBox.critical(self, "Scan Error", str(e))
 
     def resolve_selected(self):
         selected = [r for r in range(self.table.rowCount()) if self.table.item(r, 0).checkState() == Qt.Checked]
-        if not selected: return QMessageBox.information(self, "No Selection", "Please check the items you want to resolve.")
+        if not selected: return QMessageBox.information(self, "No Selection", "Please check items to resolve.")
         
         if QMessageBox.question(self, "Resolve", f"Apply resolutions to {len(selected)} selected items?", QMessageBox.Yes|QMessageBox.No) != QMessageBox.Yes: return
 
-        bitrot_strat = self.combo_resolve.currentIndex() # 0 = Overwrite Main, 1 = Overwrite Target
+        action_idx = self.combo_resolve.currentIndex() 
         
         prog = QProgressDialog(f"Resolving {len(selected)} items...", "Cancel", 0, len(selected), self)
-        prog.setWindowModality(Qt.WindowModal)
-        prog.setMinimumDuration(0)
-        prog.setValue(0)
-        prog.show()
+        prog.setWindowModality(Qt.WindowModal); prog.setMinimumDuration(0); prog.setValue(0); prog.show()
         QApplication.processEvents()
 
         try:
-            with sqlite3.connect(self.main_db) as conn_m:
+            if self.parent() and hasattr(self.parent(), 'db'):
+                self.parent().db.conn.commit()
+
+            if action_idx == 3: # Create 3rd DB
+                save_path, _ = QFileDialog.getSaveFileName(self, "Create 3rd Merged Database", "", "Database (*.db)")
+                if not save_path: return prog.close()
+                import shutil
+                shutil.copy2(self.main_db, save_path)
+                conn_m = sqlite3.connect(save_path, timeout=30)
+            else:
+                conn_m = sqlite3.connect(self.main_db, timeout=30)
+                
+            try:
                 cur_m = conn_m.cursor()
                 cur_m.execute(f"ATTACH DATABASE '{self.target_db}' AS target")
                 
+                # Execute in a bulk transaction block to prevent intra-loop locking
+                cur_m.execute("BEGIN IMMEDIATE")
+                
                 for i, r in enumerate(selected):
                     if prog.wasCanceled(): break
-                    
-                    # ... [existing resolution logic remains exactly the same] ...
-
-                    prog.setValue(i+1)
-                    if i % 10 == 0: QApplication.processEvents() # <--- Keeps UI responsive
                     issue_type = self.table.item(r, 1).text()
                     m_id = int(self.table.item(r, 5).text())
                     t_id = int(self.table.item(r, 6).text())
                     
-                    if "Missing" in issue_type:
-                        # Copy the entire row from Target to Main
-                        cur_m.execute("""
-                            INSERT INTO main.virtual_fs (parent_path, name, is_folder, real_path, size, extension, modified, sha256, custom_tags, color_tag, secondary_name, hash_verified, creation_date)
-                            SELECT parent_path, name, is_folder, real_path, size, extension, modified, sha256, custom_tags, color_tag, secondary_name, hash_verified, creation_date
-                            FROM target.virtual_fs WHERE id=?
-                        """, (t_id,))
-                        
+                    if "Missing" in issue_type and action_idx in [2, 3]:
+                        cur_m.execute("INSERT INTO main.virtual_fs (parent_path, name, is_folder, real_path, size, extension, modified, sha256, custom_tags, color_tag, secondary_name, hash_verified, creation_date) SELECT parent_path, name, is_folder, real_path, size, extension, modified, sha256, custom_tags, color_tag, secondary_name, hash_verified, creation_date FROM target.virtual_fs WHERE id=?", (t_id,))
                     elif "Bitrot" in issue_type:
-                        if bitrot_strat == 0: # Overwrite Main
-                            cur_m.execute("UPDATE main.virtual_fs SET sha256 = (SELECT sha256 FROM target.virtual_fs WHERE id=?) WHERE id=?", (t_id, m_id))
-                        else: # Overwrite Target
-                            cur_m.execute("UPDATE target.virtual_fs SET sha256 = (SELECT sha256 FROM main.virtual_fs WHERE id=?) WHERE id=?", (m_id, t_id))
-                            
-                    elif "Moved" in issue_type:
-                        # Auto-sync Main DB's path to match Target DB's path
+                        if action_idx in [0, 2, 3]: cur_m.execute("UPDATE main.virtual_fs SET sha256 = (SELECT sha256 FROM target.virtual_fs WHERE id=?) WHERE id=?", (t_id, m_id))
+                        elif action_idx == 1: cur_m.execute("UPDATE target.virtual_fs SET sha256 = (SELECT sha256 FROM main.virtual_fs WHERE id=?) WHERE id=?", (m_id, t_id))
+                    elif "Moved" in issue_type and action_idx in [0, 2, 3]:
                         cur_m.execute("UPDATE main.virtual_fs SET real_path = (SELECT real_path FROM target.virtual_fs WHERE id=?), parent_path = (SELECT parent_path FROM target.virtual_fs WHERE id=?), name = (SELECT name FROM target.virtual_fs WHERE id=?) WHERE id=?", (t_id, t_id, t_id, m_id))
 
                     prog.setValue(i+1)
-                    if i % 10 == 0: QApplication.processEvents() # <--- Keeps UI responsive
+                    if i % 10 == 0: QApplication.processEvents()
                     
-                cur_m.execute("DETACH DATABASE target")
                 conn_m.commit()
+                cur_m.execute("DETACH DATABASE target")
+            finally:
+                conn_m.close() # <--- CRITICAL FIX: Explicitly release the database lock!
                 
             prog.close()
             QMessageBox.information(self, "Success", f"Successfully resolved {len(selected)} anomalies.")
             
-            # Auto-Refresh Main UI & Table
-            if self.parent():
+            if self.parent() and action_idx != 3:
                 self.parent().clear_cache()
                 self.parent().refresh_all()
             self.run_scan()
                 
         except Exception as e:
-            prog.close()
-            QMessageBox.critical(self, "Resolve Error", str(e))
+            prog.close(); QMessageBox.critical(self, "Resolve Error", str(e))
 
     def export_report(self):
         if self.table.rowCount() == 0: return
@@ -1279,6 +1301,70 @@ class DriveComparatorDialog(QDialog):
         except Exception as e:
             QMessageBox.warning(self, "Export Error", str(e))
 
+class PhysicalDeleteWarningDialog(QDialog):
+    def __init__(self, count, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("CRITICAL WARNING: Physical Deletion")
+        self.setFixedSize(550, 300)
+        self.setModal(True)
+        
+        self.layout = QVBoxLayout(self)
+        self.layout.setAlignment(Qt.AlignCenter)
+        
+        self.lbl_warning = QLabel(f"⚠️ YOU ARE ABOUT TO PERMANENTLY DELETE {count} FILES FROM YOUR OS HARD DRIVE! ⚠️")
+        self.lbl_warning.setWordWrap(True)
+        self.lbl_warning.setAlignment(Qt.AlignCenter)
+        font = QFont("Segoe UI", 16, QFont.Bold)
+        self.lbl_warning.setFont(font)
+        self.layout.addWidget(self.lbl_warning)
+        
+        self.lbl_sub = QLabel("This action CANNOT be undone. Files will NOT go to the Recycle Bin.")
+        self.lbl_sub.setAlignment(Qt.AlignCenter)
+        self.layout.addWidget(self.lbl_sub)
+        
+        self.btn_confirm = QPushButton("I Understand, Delete Files")
+        self.btn_confirm.setFixedHeight(50)
+        self.btn_confirm.setFont(QFont("Segoe UI", 12, QFont.Bold))
+        self.btn_confirm.setEnabled(False) # Disabled initially
+        self.btn_confirm.clicked.connect(self.accept)
+        
+        self.btn_cancel = QPushButton("Cancel & Keep Files Safe")
+        self.btn_cancel.setFixedHeight(50)
+        self.btn_cancel.clicked.connect(self.reject)
+        
+        self.layout.addSpacing(20)
+        self.layout.addWidget(self.btn_confirm)
+        self.layout.addWidget(self.btn_cancel)
+        
+        # Flashing Animation State
+        self.is_red = False
+        self.flash_timer = QTimer(self)
+        self.flash_timer.timeout.connect(self.flash_bg)
+        self.flash_timer.start(500)
+        
+        # 4 Second Countdown to enable Delete button
+        self.countdown = 4
+        self.enable_timer = QTimer(self)
+        self.enable_timer.timeout.connect(self.tick_enable)
+        self.enable_timer.start(1000)
+        self.tick_enable()
+
+    def flash_bg(self):
+        self.is_red = not self.is_red
+        if self.is_red:
+            self.setStyleSheet("QDialog { background-color: #8b0000; color: white; } QLabel { color: white; } QPushButton { background-color: #21262d; color: white; }")
+        else:
+            self.setStyleSheet("QDialog { background-color: #5c2121; color: white; } QLabel { color: #ffcccc; } QPushButton { background-color: #30363d; color: white; }")
+
+    def tick_enable(self):
+        if self.countdown > 0:
+            self.btn_confirm.setText(f"Wait {self.countdown} seconds...")
+            self.countdown -= 1
+        else:
+            self.btn_confirm.setText("I Understand, Delete Files")
+            self.btn_confirm.setStyleSheet("background-color: black; color: red; border: 2px solid red;")
+            self.btn_confirm.setEnabled(True)
+            self.enable_timer.stop()
 
 class DuplicateProofDialog(QDialog):
     def __init__(self, db_path, query, params, match_type, main_app, parent=None):
@@ -3976,7 +4062,25 @@ class AdvancedImageViewer(QGraphicsView):
     def __init__(self, parent=None):
         super().__init__(parent); self.scene = QGraphicsScene(self); self.setScene(self.scene)
         self.setRenderHints(QPainter.Antialiasing | QPainter.SmoothPixmapTransform); self.setDragMode(QGraphicsView.ScrollHandDrag)
-        self.setStyleSheet("background: transparent; border: none;"); self._pixmap_item = None; self.zoom_factor = 1.15
+        self._pixmap_item = None; self.zoom_factor = 1.15
+        
+        # Apply sleek scrollbars for both vertical and horizontal zooming
+        self.setStyleSheet("""
+            QGraphicsView { background: transparent; border: none; }
+            QScrollBar:vertical { border: none; background: transparent; width: 6px; margin: 0px; }
+            QScrollBar:horizontal { border: none; background: transparent; height: 6px; margin: 0px; }
+            
+            QScrollBar::handle:vertical { background: rgba(88, 166, 255, 0.3); border-radius: 3px; min-height: 40px; }
+            QScrollBar::handle:horizontal { background: rgba(88, 166, 255, 0.3); border-radius: 3px; min-width: 40px; }
+            
+            QScrollBar::handle:vertical:hover, QScrollBar::handle:horizontal:hover { background: rgba(88, 166, 255, 0.9); }
+            
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical, 
+            QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0px; height: 0px; }
+            
+            QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical, 
+            QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal { background: none; }
+        """)
     def set_image(self, pixmap):
         self.scene.clear(); self._pixmap_item = self.scene.addPixmap(pixmap)
         self.setSceneRect(self._pixmap_item.boundingRect()); self.fitInView(self.sceneRect(), Qt.KeepAspectRatio)
@@ -4064,7 +4168,25 @@ class VerticalStripViewer(QScrollArea):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWidgetResizable(True)
-        self.setStyleSheet("background: transparent; border: none;")
+        self.setStyleSheet("""
+            QScrollArea { background: transparent; border: none; }
+            QScrollBar:vertical {
+                border: none;
+                background: transparent;
+                width: 6px;
+                margin: 0px 0px 0px 0px;
+            }
+            QScrollBar::handle:vertical {
+                background: rgba(88, 166, 255, 0.3);
+                border-radius: 3px;
+                min-height: 40px;
+            }
+            QScrollBar::handle:vertical:hover {
+                background: rgba(88, 166, 255, 0.9);
+            }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0px; }
+            QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: none; }
+        """)
         self.container = QWidget()
         self.layout = QVBoxLayout(self.container)
         self.layout.setContentsMargins(0, 0, 0, 0)
@@ -4881,6 +5003,12 @@ class vmanVirtualManager(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to clean thumbnails: {e}")
 
+    def show_breadcrumb_menu(self, pos):
+        menu = QMenu(self)
+        act_type = menu.addAction("📍 Type Virtual Address...")
+        if menu.exec(self.breadcrumb_scroll.mapToGlobal(pos)) == act_type:
+            self.prompt_type_address()
+
     def sys_log(self, message):
         timestamp = datetime.now().strftime("%H:%M:%S")
         self.log_console.appendPlainText(f"[{timestamp}] {message}")
@@ -4997,22 +5125,18 @@ class vmanVirtualManager(QMainWindow):
         self.breadcrumb_scroll.setStyleSheet("background: transparent; border: none;")
         self.breadcrumb_scroll.setFixedHeight(40)
         self.breadcrumb_scroll.setWidget(self.breadcrumb)
+        self.breadcrumb_scroll.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.breadcrumb_scroll.customContextMenuRequested.connect(self.show_breadcrumb_menu)
         
         self.local_filter = QLineEdit()
-        self.local_filter.setPlaceholderText("Filter current view instantly...")
+        self.local_filter.setPlaceholderText("Filter ")
         self.local_filter.setMaximumWidth(300)
         self.local_filter.textChanged.connect(self.filter_current_view)
         
         self.search_box = QLineEdit()
-        self.search_box.setPlaceholderText("Global Search (Ctrl+F)...")
+        self.search_box.setPlaceholderText("Global Search")
         self.search_box.setMaximumWidth(300)
         self.search_box.returnPressed.connect(self.run_global_search)
-        
-        self.btn_type_address = QPushButton("📍")
-        self.btn_type_address.setFixedSize(15, 15) # Makes it a small, neat square
-        self.btn_type_address.setToolTip("Type Address / Navigate")
-        self.btn_type_address.clicked.connect(self.prompt_type_address)
-        nav_row.addWidget(self.btn_type_address)
         
         nav_row.addWidget(self.breadcrumb_scroll, stretch=1)
         nav_row.addWidget(self.local_filter)
@@ -5289,7 +5413,9 @@ class vmanVirtualManager(QMainWindow):
             QMessageBox.warning(self, "Protected Files", "One or more selected items are marked as 'Safe' and cannot be deleted physically.\n\nPlease unmark them in the Space Analyzer first.")
             return
 
-        if QMessageBox.question(self, "Physical Deletion", f"WARNING: This will delete {len(items)} items from your REAL hard drive permanently.\n\nAre you sure?", QMessageBox.Yes|QMessageBox.No) != QMessageBox.Yes: return
+        warning_dlg = PhysicalDeleteWarningDialog(len(items), self)
+        if warning_dlg.exec() != QDialog.Accepted:
+            return
         
         deleted = 0
         
@@ -5909,6 +6035,11 @@ Ctrl+C/V/X    : Copy, Paste, Cut (Fully functional across Main and Isolated data
         # Determine state variables
         sel_items = [i for i in self._get_selected_items() if i[2] != -1]
         is_trash = self.current_prefix.startswith("trash://")
+
+        if sel_items:
+            menu.addSeparator()
+            if sel_items[0][0] == "file":
+                menu.addAction("🎞 Open (Ctrl+O)", self.open_selected_vman)
         
         if is_trash:
             menu.addSeparator()
@@ -5963,12 +6094,13 @@ Ctrl+C/V/X    : Copy, Paste, Cut (Fully functional across Main and Isolated data
 
             # --- SYSTEM & MAPPING ---
             sys_menu = menu.addMenu("⚙️ System & Mapping")
+            sys_menu.addAction(f"🧬 Compute SHA-256 for {len(sel_items)} Item(s)", lambda: self.bulk_compute_hash_selected(sel_items))
+            
             if len(sel_items) == 1:
                 if sel_items[0][0] == "folder":
-                    sys_menu.addAction("🧬 Compute SHA-256 for all Contents", lambda: self.bulk_compute_hash(sel_items[0][1]))
                     sys_menu.addAction("🔗 Map THIS Folder to Physical OS", lambda: self.cmd_map_folder(sel_items[0]))
                 sys_menu.addAction("🗺️ Map Parent Drive/Mount (Auto-Detect)", lambda: self.cmd_map_parent_drive(sel_items[0]))
-
+                
             # --- EXPORT ---
             export_menu = menu.addMenu("📤 Export & Extract")
             export_menu.addAction(f"💾 Materialize {len(sel_items)} Items to OS", lambda: self.materialize_to_os(sel_items))
@@ -6434,6 +6566,7 @@ Ctrl+C/V/X    : Copy, Paste, Cut (Fully functional across Main and Isolated data
             menu = QMenu(self)
             act_rename = menu.addAction("✏️ Rename Database")
             act_delete = menu.addAction("🗑️ Delete Database")
+            act_merge = menu.addAction("📥 Merge into Active Database")
             menu.addSeparator()
             act_compare = menu.addAction("⚖️ Compare Drives (Bitrot)")
             
@@ -6479,7 +6612,32 @@ Ctrl+C/V/X    : Copy, Paste, Cut (Fully functional across Main and Isolated data
                         self.sys_log(f"Deleted database '{db_name}'")
                     except Exception as e:
                         QMessageBox.critical(self, "Error", f"Failed to delete: {e}")
-                        
+            
+            elif action == act_merge:
+                if QMessageBox.question(self, "Merge Database", f"Copy all missing files and folders from '{db_name}' into the current database?\n(Your target database will NOT be deleted).", QMessageBox.Yes | QMessageBox.No) == QMessageBox.Yes:
+                    try:
+                        self.db.conn.commit()
+                        cur = self.db.conn.cursor()
+                        try:
+                            cur.execute(f"ATTACH DATABASE '{db_file}' AS source_db")
+                            cols = "parent_path, name, is_folder, real_path, size, extension, modified, color_tag, secondary_name, is_hidden, in_trash, is_favorite, sha256, category, year, month, custom_tags, hash_verified, creation_date"
+                            
+                            # Safely inserts anything where the path + name doesn't already exist
+                            cur.execute(f"""
+                                INSERT INTO virtual_fs ({cols})
+                                SELECT {cols} FROM source_db.virtual_fs 
+                                WHERE source_db.virtual_fs.parent_path || source_db.virtual_fs.name NOT IN (SELECT parent_path || name FROM virtual_fs)
+                            """)
+                            self.db.conn.commit()
+                        finally:
+                            cur.execute("DETACH DATABASE source_db")
+                            
+                        QMessageBox.information(self, "Merge Complete", "Database merged successfully. No original files were deleted.")
+                        self.clear_cache()
+                        self.refresh_all()
+                        self.sys_log(f"Merged isolated database '{db_name}' into active database.")
+                    except Exception as e:
+                        QMessageBox.critical(self, "Merge Error", f"Failed to merge database:\n{e}")
             elif action == act_compare:
                 DriveComparatorDialog(self.active_db_path, str(db_file), self).exec()
 
@@ -6489,15 +6647,28 @@ Ctrl+C/V/X    : Copy, Paste, Cut (Fully functional across Main and Isolated data
         self.clear_cache()
         self.load_directory(self.current_prefix)
         
-    def bulk_compute_hash(self, folder_v_path):
-        self.hash_dlg = QProgressDialog(f"Scanning & Hashing files in {folder_v_path}...", "Cancel", 0, 100, self)
-        self.hash_dlg.setWindowModality(Qt.WindowModal); self.hash_dlg.show()
+    def bulk_compute_hash_selected(self, sel_items):
+        ids_to_hash = []
+        with sqlite3.connect(self.db.path) as conn:
+            for typ, path, db_id in sel_items:
+                if db_id == -1: continue
+                if typ == "file":
+                    ids_to_hash.append(db_id)
+                else:
+                    children = conn.cursor().execute("SELECT id FROM virtual_fs WHERE parent_path LIKE ? AND is_folder=0", (f"{path}%",)).fetchall()
+                    ids_to_hash.extend([c[0] for c in children])
+                    
+        if not ids_to_hash: return QMessageBox.information(self, "Empty", "No files found to hash in selection.")
         
-        self.bulk_hasher = BulkHashCalculator(self.active_db_path, folder_v_path, self)
+        self.hash_dlg = QProgressDialog(f"Scanning & Hashing {len(ids_to_hash)} files...", "Cancel", 0, len(ids_to_hash), self)
+        self.hash_dlg.setWindowModality(Qt.WindowModal); self.hash_dlg.setMinimumDuration(0); self.hash_dlg.show()
+        QApplication.processEvents()
+        
+        self.bulk_hasher = BulkHashCalculator(self.active_db_path, target_ids=ids_to_hash, parent=self)
         self.bulk_hasher.progress.connect(lambda c,t,m: (self.hash_dlg.setMaximum(t), self.hash_dlg.setValue(c), self.hash_dlg.setLabelText(m)))
         self.hash_dlg.canceled.connect(self.bulk_hasher.cancel)
-        self.bulk_hasher.finished.connect(lambda count: (self.hash_dlg.close(), QMessageBox.information(self, "Complete", f"Successfully computed and stored SHA-256 hashes for {count} files.")))
-        self._register_worker(self.bulk_hasher); self.bulk_hasher.start()        
+        self.bulk_hasher.finished.connect(lambda count: (self.hash_dlg.close(), QMessageBox.information(self, "Complete", f"Successfully computed and stored SHA-256 hashes for {count} files."), self.clear_cache(), self.refresh_all()))
+        self._register_worker(self.bulk_hasher); self.bulk_hasher.start()       
 
     def set_storage_capacity(self):
         val, ok = QInputDialog.getDouble(self, "Virtual Capacity", "Enter maximum simulated storage in GB:", self.max_storage_gb, 1.0, 100000.0, 1)
