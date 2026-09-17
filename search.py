@@ -1426,6 +1426,24 @@ class SearchWorker(QThread):
                             lvl = max(0, str(p_path).strip('/').count('/'))
                             if not (lvl_min <= lvl <= lvl_max): continue
 
+                            # --- EXACT NAME EXCLUDING EXTENSION ---
+                            base_name = str(name).rsplit('.', 1)[0].lower() if not is_fldr and '.' in str(name) else str(name).lower()
+                            
+                            # 1. Length Check
+                            if not (self.p['len_min'] <= len(base_name) <= self.p['len_max']): continue
+                            
+                            # 2. Pattern Check
+                            if self.p['name_pattern'] == "Only Numbers (e.g. 12345)":
+                                if not base_name.isdigit(): continue
+                            elif self.p['name_pattern'] == "Hash / Frequent Numbers (e.g. a3c9f...)":
+                                # --- FIXED: Requires at least 16 hex chars only ---
+                                if not (len(base_name) >= 16 and re.fullmatch(r'[a-f0-9]+', base_name)): continue
+                            elif self.p['name_pattern'] == "Name with special symbols":
+                                if not re.search(r'[^a-zA-Z0-9\s_\-]', base_name): continue
+                            elif self.p['name_pattern'] == "Name with alphabets only":
+                                if not re.fullmatch(r'[a-zA-Z\s]+', base_name): continue
+                            # --------------------------------------
+
                             is_match = True
                             if self.p['exts'] and ext_val not in self.p['exts']: is_match = False
                             elif self.p['ex_exts'] and ext_val in self.p['ex_exts']: is_match = False
@@ -1642,9 +1660,28 @@ class AdvancedSearchWindow(QMainWindow):
         to_lbl_lvl = QLabel("to"); to_lbl_lvl.setAlignment(Qt.AlignCenter)
         lvl_lay.addWidget(self.spin_lvl_min); lvl_lay.addWidget(to_lbl_lvl); lvl_lay.addWidget(self.spin_lvl_max)
         
+        # --- ADDED: String Length Filter ---
+        len_lay = QHBoxLayout()
+        self.spin_len_min = QSpinBox(); self.spin_len_min.setRange(0, 999); self.spin_len_min.setValue(0)
+        self.spin_len_max = QSpinBox(); self.spin_len_max.setRange(0, 999); self.spin_len_max.setValue(999)
+        to_lbl_len = QLabel("to"); to_lbl_len.setAlignment(Qt.AlignCenter)
+        len_lay.addWidget(self.spin_len_min); len_lay.addWidget(to_lbl_len); len_lay.addWidget(self.spin_len_max)
+        # -----------------------------------
+        
         f2.addRow("Category:", self.combo_category); f2.addRow("Include Ext:", self.txt_ext)
         f2.addRow("Exclude Ext:", self.txt_exclude_ext); f2.addRow("Skip Names:", self.txt_exclude_name)
-        f2.addRow("Level Range:", lvl_lay)
+        f2.addRow("Folder Level:", lvl_lay)
+        f2.addRow("Name Length:", len_lay) # <-- Added to form
+        # Add right below the name length block you added earlier
+        self.combo_name_pattern = QComboBox()
+        self.combo_name_pattern.addItems([
+            "Any Name Pattern", 
+            "Only Numbers (e.g. 12345)", 
+            "Hash / Frequent Numbers (e.g. a3c9f...)",
+            "Name with special symbols",
+            "Name with alphabets only"
+        ])
+        f2.addRow("Name Pattern:", self.combo_name_pattern)
         filters_h_layout.addWidget(self.card_type)
 
         self.card_metrics = QFrame(); self.card_metrics.setObjectName("FilterCard"); self.card_metrics.setVisible(False)
@@ -1894,6 +1931,40 @@ class AdvancedSearchWindow(QMainWindow):
             self.table.setColumnHidden(7, True) 
             self.table.setColumnHidden(8, True) 
 
+    def show_multi_properties(self, selected_rows):
+        total_size = 0
+        folders = 0
+        files = 0
+        
+        for idx in selected_rows:
+            meta = self.table.item(idx.row(), 9).data(Qt.UserRole)
+            if not meta: continue
+            
+            if meta.get('is_fldr'):
+                folders += 1
+                # Resolve the correct database path
+                db = meta.get('db')
+                db_path = str(Path("vman_data/compiled_views") / f"{db}.db") if db and db != "vman_vfs" else self.active_db
+                
+                try:
+                    with sqlite3.connect(db_path) as conn:
+                        cur = conn.cursor()
+                        v_path = self.table.item(idx.row(), 3).text() + self.table.item(idx.row(), 1).text() + "/"
+                        cnt, sz = cur.execute("SELECT COUNT(id), SUM(size) FROM virtual_fs WHERE parent_path LIKE ? AND is_folder=0 AND in_trash=0", (f"{v_path}%",)).fetchone()
+                        files += cnt or 0
+                        total_size += sz or 0
+                except Exception as e: print(e)
+            else:
+                files += 1
+                total_size += meta.get('size', 0)
+                
+        QMessageBox.information(self, "Multi-Selection Properties", 
+            f"<b>Selected Items:</b> {len(selected_rows)}<br><br>"
+            f"<b>Total Folders:</b> {folders}<br>"
+            f"<b>Total Files:</b> {files}<br>"
+            f"<b>Combined Size:</b> {self.human_size(total_size)}"
+        )
+
     def select_search_databases(self):
         views_dir = Path("vman_data/compiled_views")
         main_db = Path("vman_data/vman_vfs.db")
@@ -1939,6 +2010,7 @@ class AdvancedSearchWindow(QMainWindow):
     def check_lazy_load(self, value):
         if not getattr(self, '_lazy_enabled', False) or self.is_searching or self.is_rendering: return
         scrollbar = self.table.verticalScrollBar()
+        
         if value >= scrollbar.maximum() - 5: 
             current_rows = self.table.rowCount()
             total = len(self.current_results)
@@ -1947,40 +2019,60 @@ class AdvancedSearchWindow(QMainWindow):
                 chunk = self.current_results[current_rows:end_idx]
                 
                 self.table.setUpdatesEnabled(False)
-                for i, (db_id, name, p_path, ext, size, mod, is_fldr, real_path, tags, color_tag, cat_val, sha256_val) in enumerate(chunk):
+                for i, row_data in enumerate(chunk):
                     if self._abort_render: break
                     row = current_rows + i
                     self.table.insertRow(row)
                     
+                    # Unpack 13 items
+                    db_id, name, p_path, ext, size, mod, is_fldr, real_path, tags, color_tag, cat_val, sha256_val, db_label = row_data[:13]
+                    
+                    # Col 0: S.No
                     sno_item = NumericTableItem(str(row + 1)); sno_item.setData(Qt.UserRole, row + 1)
                     self.table.setItem(row, 0, sno_item)
                     
+                    # Col 1: Name
                     name_item = QTableWidgetItem(name)
                     name_item.setIcon(self.get_icon(is_fldr, name, ext, db_id))
                     if color_tag and color_tag in self.VMAN_COLORS: 
                         name_item.setBackground(QBrush(self.VMAN_COLORS[color_tag])) 
                         name_item.setForeground(QColor("#ffffff")) 
                     self.table.setItem(row, 1, name_item)
-                    self.table.setItem(row, 2, QTableWidgetItem(p_path))
                     
+                    # Col 2: Database Origin
+                    db_item = QTableWidgetItem(db_label)
+                    db_item.setForeground(QBrush(QColor("#58a6ff")))
+                    self.table.setItem(row, 2, db_item)
+
+                    # Col 3: Virtual Path
+                    self.table.setItem(row, 3, QTableWidgetItem(p_path))
+                    
+                    # Col 4: Type
                     type_str = "Folder" if is_fldr else (ext[1:].upper() + " File" if ext.startswith(".") else (ext.upper() + " File" if ext else "File"))
-                    self.table.setItem(row, 3, QTableWidgetItem(type_str))
+                    self.table.setItem(row, 4, QTableWidgetItem(type_str))
                     
+                    # Col 5: Size
                     sz_str = "--" if is_fldr else self.human_size(size)
                     sz_item = NumericTableItem(sz_str); sz_item.setData(Qt.UserRole, size if not is_fldr else -1)
-                    self.table.setItem(row, 4, sz_item)
-                    self.table.setItem(row, 5, QTableWidgetItem(str(mod)))
+                    self.table.setItem(row, 5, sz_item)
                     
+                    # Col 6: Mod Date
+                    self.table.setItem(row, 6, QTableWidgetItem(str(mod)))
+                    
+                    # Col 7: Labels
                     eff_tag = tags if tags else self.inherited_tags.get(db_id, "")
-                    self.table.setItem(row, 6, QTableWidgetItem(str(eff_tag) if eff_tag else ""))
+                    self.table.setItem(row, 7, QTableWidgetItem(str(eff_tag) if eff_tag else ""))
                     
+                    # Col 8: SHA
                     sha_item = QTableWidgetItem(str(sha256_val) if sha256_val else "--")
                     sha_item.setForeground(QColor("#8b949e"))
-                    self.table.setItem(row, 7, sha_item)
+                    self.table.setItem(row, 8, sha_item)
                     
+                    # Col 9: Meta Data
                     meta_item = QTableWidgetItem("")
-                    meta_item.setData(Qt.UserRole, {'id': db_id, 'is_fldr': is_fldr, 'real_path': real_path, 'tags': eff_tag, 'size': size, 'mod': mod, 'name': name})
-                    self.table.setItem(row, 8, meta_item)
+                    meta_item.setData(Qt.UserRole, {'id': db_id, 'is_fldr': is_fldr, 'real_path': real_path, 'tags': eff_tag, 'size': size, 'mod': mod, 'name': name, 'ext': ext, 'cat': cat_val, 'db': db_label})
+                    self.table.setItem(row, 9, meta_item)
+                    
                 self.table.setUpdatesEnabled(True)
 
     def is_typing(self):
@@ -2053,7 +2145,7 @@ class AdvancedSearchWindow(QMainWindow):
         self._show_highlight_dialog = False
 
     def reset_filters(self):
-        self.chart_filter = None  # <-- Add this line
+        self.chart_filter = None 
         self.txt_name.clear()
         self.txt_path.clear()
         self.txt_search_tags.clear()
@@ -2071,6 +2163,12 @@ class AdvancedSearchWindow(QMainWindow):
         self.chk_day_range.setChecked(False)
         self.spin_lvl_min.setValue(0)
         self.spin_lvl_max.setValue(999)
+        
+        # --- NEW RESETS ---
+        self.spin_len_min.setValue(0)
+        self.spin_len_max.setValue(999)
+        if hasattr(self, 'combo_name_pattern'):
+            self.combo_name_pattern.setCurrentIndex(0)
 
     def apply_local_filter(self):
         name_path_text = self.local_filter_input.text().lower()
@@ -2324,6 +2422,13 @@ class AdvancedSearchWindow(QMainWindow):
         
         act_refresh = menu.addAction("🔄 Refresh Entire Search Engine")
         act_refresh.triggered.connect(self.trigger_search)
+        
+        # --- FAST MODE MOVED HERE ---
+        act_fast = menu.addAction("⚡ Fast Mode (Disable Visual Maps)")
+        act_fast.setCheckable(True)
+        act_fast.setChecked(self.fast_mode)
+        act_fast.toggled.connect(self.toggle_fast_mode)
+        # ----------------------------
         
         menu.addSeparator()
         
@@ -2713,6 +2818,9 @@ class AdvancedSearchWindow(QMainWindow):
             'day_end': self.combo_day_end.currentText(),
             'lvl_min': self.spin_lvl_min.value(),
             'lvl_max': self.spin_lvl_max.value(),
+            'len_min': self.spin_len_min.value(),
+            'len_max': self.spin_len_max.value(),
+            'name_pattern': getattr(self, 'combo_name_pattern', QComboBox()).currentText(), # <-- Add this line
             'unique_patterns': getattr(self.chk_unique, 'isChecked', lambda: False)(),
             'verbose': self.verbose_telemetry,
             'db': self.active_db,
@@ -3091,70 +3199,68 @@ class AdvancedSearchWindow(QMainWindow):
         if not item: return
         
         row = item.row()
-        
-        i_name = self.table.item(row, 1)
-        i_vpath = self.table.item(row, 3) # <-- Changed from 2 to 3
-        i_meta = self.table.item(row, 9)  # <-- Changed from 8 to 9
-        
+        i_name = self.table.item(row, 1); i_vpath = self.table.item(row, 3); i_meta = self.table.item(row, 9) 
         if not i_name or not i_vpath or not i_meta: return
         
-        name = i_name.text()
-        v_path = i_vpath.text()
+        name = i_name.text(); v_path = i_vpath.text()
         meta = i_meta.data(Qt.UserRole)
-        
         if not meta: return
 
         selected_rows = self.table.selectionModel().selectedRows()
         
         menu = QMenu(self)
         
+        # --- RESTORED FILTER VIEW ---
         view_menu = menu.addMenu("👁️ Filter View")
         for mode in ["Files & Folders", "Files Only", "Folders Only"]:
             act = view_menu.addAction(mode)
             act.setCheckable(True)
             act.setChecked(self.table_view_mode == mode)
             act.triggered.connect(lambda checked=False, m=mode: self.set_table_view_mode(m))
-            
         menu.addSeparator()
+        # ----------------------------
         
         act_open_os = menu.addAction("🚀 Open Native OS Default")
         act_show_os = menu.addAction("📂 Show in OS Explorer")
         
-        act_vman = None
         if len(selected_rows) > 1:
             act_vman = menu.addAction(f"🎞 Open {len(selected_rows)} Highlighted in VMan Viewer")
         elif not meta['is_fldr']:
             act_vman = menu.addAction("🎞 Open in VMan Viewer")
+        else: act_vman = None
             
         menu.addSeparator()
         
-        color_menu = menu.addMenu("🎨 Set Color Tag")
+        # --- BULK COLORS AND TAGS ---
+        color_menu = menu.addMenu("🎨 Set Color Tag (Highlighted)")
         for color in ["None", "Red", "Orange", "Gold", "Green", "Cyan", "Blue", "Purple", "Pink"]:
-            act = color_menu.addAction(color)
-            act.triggered.connect(lambda checked=False, c=color, r=row, mid=meta['id'], is_f=meta['is_fldr'], nm=name: self.set_color_tag(r, mid, c, is_f, nm))
+            color_menu.addAction(color).triggered.connect(lambda checked=False, c=color: self.bulk_set_color(c, selected_rows))
             
+        menu.addAction("🏷️ Assign Custom Text Tags (Highlighted)").triggered.connect(lambda: self.bulk_set_tags(selected_rows))
+        
         menu.addSeparator()
         
+        # --- SEND TO DATABASE ---
+        send_menu = menu.addMenu("📤 Send Highlighted To Database...")
+        db_list = list(Path("vman_data/compiled_views").glob("*.db"))
+        for db_file in db_list:
+            if str(db_file.resolve()) != str(Path(self.active_db).resolve()):
+                send_menu.addAction(db_file.stem).triggered.connect(lambda checked=False, tgt=db_file: self.send_to_database(tgt, selected_rows))
+        
+        menu.addSeparator()
         act_copy_names = menu.addAction("📋 Copy Selected Names")
         act_csv = menu.addAction("📥 Export Selected to CSV")
         menu.addSeparator()
         
         act_nav = menu.addAction("🎯 Locate in Virtual File Manager")
         act_copy = menu.addAction("📋 Copy Virtual Path")
-        menu.addSeparator()
-        act_tags = menu.addAction("🏷️ Edit Text Tags")
-        act_props = menu.addAction("ℹ️ Properties")
+        if len(selected_rows) > 1:
+            act_props = menu.addAction("ℹ️ Multi-Item Properties")
+        else:
+            act_props = menu.addAction("ℹ️ Properties")
         
         menu.addSeparator()
-        
-        act_fix_ts = menu.addAction("🕰️ Fix Timestamps (Forensic Extractor)")
-        act_fix_ts.triggered.connect(self.run_timestamp_corrector)
-        
-        menu.addSeparator()
-        act_fast = menu.addAction("⚡ Fast Mode (Disable Visual Maps)")
-        act_fast.setCheckable(True)
-        act_fast.setChecked(self.fast_mode)
-        act_fast.toggled.connect(self.toggle_fast_mode)
+        menu.addAction("🕰️ Fix Timestamps (Forensic Extractor)").triggered.connect(self.run_timestamp_corrector)
         
         action = menu.exec(self.table.viewport().mapToGlobal(pos))
         
@@ -3163,11 +3269,9 @@ class AdvancedSearchWindow(QMainWindow):
         elif action == act_vman:
             playlist = []
             for idx in selected_rows:
-                m = self.table.item(idx.row(), 9).data(Qt.UserRole) # <-- Changed from 8 to 9
+                m = self.table.item(idx.row(), 9).data(Qt.UserRole)
                 if not m or not m.get('is_fldr', True) and m.get('real_path') and os.path.exists(m['real_path']):
-                    n = self.table.item(idx.row(), 1).text()
-                    e = os.path.splitext(m['real_path'])[1].lower()
-                    playlist.append({'path': m['real_path'], 'name': n, 'ext': e})
+                    playlist.append({'path': m['real_path'], 'name': self.table.item(idx.row(), 1).text(), 'ext': os.path.splitext(m['real_path'])[1].lower()})
             if playlist:
                 try:
                     from main import vmanViewer
@@ -3177,18 +3281,74 @@ class AdvancedSearchWindow(QMainWindow):
                     parent.active_viewers.append(viewer)
                     viewer.show()
                 except Exception as e: print(e)
-            else:
-                QMessageBox.warning(self, "Viewer", "No valid physical files selected.")
+            else: QMessageBox.warning(self, "Viewer", "No valid physical files selected.")
         elif action == act_copy_names:
             names = [self.table.item(idx.row(), 1).text() for idx in selected_rows if self.table.item(idx.row(), 1)]
             QApplication.clipboard().setText("\n".join(names))
-            QMessageBox.information(self, "Copied", f"Copied {len(names)} names to clipboard.")
-        elif action == act_csv:
-            self.export_table_to_csv(selected_rows)
+        elif action == act_csv: self.export_table_to_csv(selected_rows)
         elif action == act_nav: self.navigate_to_item(row)
         elif action == act_copy: QApplication.clipboard().setText(f"{v_path}{name}/" if meta['is_fldr'] else f"{v_path}{name}")
-        elif action == act_tags: self.edit_tags(row, name, meta)
-        elif action == act_props: self.show_properties(name, v_path, meta)
+        elif action == act_props: 
+            if len(selected_rows) > 1:
+                self.show_multi_properties(selected_rows)
+            else:
+                self.show_properties(name, v_path, meta)
+
+    def bulk_set_color(self, color, selected_rows):
+        for idx in selected_rows:
+            meta = self.table.item(idx.row(), 9).data(Qt.UserRole)
+            db = meta.get('db')
+            if not db: continue
+            db_path = str(Path("vman_data/compiled_views") / f"{db}.db") if db != "vman_vfs" else "vman_data/vman_vfs.db"
+            try:
+                with sqlite3.connect(db_path) as conn:
+                    conn.cursor().execute("UPDATE virtual_fs SET color_tag=? WHERE id=?", ("" if color=="None" else color, meta['id']))
+                    conn.commit()
+                # Update UI instantly
+                item = self.table.item(idx.row(), 1)
+                if color in self.VMAN_COLORS:
+                    item.setBackground(QBrush(self.VMAN_COLORS[color]))
+                    item.setForeground(QColor("#ffffff"))
+                else:
+                    item.setData(Qt.BackgroundRole, None)
+                    item.setData(Qt.ForegroundRole, None)
+            except Exception as e: print(f"DB Error: {e}")
+        if self.main_app: self.main_app.refresh_all()
+
+    def bulk_set_tags(self, selected_rows):
+        tags, ok = QInputDialog.getText(self, "Apply Tags", "Enter custom tags (comma separated):")
+        if not ok or not tags.strip(): return
+        
+        for idx in selected_rows:
+            meta = self.table.item(idx.row(), 9).data(Qt.UserRole)
+            db = meta.get('db')
+            if not db: continue
+            db_path = str(Path("vman_data/compiled_views") / f"{db}.db") if db != "vman_vfs" else "vman_data/vman_vfs.db"
+            try:
+                with sqlite3.connect(db_path) as conn:
+                    old_tags = conn.cursor().execute("SELECT custom_tags FROM virtual_fs WHERE id=?", (meta['id'],)).fetchone()[0]
+                    new_val = f"{old_tags}, {tags.strip()}".strip(", ") if old_tags else tags.strip()
+                    conn.cursor().execute("UPDATE virtual_fs SET custom_tags=? WHERE id=?", (new_val, meta['id']))
+                    conn.commit()
+                # Update UI
+                meta['tags'] = new_val
+                self.table.item(idx.row(), 9).setData(Qt.UserRole, meta)
+                self.table.item(idx.row(), 7).setText(new_val)
+            except Exception as e: print(e)
+        if self.main_app: self.main_app.refresh_all()
+
+    def send_to_database(self, target_db_path, selected_rows):
+        if not self.main_app or not hasattr(self.main_app, 'send_to_database'):
+            return QMessageBox.warning(self, "Error", "Main application engine not linked.")
+        
+        items_to_send = []
+        for idx in selected_rows:
+            meta = self.table.item(idx.row(), 9).data(Qt.UserRole)
+            typ = "folder" if meta['is_fldr'] else "file"
+            v_path = self.table.item(idx.row(), 3).text()
+            items_to_send.append((typ, v_path, meta['id']))
+            
+        self.main_app.send_to_database(target_db_path, items_to_send)
 
     def run_timestamp_corrector(self):
         selected_rows = self.table.selectionModel().selectedRows()
