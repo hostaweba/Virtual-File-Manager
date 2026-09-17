@@ -24,7 +24,7 @@ from PySide6.QtWidgets import (
     QLineEdit, QComboBox, QTableView, QHeaderView, QMenu, QAbstractItemView, 
     QStatusBar, QSizePolicy, QFormLayout, QDockWidget, QToolButton,
     QStackedWidget, QListView, QTabWidget, QSlider, QStyle, QGraphicsOpacityEffect, 
-    QScrollArea, QDialog, QGraphicsView, QGraphicsScene, QTextBrowser, QTabBar,
+    QScrollArea, QDialog, QGraphicsView, QGraphicsScene, QTextBrowser, 
     QTableWidget, QTableWidgetItem, QCheckBox, QCalendarWidget, QSpinBox, QDoubleSpinBox, 
     QGridLayout, QFrame, QSplitter, QListWidget, QListWidgetItem, QGroupBox, QFormLayout, QProgressBar
 )
@@ -89,6 +89,8 @@ from database import vmanDB, SMART_PROTOCOLS
 from splash import PremiumSplash  
 from console import VManConsole
 from jobs import ExtraFeaturesDialog
+from floating_widgets import FloatingClock, FloatingNotepad, FloatingQuickText, FloatingQuotes
+from usage_logger import UsageLogDialog
 
 # ---------------- Constants & Themes ----------------
 APP_TITLE = "VMan"
@@ -1659,21 +1661,14 @@ class TagListWidget(QListWidget):
             super().keyPressEvent(event)
 
     def contextMenuEvent(self, event):
-        items = self.selectedItems()
-        if not items: return
+        item = self.itemAt(event.pos())
+        if not item: return
         menu = QMenu(self)
-        
-        if len(items) == 1:
-            act_edit = menu.addAction("✏️ Edit Tag Globally")
-        else: act_edit = None
-            
-        act_del = menu.addAction(f"🗑️ Delete {len(items)} Tag(s) Globally")
+        act_edit = menu.addAction("✏️ Edit Tag Globally")
+        act_del = menu.addAction("🗑️ Delete Tag Globally")
         action = menu.exec(self.mapToGlobal(event.pos()))
-        
-        if act_edit and action == act_edit: self.parent_dialog.edit_global_tag(items[0].text())
-        elif action == act_del:
-            tags_to_delete = [i.text() for i in items]
-            self.parent_dialog.delete_multiple_global_tags(tags_to_delete)
+        if action == act_edit: self.parent_dialog.edit_global_tag(item.text())
+        elif action == act_del: self.parent_dialog.delete_global_tag(item.text())
 
 class ColumnListWidget(QListWidget):
     def __init__(self, level_index, parent_dialog):
@@ -1709,36 +1704,54 @@ class vmanTagLibraryDialog(QDialog):
         self.main_app = parent
         self.tag_cache = {}  
         self.base_v_path = "/" 
-        
-        # Strictly enforce exactly these 5 levels, ignoring past history
-        self.hierarchy_levels = ["Parent Folder", "Level 1", "Level 2", "Level 3", "Level 4"]
+
+        # --- 1. Load Custom Names Persistently ---
+        self.settings = QSettings("vmanOS", "TagLibraryConfig")
+        saved_levels = self.settings.value("hierarchy_levels")
+        if saved_levels:
+            self.hierarchy_levels = list(saved_levels)
+        else:
+            self.hierarchy_levels = ["Parent Folder", "Level 1", "Level 2", "Level 3", "Level 4", "Level 5"]
             
+        self.l0_name = self.hierarchy_levels[0] if len(self.hierarchy_levels) > 0 else "Parent Folder"
+        self.l1_name = self.hierarchy_levels[1] if len(self.hierarchy_levels) > 1 else "Level 1"
+        self.l2_name = self.hierarchy_levels[2] if len(self.hierarchy_levels) > 2 else "Level 2"
+        self.l3_name = self.hierarchy_levels[3] if len(self.hierarchy_levels) > 3 else "Level 3"
+        self.l4_name = self.hierarchy_levels[4] if len(self.hierarchy_levels) > 4 else "Level 4"
+        
         self.setWindowTitle("Universal Tag Engine & Analytics")
         self.resize(1300, 800)
         self.setWindowFlags(self.windowFlags() | Qt.WindowMaximizeButtonHint | Qt.WindowMinimizeButtonHint)
         
-        # --- FIX: Disconnect from OS Theme & Force Dark Mode Deeply ---
-        self.setStyleSheet(THEMES["Dark"])
-        self.setAutoFillBackground(True)
-        p = self.palette(); p.setColor(self.backgroundRole(), QColor("#0d1117")); self.setPalette(p)
+        # --- FIX: AGGRESSIVE OS THEME ISOLATION ---
+        # The wildcard '*' forces every nested component to obey the dark theme.
+        self.setStyleSheet("""
+            * { background-color: #0d1117; color: #c9d1d9; }
+            QDialog { background-color: #0d1117; color: #c9d1d9; }
+            QLabel { background-color: transparent; color: #c9d1d9; }
+            QLineEdit, QComboBox, QSpinBox { background-color: #161b22; color: #c9d1d9; border: 1px solid #30363d; border-radius: 4px; padding: 4px; }
+            QPushButton { background-color: #21262d; color: #c9d1d9; border: 1px solid #30363d; border-radius: 4px; padding: 5px; }
+            QPushButton:hover { background-color: #30363d; border-color: #8b949e; }
+            QListWidget { background-color: #161b22; color: #c9d1d9; border: 1px solid #30363d; border-radius: 4px; outline: 0; }
+            QListWidget::item:selected { background-color: #1f6feb; color: white; }
+            QScrollArea, QScrollArea > QWidget > QWidget { background-color: #0d1117; border: none; }
+            QSplitter::handle { background-color: #30363d; }
+            QTabWidget::pane { background-color: #0d1117; border: 1px solid #30363d; }
+            QTabBar::tab { background: #161b22; color: #8b949e; padding: 10px 15px; border: 1px solid #30363d; border-top-left-radius: 4px; border-top-right-radius: 4px; }
+            QTabBar::tab:selected { background: #0d1117; color: #58a6ff; font-weight: bold; border-bottom: 2px solid #58a6ff; }
+            QProgressBar { border: 1px solid #30363d; border-radius: 4px; text-align: center; background-color: #161b22; color: white; }
+            QProgressBar::chunk { background-color: #58a6ff; }
+        """)
 
         self._build_toolbar()
         self.main_layout = QVBoxLayout(self)
         self.main_layout.addLayout(self.top_toolbar)
         
-        # --- Master Tab Widget with Smooth Drag Scrolling ---
         self.tabs = QTabWidget()
-        self.tabs.setTabBar(DragScrollTabBar()) # Inject custom drag-scroll bar
-        self.tabs.setStyleSheet("""
-            QTabBar::tab { background: #161b22; color: #8b949e; padding: 10px 15px; border: 1px solid #30363d; border-top-left-radius: 4px; border-top-right-radius: 4px; margin-right: 2px;}
-            QTabBar::tab:selected { background: #0d1117; color: #58a6ff; font-weight: bold; border-bottom: 2px solid #58a6ff; }
-            QTabWidget::pane { border: 1px solid #30363d; top: -1px; background: #0d1117; }
-        """)
         self.main_layout.addWidget(self.tabs, stretch=1)
 
-        # Tab 1: Original Browser UI
+        # Tab 1: Browser UI
         self.browser_tab = QWidget()
-        self.browser_tab.setStyleSheet("background-color: #0d1117; color: #c9d1d9;") # Enforce Dark Mode on children
         self.browser_layout = QVBoxLayout(self.browser_tab)
         self.browser_layout.setContentsMargins(0,0,0,0)
 
@@ -1746,23 +1759,20 @@ class vmanTagLibraryDialog(QDialog):
         self.column_scroll_area = QScrollArea()
         self.column_scroll_area.setWidgetResizable(True)
         self.column_scroll_area.setFrameShape(QScrollArea.NoFrame)
-        self.column_scroll_area.setStyleSheet("background-color: transparent;")
-        
         self.column_scroll_widget = QWidget()
-        self.column_scroll_widget.setStyleSheet("background-color: #0d1117;")
         self.column_container_layout = QHBoxLayout(self.column_scroll_widget)
         self.column_container_layout.setAlignment(Qt.AlignLeft)
         self.column_scroll_area.setWidget(self.column_scroll_widget)
 
         self.tag_search_box = QLineEdit(); self.tag_search_box.setPlaceholderText("Search tags...")        
-        self.tag_list = TagListWidget(self)   
-        
-        # Enable Shift-Click Multi Select for Tags
-        self.tag_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
-             
+        self.tag_list = TagListWidget(self)        
         self.tag_list.itemClicked.connect(self.on_tag_clicked)
         self.tag_list.itemDoubleClicked.connect(lambda item: self.main_app.nav_to_path(f"tags://{item.text()}/") if self.main_app else None)
         self.tag_search_box.textChanged.connect(lambda text: self._filter_list(self.tag_list, text))
+        
+        self.tag_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.tag_list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.tag_list.customContextMenuRequested.connect(self.show_tag_context_menu)
         
         tag_widget = QWidget()
         tag_layout = QVBoxLayout(tag_widget)
@@ -1777,57 +1787,120 @@ class vmanTagLibraryDialog(QDialog):
         self.main_splitter.setStretchFactor(1, 1)
         self.browser_layout.addWidget(self.main_splitter)
         
-        self.tabs.addTab(self.browser_tab, "📂 Library")
+        self.tabs.addTab(self.browser_tab, "📂 Library Browser")
 
-        # --- FIX: Dashboard Tab with ScrollBar ---
+        # Tabs 2+: Dynamic Analytics Engine
         self.dashboard_tab = QWidget()
-        self.dashboard_tab.setStyleSheet("background-color: #0d1117;")
         self.dashboard_layout = QGridLayout(self.dashboard_tab)
+        self.tabs.addTab(self.dashboard_tab, "🏠 Executive Dashboard")
         
-        self.dash_scroll = QScrollArea()
-        self.dash_scroll.setWidgetResizable(True)
-        self.dash_scroll.setFrameShape(QScrollArea.NoFrame)
-        self.dash_scroll.setWidget(self.dashboard_tab)
-        self.tabs.addTab(self.dash_scroll, "🏠 Dashboard")
+        self.tag_chart_tab = PaginatingChartWidget("Tag Frequency & Distribution", self)
+        self.tabs.addTab(self.tag_chart_tab, "🏷 Tag Analytics")
         
-        # Tabs 2+: Built-in Analytics 
-        self.tag_chart_tab = PaginatingChartWidget("Tag Frequency", self)
-        self.tabs.addTab(self.tag_chart_tab, "🏷 Tags")
+        # FIX: Dynamic Level Chart Array to support infinite tabs
+        self.level_chart_tabs = []
+        self.current_max_level = 4
         
-        # Dynamically generate clean named tabs
-        for i, level_name in enumerate(self.hierarchy_levels):
-            chart_tab = PaginatingChartWidget(f"Volume by {level_name}", self)
-            setattr(self, f"l{i}_chart_tab", chart_tab)
-            self.tabs.addTab(chart_tab, f"🗂 {level_name}")
+        for i in range(self.current_max_level + 1):
+            title = self.hierarchy_levels[i] if i < len(self.hierarchy_levels) else f"Level {i}"
+            tab = PaginatingChartWidget(f"Volume by {title}", self)
+            self.tabs.addTab(tab, f"📈 {title} Analytics")
+            self.level_chart_tabs.append(tab)
 
-        # --- NEW: Dynamic Tab Creator Button (+) ---
-        self.btn_add_tab = QPushButton("+")
-        self.btn_add_tab.setCursor(Qt.PointingHandCursor)
-        self.btn_add_tab.setToolTip("Add Next Hierarchy Level Analytics")
-        self.btn_add_tab.setStyleSheet("background-color: transparent; border: none; font-size: 20px; font-weight: bold; color: #3fb950; padding: 0 10px;")
-        self.btn_add_tab.clicked.connect(self.add_dynamic_level_tab)
-        self.tabs.setCornerWidget(self.btn_add_tab, Qt.TopRightCorner)
+        self.btn_add_level = QPushButton("➕")
+        self.btn_add_level.setStyleSheet("QPushButton { background: transparent; color: #3fb950; font-weight: bold; border: none; padding: 5px 15px; } QPushButton:hover { background: #30363d; border-radius: 4px; }")
+        self.btn_add_level.setCursor(Qt.PointingHandCursor)
+        self.tabs.setCornerWidget(self.btn_add_level, Qt.TopRightCorner)
+        self.btn_add_level.clicked.connect(self.generate_next_level_tab)
 
         self.dynamic_lists = [] 
         self._populate_base_contexts()
         self.refresh_memory_cache()
         self._setup_shortcuts()
 
-    def add_dynamic_level_tab(self):
-        new_level_idx = len(self.hierarchy_levels)
-        new_name = f"Level {new_level_idx}"
-        self.hierarchy_levels.append(new_name)
+    def create_dark_progress(self, title, label, max_val):
+        prog = QProgressDialog(label, "Cancel", 0, max_val, self)
+        prog.setWindowTitle(title)
+        prog.setWindowModality(Qt.WindowModal)
+        prog.setMinimumDuration(0)
         
-        new_chart_tab = PaginatingChartWidget(f"Volume by {new_name}", self)
-        setattr(self, f"l{new_level_idx}_chart_tab", new_chart_tab)
-        self.tabs.addTab(new_chart_tab, f"📑 {new_name}")
+        # --- NEW: Strip native OS frame rendering to prevent white box flashes ---
+        prog.setWindowFlags(Qt.Dialog | Qt.CustomizeWindowHint | Qt.WindowTitleHint)
         
-        self.update_analytics_data() # Force UI Re-calculation
+        prog.setStyleSheet("""
+            QDialog { background-color: #0d1117; color: #c9d1d9; border: 1px solid #30363d; }
+            QLabel { background-color: transparent; color: #c9d1d9; font-weight: bold; }
+            QProgressBar { border: 1px solid #30363d; border-radius: 4px; text-align: center; background-color: #161b22; color: white; height: 20px; }
+            QProgressBar::chunk { background-color: #58a6ff; }
+            QPushButton { background-color: #21262d; color: #c9d1d9; border: 1px solid #30363d; border-radius: 4px; padding: 5px; width: 80px; }
+            QPushButton:hover { background-color: #30363d; border-color: #8b949e; }
+        """)
+        prog.setAutoFillBackground(True)
+        return prog
+
+    def generate_next_level_tab(self):
+        self.current_max_level += 1
+        level_num = self.current_max_level
+        title = self.hierarchy_levels[level_num] if level_num < len(self.hierarchy_levels) else f"Level {level_num}"
+        
+        new_chart_tab = PaginatingChartWidget(f"Volume by {title}", self)
+        self.tabs.addTab(new_chart_tab, f"📈 {title} Analytics")
+        self.level_chart_tabs.append(new_chart_tab)
+        
+        QMessageBox.information(self, "Level Added", f"'{title}' Analytics Tab generated!\n\nIt will populate automatically upon the next data refresh.")
+
+    def show_tag_context_menu(self, pos):
+        items = self.tag_list.selectedItems()
+        if not items: return
+        
+        menu = QMenu(self)
+        menu.setStyleSheet("background-color: #161b22; color: white; border: 1px solid #30363d;")
+        if len(items) == 1: act_edit = menu.addAction("✏️ Edit Tag Globally")
+        else: act_edit = None
+            
+        act_del = menu.addAction(f"🗑️ Delete {len(items)} Tag(s) Globally")
+        action = menu.exec(self.tag_list.viewport().mapToGlobal(pos))
+        
+        if act_edit and action == act_edit: self.edit_global_tag(items[0].text())
+        elif action == act_del:
+            tags_to_delete = [item.text() for item in items]
+            self.delete_multiple_global_tags(tags_to_delete)
+
+    def delete_multiple_global_tags(self, target_tags):
+        if QMessageBox.question(self, "Delete Tags", f"Remove {len(target_tags)} tags from ALL files?", QMessageBox.Yes|QMessageBox.No) != QMessageBox.Yes: return
+        prog = self.create_dark_progress("Deleting Tags", "Scanning database for tags...", len(target_tags))
+        prog.show()
+        
+        # --- NEW: Force UI to instantly paint ---
+        QApplication.processEvents()
+        
+        with sqlite3.connect(self.db_path) as conn:
+            cur = conn.cursor()
+            for i, target_tag in enumerate(target_tags):
+                prog.setValue(i); prog.setLabelText(f"Removing '{target_tag}'..."); QApplication.processEvents()
+                if prog.wasCanceled(): break
+                cur.execute("SELECT id, custom_tags FROM virtual_fs WHERE custom_tags LIKE ?", (f"%{target_tag}%",))
+                for db_id, tags in cur.fetchall():
+                    tag_list = [t.strip() for t in tags.split(',')]
+                    if target_tag in tag_list:
+                        tag_list.remove(target_tag)
+                        cur.execute("UPDATE virtual_fs SET custom_tags=? WHERE id=?", (", ".join(tag_list), db_id))
+            conn.commit()
+            
+        prog.setValue(len(target_tags)); prog.close()
+        self.refresh_memory_cache()
 
     def edit_global_tag(self, old_tag):
         new_tag, ok = QInputDialog.getText(self, "Edit Tag", f"Rename '{old_tag}' to:")
         if not ok or not new_tag.strip() or new_tag.strip() == old_tag: return
         new_tag = new_tag.strip()
+        
+        prog = self.create_dark_progress("Editing Tag", f"Renaming '{old_tag}'...", 0)
+        prog.show()
+        
+        # --- NEW: Force UI to instantly paint the dark theme BEFORE the DB locks ---
+        QApplication.processEvents() 
+        
         with sqlite3.connect(self.db_path) as conn:
             cur = conn.cursor()
             cur.execute("SELECT id, custom_tags FROM virtual_fs WHERE custom_tags LIKE ?", (f"%{old_tag}%",))
@@ -1837,20 +1910,8 @@ class vmanTagLibraryDialog(QDialog):
                     tag_list = [new_tag if t == old_tag else t for t in tag_list]
                     cur.execute("UPDATE virtual_fs SET custom_tags=? WHERE id=?", (", ".join(tag_list), db_id))
             conn.commit()
-        self.refresh_memory_cache()
-
-    def delete_multiple_global_tags(self, target_tags):
-        if QMessageBox.question(self, "Delete Tags", f"Remove {len(target_tags)} tags from ALL files?", QMessageBox.Yes|QMessageBox.No) != QMessageBox.Yes: return
-        with sqlite3.connect(self.db_path) as conn:
-            cur = conn.cursor()
-            for target_tag in target_tags:
-                cur.execute("SELECT id, custom_tags FROM virtual_fs WHERE custom_tags LIKE ?", (f"%{target_tag}%",))
-                for db_id, tags in cur.fetchall():
-                    tag_list = [t.strip() for t in tags.split(',')]
-                    if target_tag in tag_list:
-                        tag_list.remove(target_tag)
-                        cur.execute("UPDATE virtual_fs SET custom_tags=? WHERE id=?", (", ".join(tag_list), db_id))
-            conn.commit()
+            
+        prog.close()
         self.refresh_memory_cache()
 
     def delete_global_tag(self, target_tag):
@@ -1863,46 +1924,41 @@ class vmanTagLibraryDialog(QDialog):
     def _build_toolbar(self):
         self.top_toolbar = QHBoxLayout()
         self.top_toolbar.addWidget(QLabel("<b>Base View:</b>"))
-        
         self.combo_base = QComboBox()
         self.combo_base.setEditable(True)
         self.combo_base.setMinimumWidth(180)
         self.combo_base.currentTextChanged.connect(self.change_base_context)
         self.top_toolbar.addWidget(self.combo_base)
-        
-        self.btn_map_global = QPushButton("🔗 Map to OS")
+        self.btn_map_global = QPushButton("🔗 Map View to OS Folder")
         self.btn_map_global.setStyleSheet("font-weight: bold; color: #58a6ff;")
         self.btn_map_global.clicked.connect(self.map_global_base_to_os)
         self.top_toolbar.addWidget(self.btn_map_global)
-        
         self.top_toolbar.addStretch() 
-        
         self.radio_folders = QRadioButton("Dirs")
         self.radio_files = QRadioButton("Files")
         self.radio_folders.setChecked(True)
-        
         self.global_search_box = QLineEdit()
         self.global_search_box.setPlaceholderText("Global Search ...")
         self.global_search_box.setFixedWidth(250)
-        
         self.btn_search = QPushButton("🔍")
         self.btn_search.clicked.connect(lambda: self.run_global_search(self.global_search_box.text()))
-        
         self.top_toolbar.addWidget(self.radio_folders)
         self.top_toolbar.addWidget(self.radio_files)
         self.top_toolbar.addWidget(self.global_search_box)
         self.top_toolbar.addWidget(self.btn_search)
-        
         self.global_search_box.returnPressed.connect(lambda: self.run_global_search(self.global_search_box.text()))
         self.radio_folders.toggled.connect(lambda: self.run_global_search(self.global_search_box.text()))
-        
         btn_refresh = QPushButton("🔄 Refresh")
         btn_refresh.clicked.connect(self.full_refresh)
-        
-        self.btn_export = QPushButton("📤 Export CSV")
+        self.btn_config = QPushButton("⚙️ Custom Names")
+        self.btn_config.clicked.connect(self.configure_hierarchy)
+        self.btn_import = QPushButton("📥 Import")
+        self.btn_import.clicked.connect(self.import_csv)
+        self.btn_export = QPushButton("📤 Export")
         self.btn_export.clicked.connect(self.export_csv)
-
         self.top_toolbar.addWidget(btn_refresh)
+        self.top_toolbar.addWidget(self.btn_config)
+        self.top_toolbar.addWidget(self.btn_import)
         self.top_toolbar.addWidget(self.btn_export)
 
     def full_refresh(self):
@@ -1910,16 +1966,21 @@ class vmanTagLibraryDialog(QDialog):
             col = self.dynamic_lists.pop()
             col['widget'].setParent(None)
             col['widget'].deleteLater()
-            
         self.tag_cache.clear()
         self.tag_list.blockSignals(True)
         self.tag_list.clear()
         self.tag_search_box.clear()
-        
         self.refresh_memory_cache()
         self._populate_base_contexts()
         self.tag_list.blockSignals(False)
-        QMessageBox.information(self, "Refreshed", "Tag Library data has been fully synced.")
+
+    def configure_hierarchy(self):
+        dlg = HierarchyConfigDialog(self.hierarchy_levels, self)
+        if dlg.exec():
+            self.hierarchy_levels = dlg.get_levels()
+            self.settings.setValue("hierarchy_levels", self.hierarchy_levels)
+            self.refresh_memory_cache()
+            QMessageBox.information(self, "Saved", "Hierarchy names saved for all future sessions.\n\nNote: Close and reopen the Tag Library to update the Analytics Tab names.")
 
     def refresh_memory_cache(self):
         while self.dynamic_lists:
@@ -1929,35 +1990,52 @@ class vmanTagLibraryDialog(QDialog):
 
         self.tag_list.clear()
         self.tag_cache.clear()
-
         self.tabs.setEnabled(False)
         self.setWindowTitle(f"Universal Tag Engine & Analytics - [LOADING {self.base_v_path} ...]")
+
+        self.loading_prog = self.create_dark_progress("Loading Data", "Syncing Database into Memory...", 0)
+        self.loading_prog.show()
+        
+        # --- NEW: Force UI to instantly paint before booting the loading thread ---
+        QApplication.processEvents()
 
         self.loader_thread = TagLibraryLoaderThread(self.db_path, self.base_v_path, self)
         self.loader_thread.finished_loading.connect(self._on_cache_loaded)
         self.loader_thread.start()
         
     def _on_cache_loaded(self, loaded_cache):
+        if hasattr(self, 'loading_prog') and self.loading_prog:
+            self.loading_prog.close()
+            
         self.tag_cache = loaded_cache
         self.setWindowTitle("Universal Tag Engine & Analytics")
         self.tabs.setEnabled(True)
 
         self.update_analytics_data()
-        self._add_column(0, self.hierarchy_levels[0] if len(self.hierarchy_levels) > 0 else "Root")
+        self._add_column(0, self.l0_name)
         self._populate_level(0, self.base_v_path)
         self._populate_all_tags()       
         
     def update_analytics_data(self):
+        # FIX: Dynamic array for unlimited levels
+        level_data = [{} for _ in range(self.current_max_level + 1)]
         tags_data = {}
-        # Dynamically build dictionaries for however many levels exist
-        level_dicts = [{} for _ in range(len(self.hierarchy_levels))]
         
         total_items, total_folders, total_files = 0, 0, 0
         multi_tagged_items, total_tags_applied = 0, 0
+        
         base_depth = len([p for p in self.base_v_path.split('/') if p])
         
-        # High-Speed Data extraction Loop
-        for path, tags in self.tag_cache.items():
+        keys = list(self.tag_cache.items())
+        total_keys = len(keys)
+        
+        prog = self.create_dark_progress("Analytics Engine", "Calculating deep metrics...", total_keys if total_keys > 0 else 1)
+        prog.show()
+        
+        for i, (path, tags) in enumerate(keys):
+            if i % 5000 == 0:
+                prog.setValue(i); QApplication.processEvents()
+            
             total_items += 1
             if path.endswith('/'): total_folders += 1
             else: total_files += 1
@@ -1969,18 +2047,17 @@ class vmanTagLibraryDialog(QDialog):
             parts = [p for p in path.split('/') if p]
             relative_parts = parts[base_depth:]
             
-            for i in range(min(len(relative_parts), len(self.hierarchy_levels))):
-                level_dicts[i][relative_parts[i]] = level_dicts[i].get(relative_parts[i], 0) + 1
+            # Map data to dynamic level array safely
+            for depth in range(min(len(relative_parts), self.current_max_level + 1)):
+                level_data[depth][relative_parts[depth]] = level_data[depth].get(relative_parts[depth], 0) + 1
             
-            for t in valid_tags:
-                tags_data[t] = tags_data.get(t, 0) + 1
+            for t in valid_tags: tags_data[t] = tags_data.get(t, 0) + 1
 
         self.tag_chart_tab.update_data(tags_data)
         
-        # Update all level charts dynamically
-        for i, level_name in enumerate(self.hierarchy_levels):
-            if hasattr(self, f"l{i}_chart_tab"):
-                getattr(self, f"l{i}_chart_tab").update_data(level_dicts[i])
+        # Update all dynamic chart tabs
+        for i, tab in enumerate(self.level_chart_tabs):
+            tab.update_data(level_data[i])
         
         for i in reversed(range(self.dashboard_layout.count())): 
             item = self.dashboard_layout.itemAt(i)
@@ -1988,43 +2065,30 @@ class vmanTagLibraryDialog(QDialog):
 
         avg_tags = round(total_tags_applied / total_items, 2) if total_items > 0 else 0
 
-        # Base 11 Cards
         metrics = [
             ("TOTAL VIRTUAL ITEMS", total_items),
             ("VIRTUAL FOLDERS", total_folders),
             ("VIRTUAL FILES", total_files),
             ("UNIQUE TAGS", len(tags_data)),
             ("MULTI-TAGGED ITEMS", multi_tagged_items),
-            ("AVG TAGS PER ITEM", avg_tags),
-            (f"TOTAL {self.hierarchy_levels[0].upper()}S", len(level_dicts[0]) if len(level_dicts) > 0 else 0),
-            (f"TOTAL {self.hierarchy_levels[1].upper()}S", len(level_dicts[1]) if len(level_dicts) > 1 else 0),
-            (f"TOTAL {self.hierarchy_levels[2].upper()}S", len(level_dicts[2]) if len(level_dicts) > 2 else 0),
-            (f"TOTAL {self.hierarchy_levels[3].upper()}S", len(level_dicts[3]) if len(level_dicts) > 3 else 0),
-            (f"TOTAL {self.hierarchy_levels[4].upper()}S", len(level_dicts[4]) if len(level_dicts) > 4 else 0)
+            ("AVG TAGS PER ITEM", avg_tags)
         ]
         
-        # --- THE 12TH INTERACTIVE CARD ---
-        metrics.append(("TOTAL HIERARCHY LEVELS", "Want to know how many level?"))
-
+        # Add metrics for every level dynamically
+        for i in range(min(5, self.current_max_level + 1)):
+            title = self.hierarchy_levels[i] if i < len(self.hierarchy_levels) else f"Level {i}"
+            metrics.append((f"TOTAL {title.upper()}S", len(level_data[i])))
+        
         colors = ["#58a6ff", "#3fb950", "#e3b341", "#a371f7", "#f85149", "#d2a8ff", 
                   "#79c0ff", "#2ea043", "#ff7b72", "#bc8cff", "#f2cc60"]
   
         row, col = 0, 0
         for idx, (title, val) in enumerate(metrics):
             accent_color = colors[idx % len(colors)]
-            
-            card = InteractiveDashboardCard() if title == "TOTAL HIERARCHY LEVELS" else QFrame()
+            card = QFrame()
             card.setMinimumSize(220, 130)
             card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-            
-            card.setStyleSheet(f"""
-                QFrame {{
-                    background: #161b22; 
-                    border: 1px solid #30363d; 
-                    border-radius: 8px; 
-                    border-top: 5px solid {accent_color};
-                }}
-            """)
+            card.setStyleSheet(f"QFrame {{ background: #161b22; border: 1px solid #30363d; border-radius: 8px; border-top: 5px solid {accent_color}; }}")
             
             c_lay = QVBoxLayout(card)
             lbl_title = QLabel(title)
@@ -2033,52 +2097,63 @@ class vmanTagLibraryDialog(QDialog):
             lbl_title.setMinimumHeight(30)
             
             lbl_val = QLabel(str(val))
+            lbl_val.setStyleSheet(f"color: {accent_color}; font-size: 34px; font-weight: bold; border: none;")
             lbl_val.setAlignment(Qt.AlignCenter)
-            
-            # Specific styling and click logic for the 12th card
-            if title == "TOTAL HIERARCHY LEVELS":
-                lbl_val.setStyleSheet(f"color: {accent_color}; font-size: 16px; font-style: italic; border: none;")
-                card.setCursor(Qt.PointingHandCursor)
-                
-                # Dynamic calculation engine for true max depth
-                def reveal_levels(l=lbl_val, a=accent_color):
-                    max_depth = 0
-                    for p in self.tag_cache.keys():
-                        depth = len([part for part in p.split('/') if part])
-                        if depth > max_depth: max_depth = depth
-                    base_depth = len([p for p in self.base_v_path.split('/') if p])
-                    actual_levels = max(0, max_depth - base_depth)
-                    
-                    l.setText(str(actual_levels))
-                    l.setStyleSheet(f"color: {a}; font-size: 34px; font-weight: bold; border: none;")
-                card.clicked.connect(reveal_levels)
-            else:
-                lbl_val.setStyleSheet(f"color: {accent_color}; font-size: 34px; font-weight: bold; border: none;")
             
             c_lay.addWidget(lbl_title, alignment=Qt.AlignTop | Qt.AlignLeft)
             c_lay.addStretch()
             c_lay.addWidget(lbl_val)
             c_lay.addStretch()
-            
             self.dashboard_layout.addWidget(card, row, col)
             
             col += 1
-            if col > 3: 
-                col = 0
-                row += 1
+            if col > 3: col = 0; row += 1
+                
+        # --- Interactive 12th Card ---
+        self.card_levels = QFrame()
+        self.card_levels.setMinimumSize(220, 130)
+        self.card_levels.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.card_levels.setStyleSheet("QFrame { background: #161b22; border: 1px solid #30363d; border-radius: 8px; border-top: 5px solid #a371f7; } QFrame:hover { background: #21262d; border-color: #8b949e; }")
+        c_lay = QVBoxLayout(self.card_levels)
+        lbl_title = QLabel("Want to know total levels?")
+        lbl_title.setStyleSheet("color: #8b949e; font-size: 11px; font-weight: bold; border: none;")
+        self.lbl_level_result = QLabel("Click to scan")
+        self.lbl_level_result.setStyleSheet("color: #a371f7; font-size: 18px; font-weight: bold; border: none;")
+        self.lbl_level_result.setAlignment(Qt.AlignCenter)
+        
+        c_lay.addWidget(lbl_title, alignment=Qt.AlignTop | Qt.AlignLeft)
+        c_lay.addStretch()
+        c_lay.addWidget(self.lbl_level_result)
+        c_lay.addStretch()
+        self.card_levels.mousePressEvent = self.calculate_total_levels
+        self.card_levels.setCursor(Qt.PointingHandCursor)
+        self.dashboard_layout.addWidget(self.card_levels, row, col)
                 
         for i in range(4): self.dashboard_layout.setColumnStretch(i, 1)
+        for i in range(row + 1): self.dashboard_layout.setRowStretch(i, 1)
+        
+        prog.setValue(total_keys); prog.close()
+
+    def calculate_total_levels(self, event):
+        if event.button() == Qt.LeftButton:
+            self.lbl_level_result.setText("Scanning...")
+            QApplication.processEvents() 
+            try:
+                with sqlite3.connect(self.db_path) as conn:
+                    cur = conn.cursor()
+                    cur.execute("SELECT MAX(LENGTH(parent_path) - LENGTH(REPLACE(parent_path, '/', ''))) FROM virtual_fs")
+                    max_depth = cur.fetchone()[0]
+                    total_levels = max_depth if max_depth else 0
+                    self.lbl_level_result.setText(f"{total_levels} Levels Deep")
+            except Exception: self.lbl_level_result.setText("Error")
 
     def _add_column(self, level_index, title):
         search_box = QLineEdit()
         search_box.setPlaceholderText(f"Search {title}...")
-        
         lst = ColumnListWidget(level_index, self)
         lst.setContextMenuPolicy(Qt.CustomContextMenu)
         lst.customContextMenuRequested.connect(lambda pos, l=lst: self.show_context_menu(l, pos))
-        
         lst.currentItemChanged.connect(lambda current, previous, idx=level_index: self.on_level_clicked(idx, current) if current else None)
-        
         lst.itemDoubleClicked.connect(lambda item: self.jump_to_virtual_or_real_path(item, force_real=False))
         search_box.textChanged.connect(lambda text, l=lst: self._filter_list(l, text))
 
@@ -2087,28 +2162,21 @@ class vmanTagLibraryDialog(QDialog):
         layout.addWidget(QLabel(f"<b>{title}</b>"))
         layout.addWidget(search_box)
         layout.addWidget(lst)
-
         widget = QWidget()
-        widget.setStyleSheet("background-color: #0d1117;") # Force child dark mode
         widget.setLayout(layout)
         widget.setMinimumWidth(220) 
         widget.setMaximumWidth(300)
-
         self.column_container_layout.addWidget(widget)
 
         self.dynamic_lists.append({
-            'widget': widget,
-            'list': lst,
-            'search': search_box
+            'widget': widget, 'list': lst, 'search': search_box
         })
 
     def _populate_base_contexts(self):
         self.combo_base.blockSignals(True)
         self.combo_base.clear()
         self.combo_base.addItem("/") 
-        
         existing_bases = set(["/"])
-        
         try:
             with sqlite3.connect(self.db_path) as conn:
                 cur = conn.cursor()
@@ -2119,10 +2187,7 @@ class vmanTagLibraryDialog(QDialog):
                         self.combo_base.addItem(path)
                         existing_bases.add(path)
         except Exception: pass
-        
-        if self.base_v_path not in existing_bases:
-            self.combo_base.addItem(self.base_v_path)
-            
+        if self.base_v_path not in existing_bases: self.combo_base.addItem(self.base_v_path)
         self.combo_base.setCurrentText(self.base_v_path)
         self.combo_base.blockSignals(False)
 
@@ -2149,29 +2214,24 @@ class vmanTagLibraryDialog(QDialog):
     def _populate_level(self, level_index, prefix_path):
         if level_index >= len(self.dynamic_lists): return
         items = self._get_children(prefix_path)
-                    
         lst = self.dynamic_lists[level_index]['list']
-        lst.blockSignals(True); lst.clear()
-        
+        lst.blockSignals(True)
+        lst.clear()
         folders, files = [], []
         cache_keys = self.tag_cache.keys()
-        
         for name in items:
             test_folder = f"{prefix_path}{name}/"
             is_fldr = test_folder in self.tag_cache or any(p.startswith(test_folder) for p in cache_keys)
-            
             if is_fldr: folders.append((name, True, test_folder))
             else: files.append((name, False, f"{prefix_path}{name}"))
                 
         folders.sort(key=lambda x: natural_sort_key(x[0]))
         files.sort(key=lambda x: natural_sort_key(x[0]))
-        
         for name, is_fldr, node_v_path in (folders + files):
             item = QListWidgetItem(name)
             item.setData(Qt.UserRole, node_v_path)
             item.setIcon(self._get_icon_for_node(name, is_fldr))
             lst.addItem(item)
-            
         lst.blockSignals(False)
 
     def _populate_all_tags(self):
@@ -2181,7 +2241,6 @@ class vmanTagLibraryDialog(QDialog):
             
     def on_level_clicked(self, level_index, item):
         v_path = item.data(Qt.UserRole)
-        
         while len(self.dynamic_lists) > level_index + 1:
             col_data = self.dynamic_lists.pop()
             col_data['widget'].setParent(None)
@@ -2202,49 +2261,45 @@ class vmanTagLibraryDialog(QDialog):
 
     def on_tag_clicked(self, item):
         target_tag = item.text()
-        prog = QProgressDialog(f"Loading tag '{target_tag}'...", "Cancel", 0, 100, self)
-        prog.setWindowModality(Qt.WindowModal); prog.setMinimumDuration(0); prog.show()
-
-        valid_paths = []
         keys = list(self.tag_cache.items())
         total = max(1, len(keys))
         
+        prog = self.create_dark_progress("Locating Tag", f"Loading '{target_tag}'...", total)
+        prog.show()
+
+        valid_paths = []
         for i, (p, tags) in enumerate(keys):
             if i % 2000 == 0:
-                prog.setValue(int((i / total) * 30)); QApplication.processEvents()
+                prog.setValue(i); QApplication.processEvents()
             if prog.wasCanceled(): return
             if target_tag in tags: valid_paths.append(p)
         
         base_depth = len([p for p in self.base_v_path.split('/') if p])
-        max_depth = 0
-        for vp in valid_paths:
-            parts = [p for p in vp.split('/') if p]
-            depth = len(parts) - base_depth
-            if depth > max_depth: max_depth = depth
+        max_depth = max([0] + [len([p for p in vp.split('/') if p]) - base_depth for vp in valid_paths])
             
         while len(self.dynamic_lists) > max_depth:
             col = self.dynamic_lists.pop()
-            col['widget'].setParent(None); col['widget'].deleteLater()
+            col['widget'].setParent(None)
+            col['widget'].deleteLater()
             
         for i in range(len(self.dynamic_lists), max_depth):
             title = self.hierarchy_levels[i] if hasattr(self, 'hierarchy_levels') and i < len(self.hierarchy_levels) else f"Level {i + 1}"
             self._add_column(i, title)
             
         total_vp = max(1, len(valid_paths))
+        prog.setMaximum(max_depth * total_vp)
         
         for i in range(max_depth):
             if prog.wasCanceled(): break
             prog.setLabelText(f"Building Structure for Column {i+1} of {max_depth}...")
-            
             lst = self.dynamic_lists[i]['list']
-            lst.blockSignals(True); lst.clear()
+            lst.blockSignals(True)
+            lst.clear()
             
             level_nodes = {}
             for j, vp in enumerate(valid_paths):
-                if j % 2000 == 0:
-                    col_base_pct = 30 + (i / max(1, max_depth)) * 70
-                    col_progress = (j / total_vp) * (70 / max(1, max_depth))
-                    prog.setValue(int(col_base_pct + col_progress)); QApplication.processEvents()
+                if j % 1000 == 0:
+                    prog.setValue((i * total_vp) + j); QApplication.processEvents()
                     
                 parts = [p for p in vp.split('/') if p]
                 if len(parts) > base_depth + i:
@@ -2256,8 +2311,8 @@ class vmanTagLibraryDialog(QDialog):
             f_nodes = [k for k, v in level_nodes.items() if v[1]]
             file_nodes = [k for k, v in level_nodes.items() if not v[1]]
             sorted_names = sorted(f_nodes, key=natural_sort_key) + sorted(file_nodes, key=natural_sort_key)
-            display_names = sorted_names[:1000]
             
+            display_names = sorted_names[:1000]
             for j, name in enumerate(display_names):
                 if j % 100 == 0: QApplication.processEvents()
                 node_v_path, is_folder = level_nodes[name]
@@ -2267,19 +2322,21 @@ class vmanTagLibraryDialog(QDialog):
                 
                 if node_v_path in self.tag_cache and target_tag in self.tag_cache[node_v_path]:
                     l_item.setForeground(QBrush(QColor("#58a6ff")))
-                    font = l_item.font(); font.setBold(True); l_item.setFont(font)
-                    
+                    font = l_item.font()
+                    font.setBold(True)
+                    l_item.setFont(font)
                 lst.addItem(l_item)
                 
             if len(sorted_names) > 1000:
                 warning_item = QListWidgetItem(f"... and {len(sorted_names) - 1000} more items (Refine search)")
                 warning_item.setForeground(QBrush(QColor("#e3b341")))
-                font = warning_item.font(); font.setItalic(True); warning_item.setFont(font)
+                font = warning_item.font()
+                font.setItalic(True)
+                warning_item.setFont(font)
                 lst.addItem(warning_item)
-                
             lst.blockSignals(False)
 
-        prog.setValue(100); prog.close()
+        prog.setValue(prog.maximum()); prog.close()
 
     def run_global_search(self, text):
         query = text.lower()
@@ -2291,13 +2348,13 @@ class vmanTagLibraryDialog(QDialog):
 
         total_items = max(1, len(self.tag_cache))
 
-        prog = QProgressDialog("Searching memory cache...", "Cancel", 0, 100, self)
-        prog.setWindowModality(Qt.WindowModal); prog.setMinimumDuration(0); prog.show()
+        prog = self.create_dark_progress("Search", "Searching memory cache...", total_items * 2)
+        prog.show()
 
         keys = list(self.tag_cache.keys())
         for i, p in enumerate(keys):
             if i % 2000 == 0:
-                prog.setValue(int((i / total_items) * 50)); QApplication.processEvents()
+                prog.setValue(i); QApplication.processEvents()
             if prog.wasCanceled(): return
 
             is_fldr = p.endswith('/')
@@ -2305,7 +2362,6 @@ class vmanTagLibraryDialog(QDialog):
             
             parts = [part for part in p.split('/') if part]
             target_name = parts[-1] if parts else ""
-            
             if query in target_name.lower(): valid_paths.add(p)
                 
         if not valid_paths:
@@ -2315,16 +2371,12 @@ class vmanTagLibraryDialog(QDialog):
 
         valid_paths = list(valid_paths)
         base_depth = len([p for p in self.base_v_path.split('/') if p])
-        
-        max_depth = 0
-        for vp in valid_paths:
-            parts = [p for p in vp.split('/') if p]
-            depth = len(parts) - base_depth
-            if depth > max_depth: max_depth = depth
+        max_depth = max([0] + [len([p for p in vp.split('/') if p]) - base_depth for vp in valid_paths])
             
         while len(self.dynamic_lists) > max_depth:
             col = self.dynamic_lists.pop()
-            col['widget'].setParent(None); col['widget'].deleteLater()
+            col['widget'].setParent(None)
+            col['widget'].deleteLater()
             
         for i in range(len(self.dynamic_lists), max_depth):
             title = self.hierarchy_levels[i] if hasattr(self, 'hierarchy_levels') and i < len(self.hierarchy_levels) else f"Level {i + 1}"
@@ -2335,16 +2387,15 @@ class vmanTagLibraryDialog(QDialog):
         for i in range(max_depth):
             if prog.wasCanceled(): break
             prog.setLabelText(f"Building Structure for Column {i+1} of {max_depth}...")
-            
             lst = self.dynamic_lists[i]['list']
-            lst.blockSignals(True); lst.clear()
+            lst.blockSignals(True)
+            lst.clear()
             
             level_nodes = {}
             for j, vp in enumerate(valid_paths):
-                if j % 2000 == 0:
-                    col_base_pct = 50 + (i / max(1, max_depth)) * 50
-                    col_progress = (j / total_vp) * (50 / max(1, max_depth))
-                    prog.setValue(int(col_base_pct + col_progress)); QApplication.processEvents()
+                if j % 1000 == 0:
+                    prog.setValue(total_items + int(((i / max(1, max_depth)) * total_items)))
+                    QApplication.processEvents()
                     
                 parts = [p for p in vp.split('/') if p]
                 if len(parts) > base_depth + i:
@@ -2356,11 +2407,10 @@ class vmanTagLibraryDialog(QDialog):
             f_nodes = [k for k, v in level_nodes.items() if v[1]]
             file_nodes = [k for k, v in level_nodes.items() if not v[1]]
             sorted_names = sorted(f_nodes, key=natural_sort_key) + sorted(file_nodes, key=natural_sort_key)
-            display_names = sorted_names[:1000]
             
+            display_names = sorted_names[:1000]
             for j, name in enumerate(display_names):
                 if j % 100 == 0: QApplication.processEvents() 
-                    
                 node_v_path, is_folder = level_nodes[name]
                 l_item = QListWidgetItem(name)
                 l_item.setData(Qt.UserRole, node_v_path)
@@ -2368,19 +2418,21 @@ class vmanTagLibraryDialog(QDialog):
                 
                 if query in name.lower():
                     l_item.setForeground(QBrush(QColor("#2ea043")))
-                    font = l_item.font(); font.setBold(True); l_item.setFont(font)
-                    
+                    font = l_item.font()
+                    font.setBold(True)
+                    l_item.setFont(font)
                 lst.addItem(l_item)
                 
             if len(sorted_names) > 1000:
                 warning_item = QListWidgetItem(f"... and {len(sorted_names) - 1000} more items (Refine search)")
                 warning_item.setForeground(QBrush(QColor("#e3b341")))
-                font = warning_item.font(); font.setItalic(True); warning_item.setFont(font)
+                font = warning_item.font()
+                font.setItalic(True)
+                warning_item.setFont(font)
                 lst.addItem(warning_item)
-                
             lst.blockSignals(False)
 
-        prog.setValue(100); prog.close()
+        prog.setValue(prog.maximum()); prog.close()
 
     def _filter_list(self, list_widget, text):
         query = text.lower()
@@ -2415,7 +2467,6 @@ class vmanTagLibraryDialog(QDialog):
         item = list_widget.itemAt(pos)
         if not item: return
         menu = QMenu(self)
-        
         v_path = item.data(Qt.UserRole)
         is_folder = v_path.endswith('/')
         
@@ -2444,11 +2495,11 @@ class vmanTagLibraryDialog(QDialog):
                     ext = os.path.splitext(real_p)[1].lower()
                     playlist = [{'path': real_p, 'name': item.text(), 'ext': ext}]
                     new_viewer = vmanViewer(playlist, 0, self.main_app if self.main_app else self)
-                    
                     parent_ref = self.main_app if self.main_app else self
                     if not hasattr(parent_ref, 'active_viewers'): parent_ref.active_viewers = []
                     parent_ref.active_viewers.append(new_viewer)
                     new_viewer.show() 
+            
         elif action == action_open: self.jump_to_virtual_or_real_path(item, force_real=True)
         elif action == action_copy_v: 
             QApplication.clipboard().setText(v_path)
@@ -2459,7 +2510,8 @@ class vmanTagLibraryDialog(QDialog):
                 QApplication.clipboard().setText(real_p)
                 if self.main_app: self.main_app.status.showMessage("Physical OS path copied to clipboard.", 3000)
             else: QMessageBox.warning(self, "Copy Failed", "This item has no mapped physical path on your hard drive.")
-        elif action == action_props: self.show_item_properties(item)
+        elif action == action_props:
+            self.show_item_properties(item)
 
     def _get_real_path_for_item(self, item):
         v_path = item.data(Qt.UserRole)
@@ -2468,7 +2520,6 @@ class vmanTagLibraryDialog(QDialog):
         if not parts: return None
         name = parts[-1]
         parent_path = "/" + "/".join(parts[:-1]) + "/" if len(parts) > 1 else "/"
-        
         try:
             with sqlite3.connect(self.db_path) as conn:
                 res = conn.cursor().execute("SELECT real_path FROM virtual_fs WHERE parent_path=? AND name=? AND is_folder=?", (parent_path, name, 1 if is_folder else 0)).fetchone()
@@ -2485,16 +2536,20 @@ class vmanTagLibraryDialog(QDialog):
         dlg = QDialog(self)
         dlg.setWindowTitle(f"Properties: {name}")
         dlg.setMinimumWidth(500)
-        
-        if self.main_app and hasattr(self.main_app, 'theme_combo'):
-            dlg.setStyleSheet(THEMES.get(self.main_app.theme_combo.currentText(), THEMES["Dark"]))
+        dlg.setStyleSheet("""
+            QDialog { background-color: #0d1117; color: #c9d1d9; }
+            QLabel { color: #c9d1d9; }
+            QLineEdit { background-color: #161b22; color: #c9d1d9; border: 1px solid #30363d; border-radius: 4px; padding: 4px; }
+            QPushButton { background-color: #21262d; color: #c9d1d9; border: 1px solid #30363d; border-radius: 4px; padding: 5px; }
+            QPushButton:hover { background-color: #30363d; border-color: #8b949e; }
+        """)
             
         layout = QFormLayout(dlg)
         layout.addRow("Virtual Path:", QLineEdit(v_path))
-        
         try:
             with sqlite3.connect(self.db_path, timeout=10) as conn:
-                res = conn.cursor().execute("SELECT id, size, extension, modified, real_path, custom_tags, color_tag, secondary_name FROM virtual_fs WHERE parent_path=? AND name=? AND is_folder=?", (parent_path, name, 1 if is_folder else 0)).fetchone()
+                cur = conn.cursor()
+                res = cur.execute("SELECT id, size, extension, modified, real_path, custom_tags, color_tag, secondary_name FROM virtual_fs WHERE parent_path=? AND name=? AND is_folder=?", (parent_path, name, 1 if is_folder else 0)).fetchone()
                 if res:
                     db_id, size, ext, mod, real_p, tags, color, sec_name = res
                     layout.addRow("Type:", QLabel("Directory (Virtual Folder)" if is_folder else "Virtual File"))
@@ -2502,11 +2557,9 @@ class vmanTagLibraryDialog(QDialog):
                         layout.addRow("Extension:", QLabel(str(ext)))
                         layout.addRow("Size:", QLabel(human_size(size or 0)))
                     layout.addRow("Modified Date:", QLabel(str(mod)))
-                    
                     txt_real = QLineEdit(str(real_p) if real_p else "Disconnected / Virtual Only")
                     txt_real.setReadOnly(True)
                     layout.addRow("Local Target OS Path:", txt_real)
-                    
                     layout.addRow("Custom Tags:", QLabel(str(tags) if tags else "None"))
                     layout.addRow("Color Label:", QLabel(str(color) if color else "None"))
                     layout.addRow("Secondary Name:", QLabel(str(sec_name) if sec_name else "None"))
@@ -2529,7 +2582,6 @@ class vmanTagLibraryDialog(QDialog):
                 cur = conn.cursor()
                 cur.execute("SELECT id, parent_path, name FROM virtual_fs WHERE parent_path LIKE ? OR (parent_path=? AND name=?)", 
                             (f"{v_path}%", "/" + "/".join(v_path.strip('/').split('/')[:-1]) + "/", v_path.strip('/').split('/')[-1]))
-                
                 for db_id, pp, name in cur.fetchall():
                     full_v = f"{pp}{name}/".replace("//", "/")
                     rel = full_v[len(v_path):]
@@ -2542,7 +2594,6 @@ class vmanTagLibraryDialog(QDialog):
     def jump_to_virtual_or_real_path(self, item, force_real=False):
         v_path = item.data(Qt.UserRole)
         if not v_path: return
-        
         is_folder = v_path.endswith('/')
         parts = [p for p in v_path.strip('/').split('/')]
         name = parts[-1]
@@ -2554,7 +2605,6 @@ class vmanTagLibraryDialog(QDialog):
                 else:
                     self.main_app.nav_to_path(parent_path)
                     self.main_app.local_filter.setText(name)
-                
                 self.main_app.raise_()
                 self.main_app.activateWindow()
             self.hide() 
@@ -2593,7 +2643,6 @@ class vmanTagLibraryDialog(QDialog):
                 if res: cur.execute("UPDATE virtual_fs SET custom_tags=? WHERE id=?", (new_tags.strip(), res[0]))
                 else: cur.execute("INSERT INTO virtual_fs (parent_path, name, is_folder, custom_tags, modified) VALUES (?, ?, ?, ?, '2023-01-01 12:00:00')", (parent_path, name, 1 if is_folder else 0, new_tags.strip()))
                 conn.commit()
-
                 if is_folder and real_path and os.path.exists(real_path):
                     try:
                         with open(os.path.join(real_path, "tag.txt"), "w", encoding='utf-8') as f: f.write(new_tags.strip())
@@ -2602,18 +2651,98 @@ class vmanTagLibraryDialog(QDialog):
         self.refresh_memory_cache()
         if self.main_app: self.main_app.refresh_all()
 
+    def import_csv(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Import Tags", "", "CSV Files (*.csv)")
+        if not path: return
+        reply = QMessageBox.question(self, "Physical Sync", "Do you want to actually generate physical folders on your hard drive for this data structure?", QMessageBox.Yes | QMessageBox.No)
+        create_real = (reply == QMessageBox.Yes)
+        
+        target_v_path = self.base_v_path
+        if target_v_path == "/": target_v_path = "/CSV_Library/"
+            
+        base_real_dir = None
+        if create_real:
+            dest = QFileDialog.getExistingDirectory(self, "Select destination to securely create the Root folder")
+            if not dest: return
+            base_real_dir = os.path.join(dest, target_v_path.strip('/')).replace('\\', '/')
+            os.makedirs(base_real_dir, exist_ok=True)
+
+        prog = self.create_dark_progress("Importing", "Parsing CSV...", 0)
+        prog.show()
+
+        try:
+            with sqlite3.connect(self.db_path, timeout=20) as conn:
+                cur = conn.cursor()
+                if target_v_path != "/":
+                    parts = [p for p in target_v_path.split('/') if p]
+                    cur.execute("INSERT OR IGNORE INTO virtual_fs (parent_path, name, is_folder) VALUES (?, ?, 1)", ("/" + "/".join(parts[:-1]) + "/" if len(parts)>1 else "/", parts[-1]))
+                
+                with open(path, 'r', encoding='utf-8') as f:
+                    reader = list(csv.reader(f))
+                    prog.setMaximum(len(reader))
+                    
+                    for row_idx, row in enumerate(reader):
+                        if row_idx % 500 == 0: prog.setValue(row_idx); QApplication.processEvents()
+                        if len(row) < 2 or row[0].lower() == "path": continue
+                        
+                        raw_path, tags = row[0], row[1]
+                        parts = raw_path.replace('\\', '/').strip('/').split('/')
+                        if not parts: continue
+                        
+                        curr = target_v_path 
+                        for i, part in enumerate(parts):
+                            is_last = (i == len(parts) - 1)
+                            cur.execute("SELECT id FROM virtual_fs WHERE parent_path=? AND name=? AND is_folder=1", (curr, part))
+                            existing = cur.fetchone()
+                            final_tags = tags if is_last else ''
+                            db_id = None
+                            
+                            if existing:
+                                db_id = existing[0]
+                                if is_last and tags: cur.execute("UPDATE virtual_fs SET custom_tags=? WHERE id=?", (tags, db_id))
+                            else:
+                                cur.execute("INSERT INTO virtual_fs (parent_path, name, is_folder, custom_tags, modified) VALUES (?, ?, 1, ?, '2023-01-01 12:00:00')", (curr, part, final_tags))
+                                db_id = cur.lastrowid
+                            curr += part + "/"
+                            
+                            if create_real and base_real_dir:
+                                rel = curr[len(target_v_path):]
+                                real_p = os.path.join(base_real_dir, rel).replace('\\', '/')
+                                os.makedirs(real_p, exist_ok=True)
+                                cur.execute("UPDATE virtual_fs SET real_path=? WHERE id=?", (real_p, db_id))
+                                if final_tags:
+                                    with open(os.path.join(real_p, "tag.txt"), "w", encoding='utf-8') as f_tag: f_tag.write(final_tags)
+                conn.commit()
+            
+            prog.close()
+            self.base_v_path = target_v_path 
+            self._populate_base_contexts()
+            self.refresh_memory_cache()
+            if self.main_app: self.main_app.refresh_all()
+            QMessageBox.information(self, "Success", f"Database updated successfully inside {target_v_path}")
+        except Exception as e:
+            prog.close()
+            QMessageBox.critical(self, "Import Error", str(e))
+
     def export_csv(self):
         path, _ = QFileDialog.getSaveFileName(self, "Export Tags", "", "CSV Files (*.csv)")
         if not path: return
+        prog = self.create_dark_progress("Exporting", "Writing CSV...", len(self.tag_cache))
+        prog.show()
+        
         try:
             with open(path, 'w', newline='', encoding='utf-8') as f:
                 writer = csv.writer(f)
                 writer.writerow(['Path', 'Tags'])
-                for v_path, tags in self.tag_cache.items():
+                for i, (v_path, tags) in enumerate(self.tag_cache.items()):
+                    if i % 1000 == 0: prog.setValue(i); QApplication.processEvents()
                     if tags: writer.writerow([v_path.replace(self.base_v_path, ''), ', '.join(tags)])
+            prog.close()
             QMessageBox.information(self, "Success", "Tags exported successfully.")
-        except Exception as e: QMessageBox.critical(self, "Error", str(e))
-
+        except Exception as e:
+            prog.close()
+            QMessageBox.critical(self, "Error", str(e))
+        
 class HeatmapColorConfigDialog(QDialog):
     def __init__(self, db_path, parent=None):
         super().__init__(parent)
@@ -2885,7 +3014,20 @@ class TimelineDiaryDialog(QDialog):
         
         
         # FORCE DARK MODE ALWAYS
-        self.setStyleSheet(THEMES["Dark"])
+        self.setStyleSheet("""
+            * { background-color: #0d1117; color: #c9d1d9; }
+            QDialog { background-color: #0d1117; color: #c9d1d9; }
+            QLabel { background-color: transparent; color: #c9d1d9; }
+            QLineEdit, QComboBox, QSpinBox { background-color: #161b22; color: #c9d1d9; border: 1px solid #30363d; border-radius: 4px; padding: 4px; }
+            QPushButton { background-color: #21262d; color: #c9d1d9; border: 1px solid #30363d; border-radius: 4px; padding: 5px; }
+            QPushButton:hover { background-color: #30363d; border-color: #8b949e; }
+            QTableWidget { background-color: #0d1117; alternate-background-color: #161b22; border: 1px solid #30363d; border-radius: 6px; }
+            QHeaderView::section { background-color: #21262d; color: #c9d1d9; font-weight: bold; padding: 8px; border: 1px solid #30363d; }
+            QTabWidget::pane { border: 1px solid #30363d; background: #0d1117; border-radius: 4px; border-top-left-radius: 0px; }
+            QTabBar::tab { background: #161b22; color: #8b949e; padding: 8px 20px; border: 1px solid #30363d; border-bottom: none; border-top-left-radius: 4px; border-top-right-radius: 4px; margin-right: 2px;}
+            QTabBar::tab:selected { background: #0d1117; color: #58a6ff; font-weight: bold; border-top: 2px solid #58a6ff; }
+            QScrollArea { background-color: #0d1117; border: none; }
+        """)
 
         main_layout = QVBoxLayout(self)
         main_layout.setContentsMargins(10, 10, 10, 10)
@@ -3314,35 +3456,37 @@ class TimelineDiaryDialog(QDialog):
         self.tbl_rep_tag = create_rep_table(["Tag", "Files", "Size", "Avg Size"])
         self.tbl_rep_largest = create_rep_table(["Largest Files", "Size", "Type", "ID"])
         self.tbl_rep_smallest = create_rep_table(["Smallest Files", "Size", "Type", "ID"])
-        
         self.tbl_rep_ext_by_cat = create_rep_table(["Category", "Extension", "File Count", "Total Size"])
-        self.tbl_rep_common_sizes = create_rep_table(["Exact File Size", "Number of Files", "Total Volume"])
+        # --- NEW CUSTOM TABLES ---
+        self.tbl_rep_size_tiers = create_rep_table(["Size Tier Range", "Number of Files", "Used Extensions"])
+        self.tbl_rep_micro_buckets = create_rep_table(["File Size Threshold", "Number of Files"])
+        self.tbl_rep_ext_extremes = create_rep_table(["Extension", "Smallest File", "Smallest Size", "Largest File", "Largest Size"])
+        self.tbl_rep_cat_extremes = create_rep_table(["Category", "Smallest File", "Smallest Size", "Largest File", "Largest Size"])
 
-        # Hide internal ID columns
         self.tbl_rep_largest.setColumnHidden(3, True)
         self.tbl_rep_smallest.setColumnHidden(3, True)
-        
-        # FIX: Allow interactive resizing while still stretching to fill the right side!
-        self.tbl_rep_largest.horizontalHeader().setSectionResizeMode(0, QHeaderView.Interactive)
-        self.tbl_rep_smallest.horizontalHeader().setSectionResizeMode(0, QHeaderView.Interactive)
 
-        # Helper to add full-width sections cleanly
         def add_section(title, subtitle, widget):
             header = QLabel(f"<span style='font-size: 20px; color: #58a6ff; font-weight: bold;'>{title}</span><br><span style='color: #8b949e; font-size: 13px;'>{subtitle}</span>")
             self.rep_vbox.addWidget(header)
             self.rep_vbox.addWidget(widget)
 
-        # Add Full-Width Stacked Layout
+        # Append all sections to Report Tab
         add_section("📅 Temporal Grouping", "Double-click any row to filter the Activity Log to that specific time period.", self.tbl_rep_group)
         add_section("📁 Data by Category", "Distribution of storage and file counts across major file categories.", self.tbl_rep_cat)
         
-        add_section("🗂️ Extensions by Category", "Detailed breakdown of file formats within each category.", self.tbl_rep_ext_by_cat)
-        add_section("📊 Most Common File Sizes", "Groups files by their exact byte size to find massively duplicated or identical files.", self.tbl_rep_common_sizes)
+        # --- ADD THE NEW TABLES ---
+        add_section("📊 File Size Range Tiers", "Volume distribution across custom byte-range brackets.", self.tbl_rep_size_tiers)
+        add_section("🔬 Micro File Size Thresholds", "Exact file counts for fine-grained sub-kilobyte file dimensions.", self.tbl_rep_micro_buckets)
+        add_section("📐 Extension Extremes", "Smallest and largest files found for each specific file extension.", self.tbl_rep_ext_extremes)
+        add_section("📊 Category Extremes", "Smallest and largest files tracked within each major category.", self.tbl_rep_cat_extremes)
         
         add_section("📄 Top 50 Extensions", "Most dominant file formats matching your current filters.", self.tbl_rep_ext)
         add_section("🏷️ Custom Tag Utilization", "File metrics grouped by your user-defined tags.", self.tbl_rep_tag)
-        add_section("🐘 Top 20 Largest Files", "Heaviest outliers in the current dataset (Double click to locate).", self.tbl_rep_largest)
-        add_section("🦠 Top 20 Smallest Files", "Smallest tracked items (Double click to locate).", self.tbl_rep_smallest)
+        add_section("🐘 Top 20 Largest Files", "Heaviest outliers in the current dataset.", self.tbl_rep_largest)
+        add_section("🦠 Top 20 Smallest Files", "Smallest tracked items.", self.tbl_rep_smallest)
+
+
         
         self.rep_vbox.addStretch()
         self.rep_scroll.setWidget(self.rep_container)
@@ -3624,22 +3768,91 @@ class TimelineDiaryDialog(QDialog):
                     self.tbl_rep_ext_by_cat.setItem(r, 3, SizeTableWidgetItem(row_data[3] or 0))
                 self.tbl_rep_ext_by_cat.setSortingEnabled(True)
 
-                # 8. Most Common File Sizes
-                prog.setLabelText("Analyzing Common File Sizes..."); prog.setValue(88); QApplication.processEvents()
-                cur.execute(f"SELECT size, COUNT(id), SUM(size) FROM virtual_fs WHERE {base_where} AND is_folder=0 AND size > 0 GROUP BY size ORDER BY COUNT(id) DESC LIMIT 50", params)
-                common_sizes_data = cur.fetchall()
+                # --- 7. NEW TABLE: File Size Range Tiers (1KB to Beyond + Exts) ---
+                prog.setLabelText("Computing Size Tiers..."); prog.setValue(85); QApplication.processEvents()
+                tiers = [
+                    ("1 KB to 1 MB", 1024, 1024 * 1024),
+                    ("1.1 MB to 10 MB", 1024 * 1024 * 1.1, 10 * 1024 * 1024),
+                    ("10.1 MB to 50 MB", 10 * 1024 * 1024 * 1.01, 50 * 1024 * 1024),
+                    ("50.1 MB to 100 MB", 50 * 1024 * 1024 * 1.01, 100 * 1024 * 1024),
+                    ("100.1 MB to 500 MB", 100 * 1024 * 1024 * 1.01, 500 * 1024 * 1024),
+                    ("500.1 MB to 1000 MB", 500 * 1024 * 1024 * 1.01, 1000 * 1024 * 1024),
+                    ("1000.1 MB to 5000 MB", 1000 * 1024 * 1024 * 1.01, 5000 * 1024 * 1024),
+                    ("5000.1 MB and Beyond", 5000 * 1024 * 1024 * 1.01, float('inf'))
+                ]
+                self.tbl_rep_size_tiers.setSortingEnabled(False)
+                self.tbl_rep_size_tiers.setRowCount(0)
+                for r, (range_label, low, high) in enumerate(tiers):
+                    self.tbl_rep_size_tiers.insertRow(r)
+                    if high == float('inf'):
+                        cur.execute(f"SELECT COUNT(id), GROUP_CONCAT(DISTINCT extension) FROM virtual_fs WHERE {base_where} AND size >= ?", params + [low])
+                    else:
+                        cur.execute(f"SELECT COUNT(id), GROUP_CONCAT(DISTINCT extension) FROM virtual_fs WHERE {base_where} AND size >= ? AND size <= ?", params + [low, high])
+                    cnt, exts = cur.fetchone()
+                    cnt = cnt or 0
+                    exts_str = ", ".join(sorted(set([str(e).upper() for e in exts.split(',') if e]))) if exts else "None"
+                    
+                    self.tbl_rep_size_tiers.setItem(r, 0, QTableWidgetItem(range_label))
+                    cnt_item = NumericTableItem(f"{cnt:,}"); cnt_item.setData(Qt.UserRole, cnt)
+                    self.tbl_rep_size_tiers.setItem(r, 1, cnt_item)
+                    self.tbl_rep_size_tiers.setItem(r, 2, QTableWidgetItem(exts_str))
+                self.tbl_rep_size_tiers.setSortingEnabled(True)
+
+                # --- 8. NEW TABLE: Micro File Size Thresholds (<1KB to <64KB) ---
+                prog.setLabelText("Computing Micro Buckets..."); prog.setValue(90); QApplication.processEvents()
+                micro_limits = [
+                    ("1 KB or less", 1024), ("2 KB or less", 2048), ("4 KB or less", 4096),
+                    ("8 KB or less", 8192), ("16 KB or less", 16384), ("32 KB or less", 32768), ("64 KB or less", 65536)
+                ]
+                self.tbl_rep_micro_buckets.setSortingEnabled(False)
+                self.tbl_rep_micro_buckets.setRowCount(0)
+                for r, (label_t, limit_b) in enumerate(micro_limits):
+                    self.tbl_rep_micro_buckets.insertRow(r)
+                    cur.execute(f"SELECT COUNT(id) FROM virtual_fs WHERE {base_where} AND size <= ?", params + [limit_b])
+                    cnt = cur.fetchone()[0] or 0
+                    self.tbl_rep_micro_buckets.setItem(r, 0, QTableWidgetItem(label_t))
+                    cnt_item = NumericTableItem(f"{cnt:,}"); cnt_item.setData(Qt.UserRole, cnt)
+                    self.tbl_rep_micro_buckets.setItem(r, 1, cnt_item)
+                self.tbl_rep_micro_buckets.setSortingEnabled(True)
+
+                # --- 9. NEW TABLE: Extension Extremes (Smallest & Largest) ---
+                prog.setLabelText("Computing Extension Extremes..."); prog.setValue(93); QApplication.processEvents()
+                cur.execute(f"SELECT DISTINCT extension FROM virtual_fs WHERE {base_where} AND extension IS NOT NULL AND extension != ''", params)
+                exts_list = [row[0] for row in cur.fetchall()]
                 
-                self.tbl_rep_common_sizes.setSortingEnabled(False)
-                self.tbl_rep_common_sizes.setRowCount(0)
-                for r, row_data in enumerate(common_sizes_data):
-                    self.tbl_rep_common_sizes.insertRow(r)
-                    self.tbl_rep_common_sizes.setItem(r, 0, SizeTableWidgetItem(row_data[0] or 0))
+                self.tbl_rep_ext_extremes.setSortingEnabled(False)
+                self.tbl_rep_ext_extremes.setRowCount(0)
+                for r, ext in enumerate(sorted(exts_list)):
+                    self.tbl_rep_ext_extremes.insertRow(r)
+                    cur.execute(f"SELECT name, size FROM virtual_fs WHERE {base_where} AND extension = ? AND size > 0 ORDER BY size ASC LIMIT 1", params + [ext])
+                    small = cur.fetchone()
+                    cur.execute(f"SELECT name, size FROM virtual_fs WHERE {base_where} AND extension = ? ORDER BY size DESC LIMIT 1", params + [ext])
+                    large = cur.fetchone()
                     
-                    cnt_item = NumericTableItem(f"{row_data[1]:,}"); cnt_item.setData(Qt.UserRole, row_data[1])
-                    self.tbl_rep_common_sizes.setItem(r, 1, cnt_item)
+                    self.tbl_rep_ext_extremes.setItem(r, 0, QTableWidgetItem(str(ext).upper()))
+                    self.tbl_rep_ext_extremes.setItem(r, 1, QTableWidgetItem(str(small[0]) if small else "N/A"))
+                    self.tbl_rep_ext_extremes.setItem(r, 2, SizeTableWidgetItem(small[1]) if small else SizeTableWidgetItem(0))
+                    self.tbl_rep_ext_extremes.setItem(r, 3, QTableWidgetItem(str(large[0]) if large else "N/A"))
+                    self.tbl_rep_ext_extremes.setItem(r, 4, SizeTableWidgetItem(large[1]) if large else SizeTableWidgetItem(0))
+                self.tbl_rep_ext_extremes.setSortingEnabled(True)
+
+                # --- 10. NEW TABLE: Category Extremes (Smallest & Largest) ---
+                prog.setLabelText("Computing Category Extremes..."); prog.setValue(96); QApplication.processEvents()
+                self.tbl_rep_cat_extremes.setSortingEnabled(False)
+                self.tbl_rep_cat_extremes.setRowCount(0)
+                for r, cat in enumerate(cat_order):
+                    self.tbl_rep_cat_extremes.insertRow(r)
+                    cur.execute(f"SELECT name, size FROM virtual_fs WHERE {base_where} AND category = ? AND size > 0 ORDER BY size ASC LIMIT 1", params + [cat])
+                    small = cur.fetchone()
+                    cur.execute(f"SELECT name, size FROM virtual_fs WHERE {base_where} AND category = ? ORDER BY size DESC LIMIT 1", params + [cat])
+                    large = cur.fetchone()
                     
-                    self.tbl_rep_common_sizes.setItem(r, 2, SizeTableWidgetItem(row_data[2] or 0))
-                self.tbl_rep_common_sizes.setSortingEnabled(True)
+                    self.tbl_rep_cat_extremes.setItem(r, 0, QTableWidgetItem(cat))
+                    self.tbl_rep_cat_extremes.setItem(r, 1, QTableWidgetItem(str(small[0]) if small else "N/A"))
+                    self.tbl_rep_cat_extremes.setItem(r, 2, SizeTableWidgetItem(small[1]) if small else SizeTableWidgetItem(0))
+                    self.tbl_rep_cat_extremes.setItem(r, 3, QTableWidgetItem(str(large[0]) if large else "N/A"))
+                    self.tbl_rep_cat_extremes.setItem(r, 4, SizeTableWidgetItem(large[1]) if large else SizeTableWidgetItem(0))
+                self.tbl_rep_cat_extremes.setSortingEnabled(True)
                 
             prog.setLabelText("Rendering Charts..."); prog.setValue(95); QApplication.processEvents()
             self.render_report_charts(grp_data, cat_data)
@@ -3728,7 +3941,50 @@ class TimelineDiaryDialog(QDialog):
 
             self.fig_rep.tight_layout(pad=3.0)
             
-            # Force UI to instantly paint the canvas
+            # --- INTERACTIVE TOOLTIPS & CLICK ROUTING ---
+            if not hasattr(self, 'chart_tooltip'):
+                self.chart_tooltip = QLabel(self.canvas_rep)
+                self.chart_tooltip.setStyleSheet("background-color: rgba(13, 17, 23, 0.95); color: #58a6ff; border: 1px solid #30363d; border-radius: 4px; padding: 6px; font-weight: bold; font-size: 11px;")
+                self.chart_tooltip.hide()
+                
+            def on_motion(event):
+                if event.inaxes and hasattr(self, '_chart_elements'):
+                    for el in self._chart_elements:
+                        if hasattr(el, 'contains') and el.contains(event)[0]:
+                            if hasattr(el, 'category_name'):
+                                txt = f"Category: {el.category_name}\nSize: {human_size(el.category_size)}"
+                            else:
+                                txt = f"Group: {el.group_key}\nValue: {el.group_val:.2f}"
+                            self.chart_tooltip.setText(txt)
+                            self.chart_tooltip.adjustSize()
+                            self.chart_tooltip.move(int(event.x) + 12, self.canvas_rep.height() - int(event.y) + 12)
+                            self.chart_tooltip.show()
+                            return
+                if hasattr(self, 'chart_tooltip'): self.chart_tooltip.hide()
+
+            def on_click(event):
+                if event.inaxes and hasattr(self, '_chart_elements'):
+                    for el in self._chart_elements:
+                        if hasattr(el, 'contains') and el.contains(event)[0]:
+                            if hasattr(el, 'category_name'):
+                                drill_q = f"SELECT id, name, is_folder, extension, size, parent_path, {self.rep_date_col}, custom_tags FROM virtual_fs WHERE {self.rep_base_where} AND category = ?"
+                                self.execute_search(drill_q, self.rep_base_params + (el.category_name,), update_highlights=False)
+                                self.tabs.setCurrentIndex(1)
+                            else:
+                                val = el.group_key
+                                drill_q = f"SELECT id, name, is_folder, extension, size, parent_path, {self.rep_date_col}, custom_tags FROM virtual_fs WHERE {self.rep_base_where}"
+                                params = list(self.rep_base_params)
+                                groupby = self.cb_rep_groupby.currentText()
+                                if groupby == "Day": drill_q += f" AND SUBSTR({self.rep_date_col}, 1, 10) = ?"; params.append(val)
+                                elif groupby == "Month": drill_q += f" AND SUBSTR({self.rep_date_col}, 1, 7) = ?"; params.append(val)
+                                elif groupby == "Year": drill_q += f" AND SUBSTR({self.rep_date_col}, 1, 4) = ?"; params.append(val)
+                                self.execute_search(drill_q, tuple(params), update_highlights=False)
+                                self.tabs.setCurrentIndex(1)
+                            break
+
+            self.canvas_rep.mpl_connect('motion_notify_event', on_motion)
+            self.canvas_rep.mpl_connect('button_press_event', on_click)
+
             self.canvas_rep.draw()
             self.canvas_rep.update()
             
@@ -3812,6 +4068,44 @@ class TimelineDiaryDialog(QDialog):
                 db_id = sender.item(row, 3).text()
                 drill_query += " AND id = ?"; drill_params.append(db_id)
 
+            # ... right after sender == self.tbl_rep_largest ...
+            elif sender == self.tbl_rep_size_tiers:
+                range_label = sender.item(row, 0).text()
+                tiers_map = {
+                    "1 KB to 1 MB": (1024, 1024 * 1024),
+                    "1.1 MB to 10 MB": (1024 * 1024 * 1.1, 10 * 1024 * 1024),
+                    "10.1 MB to 50 MB": (10 * 1024 * 1024 * 1.01, 50 * 1024 * 1024),
+                    "50.1 MB to 100 MB": (50 * 1024 * 1024 * 1.01, 100 * 1024 * 1024),
+                    "100.1 MB to 500 MB": (100 * 1024 * 1024 * 1.01, 500 * 1024 * 1024),
+                    "500.1 MB to 1000 MB": (500 * 1024 * 1024 * 1.01, 1000 * 1024 * 1024),
+                    "1000.1 MB to 5000 MB": (1000 * 1024 * 1024 * 1.01, 5000 * 1024 * 1024),
+                    "5000.1 MB and Beyond": (5000 * 1024 * 1024 * 1.01, float('inf'))
+                }
+                if range_label in tiers_map:
+                    low, high = tiers_map[range_label]
+                    if high == float('inf'):
+                        drill_query += " AND size >= ?"; drill_params.append(low)
+                    else:
+                        drill_query += " AND size >= ? AND size <= ?"; drill_params.extend([low, high])
+
+            elif sender == self.tbl_rep_micro_buckets:
+                label_t = sender.item(row, 0).text()
+                micro_map = {
+                    "1 KB or less": 1024, "2 KB or less": 2048, "4 KB or less": 4096,
+                    "8 KB or less": 8192, "16 KB or less": 16384, "32 KB or less": 32768, "64 KB or less": 65536
+                }
+                if label_t in micro_map:
+                    drill_query += " AND size <= ?"; drill_params.append(micro_map[label_t])
+
+            elif sender == self.tbl_rep_ext_extremes:
+                ext_val = sender.item(row, 0).text().lower()
+                drill_query += " AND LOWER(extension) = ?"
+                drill_params.append(ext_val if ext_val.startswith('.') else f".{ext_val}")
+
+            elif sender == self.tbl_rep_cat_extremes:
+                cat_val = sender.item(row, 0).text()
+                drill_query += " AND category = ?"; drill_params.append(cat_val)
+            
             # --- NEW: Drilldown logic for the 2 new tables ---
             elif sender == self.tbl_rep_ext_by_cat:
                 cat_val = sender.item(row, 0).text()
@@ -5823,203 +6117,6 @@ class ThumbnailGeneratorThread(QThread):
                 except Exception: pass
             self.progress.emit(i + 1)
 
-
-
-
-class UsageLogDialog(QDialog):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("App Usage & Session Logs")
-        self.resize(600, 400)
-        if parent and hasattr(parent, 'styleSheet'): self.setStyleSheet(parent.styleSheet())
-        
-        layout = QVBoxLayout(self)
-        self.table = QTableWidget(0, 3)
-        self.table.setHorizontalHeaderLabels(["Session Start", "Session End", "Duration"])
-        self.table.horizontalHeader().setStretchLastSection(True)
-        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        layout.addWidget(self.table)
-        
-        btn_lay = QHBoxLayout()
-        btn_clear = QPushButton("🗑️ Clear All Logs")
-        btn_clear.setStyleSheet("background-color: #f85149; color: white; font-weight: bold;")
-        btn_clear.clicked.connect(self.clear_logs)
-        btn_lay.addStretch()
-        btn_lay.addWidget(btn_clear)
-        layout.addLayout(btn_lay)
-        
-        self.log_file = DATA_DIR / "usage.json"
-        self.load_logs()
-
-    def load_logs(self):
-        self.table.setRowCount(0)
-        if not self.log_file.exists(): return
-        try:
-            with open(self.log_file, "r") as f: logs = json.load(f)
-            for r, entry in enumerate(reversed(logs)):
-                self.table.insertRow(r)
-                self.table.setItem(r, 0, QTableWidgetItem(entry.get("start", "")))
-                self.table.setItem(r, 1, QTableWidgetItem(entry.get("end", "")))
-                self.table.setItem(r, 2, QTableWidgetItem(entry.get("duration", "")))
-        except Exception: pass
-
-    def clear_logs(self):
-        if QMessageBox.question(self, "Clear Logs", "Delete all session history?", QMessageBox.Yes|QMessageBox.No) == QMessageBox.Yes:
-            if self.log_file.exists(): self.log_file.unlink()
-            self.load_logs()
-
-class FloatingClock(QWidget):
-    def __init__(self, parent=None):
-        super().__init__(parent, Qt.Window | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
-        self.setAttribute(Qt.WA_TranslucentBackground)
-        self.is_24h = True
-        
-        self.layout = QVBoxLayout(self)
-        self.layout.setContentsMargins(10, 10, 10, 10)
-        self.lbl_time = QLabel()
-        self.lbl_time.setAlignment(Qt.AlignCenter)
-        self.layout.addWidget(self.lbl_time)
-        
-        self.timer = QTimer(self)
-        self.timer.timeout.connect(self.update_time)
-        self.timer.start(1000)
-        self.update_time()
-        
-        # Draggable state
-        self._drag_pos = None
-
-    def update_time(self):
-        fmt = "%H:%M:%S" if self.is_24h else "%I:%M:%S %p"
-        self.lbl_time.setText(datetime.now().strftime(fmt))
-        
-        is_dark = True
-        if self.parent() and hasattr(self.parent(), 'is_dark_mode'): is_dark = self.parent().is_dark_mode
-        bg_col = "rgba(13, 17, 23, 0.8)" if is_dark else "rgba(255, 255, 255, 0.8)"
-        txt_col = "#58a6ff" if is_dark else "#0969da"
-        self.lbl_time.setStyleSheet(f"background-color: {bg_col}; color: {txt_col}; border: 1px solid #30363d; border-radius: 8px; padding: 5px 15px; font-size: 24px; font-weight: bold; font-family: 'Segoe UI';")
-
-    def mousePressEvent(self, event):
-        if event.button() == Qt.LeftButton: self._drag_pos = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
-        elif event.button() == Qt.RightButton:
-            menu = QMenu(self)
-            menu.setStyleSheet("background-color: #161b22; color: white;")
-            act_fmt = menu.addAction("Toggle 12h/24h")
-            act_close = menu.addAction("Close Clock")
-            res = menu.exec(event.globalPosition().toPoint())
-            if res == act_fmt: 
-                self.is_24h = not self.is_24h; self.update_time()
-            elif res == act_close: self.hide()
-
-    def mouseMoveEvent(self, event):
-        if self._drag_pos is not None and event.buttons() == Qt.LeftButton:
-            self.move(event.globalPosition().toPoint() - self._drag_pos)
-            
-    def mouseReleaseEvent(self, event): self._drag_pos = None
-
-class QuickTextButton(QPushButton):
-    def __init__(self, text, main_app):
-        super().__init__(text)
-        self.text_val = text
-        self.main_app = main_app
-        self.setToolTip("Click to Copy")
-        self.setStyleSheet("QPushButton { background-color: transparent; border: 1px solid #30363d; border-radius: 4px; padding: 4px 10px; } QPushButton:hover { background-color: #1f6feb; color: white; }")
-        self.clicked.connect(self.copy_to_clip)
-
-    def copy_to_clip(self):
-        QApplication.clipboard().setText(self.text_val)
-        if self.main_app: self.main_app.status.showMessage(f"Copied: {self.text_val}", 2000)
-
-    def mousePressEvent(self, event):
-        if event.button() == Qt.RightButton:
-            menu = QMenu(self)
-            act_del = menu.addAction("🗑️ Delete Quick Text")
-            if menu.exec(event.globalPosition().toPoint()) == act_del:
-                self.main_app.remove_quick_text(self.text_val)
-        else: super().mousePressEvent(event)
-
-class FloatingNotepad(QWidget):
-    def __init__(self, parent=None):
-        super().__init__(parent, Qt.Window | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
-        self.setAttribute(Qt.WA_TranslucentBackground)
-        self.resize(260, 300)
-        
-        self.layout = QVBoxLayout(self)
-        self.layout.setContentsMargins(5, 5, 5, 5)
-        self.layout.setSpacing(0)
-        
-        # Draggable Header
-        self.header = QWidget()
-        self.header.setStyleSheet("background-color: #21262d; border-top-left-radius: 8px; border-top-right-radius: 8px;")
-        self.header.setFixedHeight(28)
-        h_lay = QHBoxLayout(self.header)
-        h_lay.setContentsMargins(10, 0, 5, 0)
-        lbl = QLabel("📝 Quick Text Pad")
-        lbl.setStyleSheet("color: #8b949e; font-size: 11px; font-weight: bold; border: none;")
-        h_lay.addWidget(lbl)
-        h_lay.addStretch()
-        btn_close = QPushButton("✕")
-        btn_close.setFixedSize(20, 20)
-        btn_close.setStyleSheet("QPushButton { background: transparent; color: #8b949e; border: none; font-weight: bold; } QPushButton:hover { color: #f85149; }")
-        btn_close.clicked.connect(self.hide)
-        h_lay.addWidget(btn_close)
-        
-        # Text Area
-        self.text_edit = QPlainTextEdit()
-        self.text_edit.setPlaceholderText("Type or paste anything here...\n\n(It will stay on top of everything)")
-        self.text_edit.setStyleSheet("QPlainTextEdit { background-color: rgba(13, 17, 23, 0.9); color: #c9d1d9; border: 1px solid #30363d; border-bottom-left-radius: 8px; border-bottom-right-radius: 8px; padding: 8px; font-size: 12px; }")
-        
-        self.layout.addWidget(self.header)
-        self.layout.addWidget(self.text_edit)
-        self._drag_pos = None
-
-    def mousePressEvent(self, event):
-        if event.button() == Qt.LeftButton and event.position().y() <= 35:
-            self._drag_pos = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
-
-    def mouseMoveEvent(self, event):
-        if self._drag_pos is not None and event.buttons() == Qt.LeftButton:
-            self.move(event.globalPosition().toPoint() - self._drag_pos)
-            
-    def mouseReleaseEvent(self, event):
-        self._drag_pos = None
-
-class DragScrollTabBar(QTabBar):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self._drag_pos = None
-        self.setUsesScrollButtons(True) # Keep true so tabs don't squish
-        self.setStyleSheet("QTabBar::scroller { width: 0px; }") # Hide the physical buttons natively
-        self.setCursor(Qt.OpenHandCursor)
-
-    def mousePressEvent(self, event):
-        if event.button() == Qt.LeftButton:
-            self._drag_pos = event.position().x()
-            self.setCursor(Qt.ClosedHandCursor)
-        super().mousePressEvent(event)
-
-    def mouseMoveEvent(self, event):
-        if self._drag_pos is not None:
-            delta = self._drag_pos - event.position().x()
-            if abs(delta) > 2: # Send synthetic wheel scroll events for buttery dragging
-                import PySide6.QtGui as QtGui
-                angle_delta = QtGui.QPoint(0, int(delta * -3))
-                wheel_event = QtGui.QWheelEvent(event.position(), event.globalPosition(), QtGui.QPoint(0,0), angle_delta, Qt.NoButton, Qt.NoModifier, Qt.ScrollUpdate, False)
-                QApplication.sendEvent(self, wheel_event)
-                self._drag_pos = event.position().x()
-        super().mouseMoveEvent(event)
-
-    def mouseReleaseEvent(self, event):
-        self._drag_pos = None
-        self.setCursor(Qt.OpenHandCursor)
-        super().mouseReleaseEvent(event)
-        
-class InteractiveDashboardCard(QFrame):
-    clicked = Signal()
-    def mousePressEvent(self, event):
-        if event.button() == Qt.LeftButton: self.clicked.emit()
-        super().mousePressEvent(event)
-
 # ---------------- Main Application Window ----------------
 class vmanVirtualManager(QMainWindow):
     def __init__(self):
@@ -6029,12 +6126,20 @@ class vmanVirtualManager(QMainWindow):
         self.current_prefix = "/"
         self.active_db_path = str(DB_FILE)
         
-        # --- NEW: App Usage Session Tracker, Floating Clock & Notepad ---
+        # --- App Usage Session Tracker & Floating Widgets ---
         self.session_start = datetime.now()
+        
         self.floating_clock = FloatingClock(self)
         self.floating_clock.hide() 
+        
         self.floating_notepad = FloatingNotepad(self)
         self.floating_notepad.hide()
+        
+        self.floating_quicktext = FloatingQuickText(DATA_DIR / "text.json", self)
+        self.floating_quicktext.hide()
+        
+        self.floating_quotes = FloatingQuotes(self)
+        self.floating_quotes.hide()
         
         # --- Persistent Storage Settings ---
         self.settings = QSettings("vmanOS", "VirtualManager")
@@ -6267,18 +6372,10 @@ class vmanVirtualManager(QMainWindow):
         self.search_box.setMaximumWidth(300)
         self.search_box.returnPressed.connect(self.run_global_search)
         
-        # --- NEW: Quick Text Ribbon ---
-        self.qt_toolbar = QToolBar("Quick Text Ribbon")
-        self.qt_toolbar.setIconSize(QSize(16, 16))
-        self.qt_toolbar.setStyleSheet("QToolBar { border-bottom: 1px solid #30363d; spacing: 5px; }")
-        self.addToolBar(Qt.TopToolBarArea, self.qt_toolbar)
-        self.refresh_quick_text()
-        # -----------------------------
-        
         nav_row.addWidget(self.breadcrumb_scroll, stretch=1)
         nav_row.addWidget(self.local_filter)
         nav_row.addWidget(self.search_box)
-        vbox.addLayout(nav_row) # This line already exists
+        vbox.addLayout(nav_row)
 
         self.view_stack = QStackedWidget()
         
@@ -6345,6 +6442,7 @@ class vmanVirtualManager(QMainWindow):
         media_layout = QVBoxLayout(self.media_container)
         self.lbl_media_title = QLabel("Audio Engine")
         self.lbl_media_title.setAlignment(Qt.AlignCenter)
+        self.lbl_media_title.setWordWrap(True) # <--- FIX: Prevents long media names from stretching
         media_controls = QHBoxLayout()
         self.btn_play = QPushButton("▶")
         self.btn_pause = QPushButton("⏸")
@@ -6374,20 +6472,31 @@ class vmanVirtualManager(QMainWindow):
 
         props_container = QWidget()
         ed_layout = QFormLayout(props_container)
+        
+        # --- FIX: Set Minimum Widths so they scroll instead of stretching the UI ---
         self.ed_name = QLineEdit()
+        self.ed_name.setMinimumWidth(100) 
         
         self.ed_v_path = QLineEdit()
         self.ed_v_path.setReadOnly(True)
+        self.ed_v_path.setMinimumWidth(100) 
         
         self.ed_target = QLineEdit()
         self.ed_target.setReadOnly(True)
+        self.ed_target.setMinimumWidth(100) 
+        
         self.ed_custom_tags = QLineEdit()
         self.ed_custom_tags.setPlaceholderText("tag1, tag2")
+        self.ed_custom_tags.setMinimumWidth(100) 
+        
         self.ed_secondary = QLineEdit()
+        self.ed_secondary.setMinimumWidth(100) 
         
         self.ed_sha = QLineEdit()
         self.ed_sha.setReadOnly(True)
         self.ed_sha.setPlaceholderText("Not Computed")
+        self.ed_sha.setMinimumWidth(100) 
+        # --------------------------------------------------------------------------
         
         self.ed_tag = QComboBox()
         self.ed_tag.addItems(["None", "Red", "Orange", "Gold", "Green", "Cyan", "Blue", "Purple", "Pink"])
@@ -6425,7 +6534,17 @@ class vmanVirtualManager(QMainWindow):
         ctrl_lay.setContentsMargins(10, 10, 10, 10)
 
         self.stat_combo = QComboBox()
-        self.stat_combo.addItems(["Distribution by Extension (Size)", "Distribution by Extension (Count)", "Top 10 Largest Files", "Storage Ratio (Pie Chart)", "File Count Over Time"])
+        self.stat_combo.addItems([
+            "Distribution by Extension (Size)", 
+            "Distribution by Extension (Count)", 
+            "Top 10 Largest Files", 
+            "Storage Ratio (Pie Chart)", 
+            "File Count Over Time",
+            "Subfolder Distribution (Size)",   # NEW!
+            "Subfolder Distribution (Count)",  # NEW!
+            "File Age Analysis (Year)",        # NEW!
+            "Category Breakdown (Size)"        # NEW!
+        ])
         self.stat_combo.currentIndexChanged.connect(self.update_statistics)
 
         self.lbl_inv = QLabel("Investigation:")
@@ -6434,10 +6553,39 @@ class vmanVirtualManager(QMainWindow):
         ch_layout.addWidget(self.ctrl_bar)
 
         if MATPLOTLIB_AVAILABLE: 
-            # Responsive Figure (no hardcoded figsize)
+            # Responsive Figure
             self.figure = Figure(dpi=100)
             self.canvas = FigureCanvas(self.figure)
-            ch_layout.addWidget(self.canvas, stretch=1) # Expands natively
+            
+            # --- NEW: Chart Scroll Area with Slim CSS ---
+            self.chart_scroll = QScrollArea()
+            self.chart_scroll.setWidgetResizable(True)
+            self.chart_scroll.setFrameShape(QScrollArea.NoFrame)
+            self.chart_scroll.setStyleSheet("""
+                QScrollArea { background: transparent; border: none; }
+                QScrollBar:horizontal { height: 8px; background: transparent; }
+                QScrollBar::handle:horizontal { background: #30363d; border-radius: 4px; }
+                QScrollBar::handle:horizontal:hover { background: #58a6ff; }
+            """)
+            self.chart_scroll.setWidget(self.canvas)
+            ch_layout.addWidget(self.chart_scroll, stretch=1) 
+            
+            # --- NEW: Context Menu for Chart Scroll Toggle ---
+            self.chart_is_scrollable = False
+            self.chart_scroll.setContextMenuPolicy(Qt.CustomContextMenu)
+            self.chart_scroll.customContextMenuRequested.connect(self.show_chart_menu)
+            
+           # --- Matplotlib Interactivity Hooks ---
+            self.canvas.mpl_connect("button_press_event", self.on_chart_click)
+            self.canvas.mpl_connect("motion_notify_event", self.on_chart_hover)
+            self.canvas.mpl_connect("figure_leave_event", lambda e: self.chart_tooltip.hide()) # <--- NEW: Forces tooltip to hide
+            
+            self.chart_tooltip = QLabel(self.canvas)
+            self.chart_tooltip.setStyleSheet("background-color: rgba(13, 17, 23, 0.95); color: #58a6ff; border: 1px solid #30363d; border-radius: 4px; padding: 6px; font-weight: bold; font-size: 11px;")
+            self.chart_tooltip.setAttribute(Qt.WA_TransparentForMouseEvents)
+            self.chart_tooltip.hide()
+            self._chart_elements = [] # Store tuple: (patch, copy_text, display_text)
+            
         else: 
             self.figure = self.canvas = None
             self.lbl_err = QLabel("Matplotlib not installed.")
@@ -6448,8 +6596,6 @@ class vmanVirtualManager(QMainWindow):
 
         self.right_dock.setWidget(self.right_tabs)
         self.addDockWidget(Qt.RightDockWidgetArea, self.right_dock)
-        
-        # Force the Inspector to be slim by default so the main UI has room
         self.resizeDocks([self.right_dock], [380], Qt.Horizontal)
         
         self.status = QStatusBar()
@@ -7040,10 +7186,16 @@ class vmanVirtualManager(QMainWindow):
         # 2. Construct the true Virtual Path so you can copy-paste it
         actual_v_path = f"{parent_path}{f_name}/" if typ == "folder" else f"{parent_path}{f_name}"
         self.ed_v_path.setText(actual_v_path)
+        self.ed_v_path.setCursorPosition(0) # <--- Fix cursor position
         
         self.ed_secondary.setText(str(sec_n) if sec_n else "")
+        self.ed_secondary.setCursorPosition(0) # <--- Fix cursor position
+        
         self.ed_custom_tags.setText(str(custom_tags) if custom_tags else "")
+        self.ed_custom_tags.setCursorPosition(0) # <--- Fix cursor position
+        
         self.ed_sha.setText(str(sha256_val) if sha256_val else "")
+        self.ed_sha.setCursorPosition(0) # <--- Fix cursor position
         
         if typ == "folder": 
             self.preview_stack.setCurrentIndex(1)
@@ -7080,7 +7232,9 @@ class vmanVirtualManager(QMainWindow):
             data = self.file_table.model().data(self.file_table.model().index(index.row(), 1), Qt.UserRole)
             if data[2] == -1: return 
             name = self.file_table.model().data(self.file_table.model().index(index.row(), 1), Qt.DisplayRole)
-            self.ed_name.setText(str(name).split('\n')[0]); self.ed_tag.setCurrentIndex(max(0, self.ed_tag.findText(self.file_table.model().data(self.file_table.model().index(index.row(), 1), Qt.UserRole + 1))))
+            self.ed_name.setText(str(name).split('\n')[0])
+            self.ed_name.setCursorPosition(0) # <--- Fix cursor position
+            self.ed_tag.setCurrentIndex(max(0, self.ed_tag.findText(self.file_table.model().data(self.file_table.model().index(index.row(), 1), Qt.UserRole + 1))))
             self._trigger_preview(data[0], data[1], data[2], name)
 
     def on_grid_click(self, index: QModelIndex):
@@ -7088,7 +7242,9 @@ class vmanVirtualManager(QMainWindow):
             data = self.file_grid.model().data(index, Qt.UserRole)
             if data[2] == -1: return
             name = self.file_grid.model().data(index, Qt.DisplayRole)
-            self.ed_name.setText(str(name).split('\n')[0]); self.ed_tag.setCurrentIndex(max(0, self.ed_tag.findText(self.file_grid.model().data(index, Qt.UserRole + 1))))
+            self.ed_name.setText(str(name).split('\n')[0])
+            self.ed_name.setCursorPosition(0) # <--- Fix cursor position
+            self.ed_tag.setCurrentIndex(max(0, self.ed_tag.findText(self.file_grid.model().data(index, Qt.UserRole + 1))))
             self._trigger_preview(data[0], data[1], data[2], name)
 
     def save_properties_editor(self):
@@ -7432,7 +7588,7 @@ class vmanVirtualManager(QMainWindow):
         view_menu.addAction("🗂️ Toggle Data Engine View", lambda: self.tree_dock.setVisible(not self.tree_dock.isVisible()))
         view_menu.addAction("📊 Toggle Inspector", lambda: self.right_dock.setVisible(not self.right_dock.isVisible()))
         
-        # --- NEW: Floating Widgets & Usage Log ---
+        # --- Floating Widgets & Usage Log ---
         view_menu.addSeparator()
         
         act_clock = view_menu.addAction("🕒 Toggle Floating Clock")
@@ -7440,13 +7596,25 @@ class vmanVirtualManager(QMainWindow):
         act_clock.setChecked(self.floating_clock.isVisible())
         act_clock.triggered.connect(lambda: self.floating_clock.setVisible(not self.floating_clock.isVisible()))
         
-        act_notepad = view_menu.addAction("📝 Toggle Floating Notepad")
+        act_notepad = view_menu.addAction("📝 Toggle Quick Notepad")
         act_notepad.setCheckable(True)
         act_notepad.setChecked(self.floating_notepad.isVisible())
         act_notepad.triggered.connect(lambda: self.floating_notepad.setVisible(not self.floating_notepad.isVisible()))
         
-        view_menu.addAction("⏱️ View App Usage Logs", lambda: UsageLogDialog(self).exec())
-        # --------------------------------
+        # --- NEW: Floating Quotes Toggle ---
+        act_quotes = view_menu.addAction("💬 Toggle Floating Quotes")
+        act_quotes.setCheckable(True)
+        act_quotes.setChecked(self.floating_quotes.isVisible())
+        act_quotes.triggered.connect(lambda: self.floating_quotes.setVisible(not self.floating_quotes.isVisible()))
+
+        # --- NEW: Floating Quick Text Toggle ---
+        act_qtext = view_menu.addAction("⚡ Toggle Floating Quick Text")
+        act_qtext.setCheckable(True)
+        act_qtext.setChecked(self.floating_quicktext.isVisible())
+        act_qtext.triggered.connect(lambda: self.floating_quicktext.setVisible(not self.floating_quicktext.isVisible()))
+        
+        
+        view_menu.addAction("⏱️ View App Usage Logs", lambda: UsageLogDialog(DATA_DIR / "usage.json", self).exec())
         
         act_paste = QAction("📋 Paste (Ctrl+V)", self)
         act_paste.triggered.connect(self.cmd_paste)
@@ -7874,20 +8042,35 @@ class vmanVirtualManager(QMainWindow):
         
         grid_color = '#30363d' if is_dark else '#e1e4e8'
 
+        if hasattr(self, '_chart_elements'):
+            self._chart_elements.clear()
+            self.chart_tooltip.hide()
+            
+        # --- SMART LIMIT LOGIC ---
+        is_scrollable = getattr(self, 'chart_is_scrollable', False)
+        item_limit = 50 if is_scrollable else 12
+        item_count = 0 
+        
+        # Helper to format X-Axis strictly and responsively
+        def format_x_axis(labels):
+            ax.set_xticks(range(len(labels)))
+            ax.set_xticklabels(labels, rotation=45, ha='right', fontsize=8, color=txt_c)
+
         if "Line Chart" in mode or "Over Time" in mode:
             data = stats["time_series"]
             if not data: ax.text(0.5, 0.5, "No temporal data available", color=txt_c, ha='center')
             else:
-                dates = [datetime.strptime(d[0], "%Y-%m") for d in data if len(d[0]) == 7]
-                if "Count" in mode: vals = [d[1] for d in data if len(d[0]) == 7]; ylabel = "Files Modified"; color = '#58a6ff'
-                else: vals = [d[2] / (1024*1024) for d in data if len(d[0]) == 7]; ylabel = "Storage (MB)"; color = '#e3b341'
+                dates = [datetime.strptime(d[0], "%Y-%m") for d in data if len(d[0]) == 7][-item_limit:]
+                if "Count" in mode: vals = [d[1] for d in data if len(d[0]) == 7][-item_limit:]; ylabel = "Files Modified"; color = '#58a6ff'
+                else: vals = [d[2] / (1024*1024) for d in data if len(d[0]) == 7][-item_limit:]; ylabel = "Storage (MB)"; color = '#e3b341'
                 if dates and vals:
+                    item_count = len(dates)
                     ax.plot(dates, vals, marker='o', linestyle='-', color=color, linewidth=2, markersize=5)
                     ax.fill_between(dates, vals, color=color, alpha=0.15)
-                    ax.xaxis.set_major_formatter(mdates.DateFormatter('%b %Y'))
-                    self.figure.autofmt_xdate(rotation=30)
-                    ax.set_ylabel(ylabel, color=txt_c, fontweight='bold')
-                    ax.set_title(mode, color=txt_c, fontweight='bold', pad=15)
+                    ax.xaxis.set_major_formatter(mdates.DateFormatter('%b %y'))
+                    self.figure.autofmt_xdate(rotation=45, ha='right')
+                    ax.set_ylabel(ylabel, color=txt_c, fontweight='bold', fontsize=9)
+                    ax.set_title(mode, color=txt_c, fontweight='bold', pad=8)
                     ax.grid(True, color=grid_color, linestyle='--', alpha=0.5)
 
         elif "Distribution by Extension" in mode:
@@ -7895,43 +8078,166 @@ class vmanVirtualManager(QMainWindow):
             if not data: ax.text(0.5, 0.5, "No distribution data available", color=txt_c, ha='center')
             else:
                 clean_data = [(str(d[0]).upper() if d[0] else 'NONE', d[1], d[2]) for d in data]
+
                 if "Size" in mode: 
-                    sorted_d = sorted(clean_data, key=lambda x: x[2], reverse=True)[:10]
-                    ax.bar([x[0] for x in sorted_d], [x[2] / (1024*1024) for x in sorted_d], color='#3fb950', edgecolor=bg_c)
-                    ax.set_ylabel("Storage Size (MB)", color=txt_c, fontweight='bold')
+                    sorted_d = sorted(clean_data, key=lambda x: x[2], reverse=True)[:item_limit]
+                    vals = [x[2] / (1024*1024) for x in sorted_d]
+                    bars = ax.bar([x[0][:8] for x in sorted_d], vals, color='#3fb950', edgecolor=bg_c)
+                    for i, bar in enumerate(bars): self._chart_elements.append((bar, sorted_d[i][0], f"Ext: {sorted_d[i][0]}\nSize: {vals[i]:.2f} MB"))
+                    ax.set_ylabel("Storage Size (MB)", color=txt_c, fontweight='bold', fontsize=9)
                 else: 
-                    sorted_d = sorted(clean_data, key=lambda x: x[1], reverse=True)[:10]
-                    ax.bar([x[0] for x in sorted_d], [x[1] for x in sorted_d], color='#58a6ff', edgecolor=bg_c)
-                    ax.set_ylabel("File Count", color=txt_c, fontweight='bold')
-                ax.set_title(mode, color=txt_c, fontweight='bold', pad=15)
-                ax.tick_params(axis='x', rotation=30)
+                    sorted_d = sorted(clean_data, key=lambda x: x[1], reverse=True)[:item_limit]
+                    vals = [x[1] for x in sorted_d]
+                    bars = ax.bar([x[0][:8] for x in sorted_d], vals, color='#58a6ff', edgecolor=bg_c)
+                    for i, bar in enumerate(bars): self._chart_elements.append((bar, sorted_d[i][0], f"Ext: {sorted_d[i][0]}\nCount: {vals[i]} items"))
+                    ax.set_ylabel("File Count", color=txt_c, fontweight='bold', fontsize=9)
+                
+                item_count = len(sorted_d)
+                format_x_axis([x[0][:8] for x in sorted_d])
+                ax.set_title(mode, color=txt_c, fontweight='bold', pad=8)
                 ax.grid(axis='y', color=grid_color, linestyle='--', alpha=0.5)
 
         elif "Largest Files" in mode:
             data = stats["top_files"]
             if not data: ax.text(0.5, 0.5, "No files available", color=txt_c, ha='center')
             else:
-                names = [d[0][:15] + ".." if len(d[0])>15 else d[0] for d in data]
-                sizes = [d[1] / (1024*1024) for d in data]
-                ax.barh(names, sizes, color='#a371f7', edgecolor=bg_c)
-                ax.set_xlabel("Size (MB)", color=txt_c, fontweight='bold')
-                ax.set_title(mode, color=txt_c, fontweight='bold', pad=15)
+                names = [d[0][:18] + ".." if len(d[0])>18 else d[0] for d in data[:item_limit]]
+                sizes = [d[1] / (1024*1024) for d in data[:item_limit]]
+                
+                bars = ax.barh(names, sizes, color='#a371f7', edgecolor=bg_c)
+                for i, bar in enumerate(bars):
+                    self._chart_elements.append((bar, data[i][0], f"File: {data[i][0]}\nSize: {sizes[i]:.2f} MB"))
+                
+                item_count = len(names)
+                ax.set_xlabel("Size (MB)", color=txt_c, fontweight='bold', fontsize=9)
+                ax.set_title(mode, color=txt_c, fontweight='bold', pad=8)
                 ax.invert_yaxis()
                 ax.grid(axis='x', color=grid_color, linestyle='--', alpha=0.5)
-        
+                
+        elif "Subfolder Distribution" in mode:
+            cur = self.db.conn.cursor()
+            cur.execute("SELECT parent_path, COUNT(id), SUM(size) FROM virtual_fs WHERE parent_path LIKE ? AND is_folder=0 GROUP BY parent_path", (f"{self.current_prefix}%",))
+            sub_data = {}
+            for pp, cnt, sz in cur.fetchall():
+                rel = pp[len(self.current_prefix):].strip('/')
+                first_level = rel.split('/')[0] if rel else "(Root)"
+                if first_level not in sub_data: sub_data[first_level] = [0, 0]
+                sub_data[first_level][0] += cnt
+                sub_data[first_level][1] += sz or 0
+            
+            if not sub_data: ax.text(0.5, 0.5, "No subfolder data available", color=txt_c, ha='center')
+            else:
+                is_size = "Size" in mode
+                idx = 1 if is_size else 0
+                sorted_d = sorted(sub_data.items(), key=lambda x: x[1][idx], reverse=True)[:item_limit]
+                
+                names_display = [x[0][:10] + ".." if len(x[0])>10 else x[0] for x in sorted_d]
+                vals = [(x[1][1]/(1024*1024)) if is_size else x[1][0] for x in sorted_d]
+                
+                bars = ax.bar(names_display, vals, color='#3fb950', edgecolor=bg_c)
+                for i, bar in enumerate(bars):
+                    self._chart_elements.append((bar, sorted_d[i][0], f"Folder: {sorted_d[i][0]}\nValue: {vals[i]:.2f} {'MB' if is_size else 'Items'}"))
+                
+                item_count = len(names_display)
+                format_x_axis(names_display)
+                ax.set_ylabel("Storage Size (MB)" if is_size else "File Count", color=txt_c, fontweight='bold', fontsize=9)
+                ax.set_title(mode, color=txt_c, fontweight='bold', pad=8)
+                ax.grid(axis='y', color=grid_color, linestyle='--', alpha=0.5)
+
+        elif "Category Breakdown" in mode:
+            cur = self.db.conn.cursor()
+            cur.execute("SELECT category, SUM(size), COUNT(id) FROM virtual_fs WHERE parent_path LIKE ? AND is_folder=0 GROUP BY category", (f"{self.current_prefix}%",))
+            data = cur.fetchall()
+            if not data: ax.text(0.5, 0.5, "No category data available", color=txt_c, ha='center')
+            else:
+                sorted_d = sorted(data, key=lambda x: x[1] or 0, reverse=True)[:item_limit]
+                names = [str(x[0]) if x[0] else 'Others' for x in sorted_d]
+                sizes = [(x[1] or 0) / (1024*1024) for x in sorted_d]
+                counts = [x[2] for x in sorted_d]
+                
+                bars = ax.bar(names, sizes, color='#f85149', edgecolor=bg_c)
+                for i, bar in enumerate(bars):
+                    self._chart_elements.append((bar, names[i], f"Category: {names[i]}\nSize: {sizes[i]:.2f} MB\nItems: {counts[i]}"))
+                
+                item_count = len(names)
+                format_x_axis(names)
+                ax.set_ylabel("Storage Size (MB)", color=txt_c, fontweight='bold', fontsize=9)
+                ax.set_title(mode, color=txt_c, fontweight='bold', pad=8)
+                ax.grid(axis='y', color=grid_color, linestyle='--', alpha=0.5)
+
+        elif "File Age Analysis" in mode:
+            cur = self.db.conn.cursor()
+            cur.execute("SELECT year, COUNT(id), SUM(size) FROM virtual_fs WHERE parent_path LIKE ? AND is_folder=0 AND year IS NOT NULL AND year != '' GROUP BY year ORDER BY year", (f"{self.current_prefix}%",))
+            data = cur.fetchall()
+            if not data: ax.text(0.5, 0.5, "No temporal data available", color=txt_c, ha='center')
+            else:
+                names = [str(x[0]) for x in data][-item_limit:] 
+                counts = [x[1] for x in data][-item_limit:]
+                sizes = [(x[2] or 0) / (1024*1024) for x in data][-item_limit:]
+                
+                bars = ax.bar(names, counts, color='#e3b341', edgecolor=bg_c)
+                for i, bar in enumerate(bars):
+                    self._chart_elements.append((bar, names[i], f"Year: {names[i]}\nItems: {counts[i]}\nSize: {sizes[i]:.2f} MB"))
+                
+                item_count = len(names)
+                format_x_axis(names)
+                ax.set_ylabel("File Count", color=txt_c, fontweight='bold', fontsize=9)
+                ax.set_title(mode, color=txt_c, fontweight='bold', pad=8)
+                ax.grid(axis='y', color=grid_color, linestyle='--', alpha=0.5)
+
         elif "Ratio" in mode:
-            labels = ['Used Storage', 'Free Space']
+            labels = ['Used', 'Free']
             sizes = [stats['used_bytes'], max(0, self.max_virtual_storage - stats['used_bytes'])]
             colors = ['#e3b341', '#3fb950']         
-            ax.pie(sizes, labels=labels, autopct='%1.1f%%', startangle=140, colors=colors, textprops={'color': txt_c, 'fontweight': 'bold'}, wedgeprops={'edgecolor': bg_c, 'linewidth': 1.5})
-            ax.set_title("Simulated Storage Allocation", color=txt_c, fontweight='bold', pad=15)
+            ax.pie(sizes, labels=labels, autopct='%1.1f%%', startangle=140, colors=colors, textprops={'color': txt_c, 'fontweight': 'bold', 'fontsize': 9}, wedgeprops={'edgecolor': bg_c, 'linewidth': 1.5})
+            ax.set_title("Simulated Storage Allocation", color=txt_c, fontweight='bold', pad=8)
 
-        # Cleanup Spines for Modern Minimalist Look
+        # --- PREVENT WHITE SPACE AT MARGINS ---
         if "Ratio" not in mode:
             for spine in ['top', 'right']: ax.spines[spine].set_visible(False)
             for spine in ['bottom', 'left']: ax.spines[spine].set_color(grid_color)
+            
+            # Pushes the bars entirely to the left and right edges with minimal padding
+            ax.margins(x=0.02)
+            if "Largest" in mode: ax.margins(y=0.02) 
 
-        self.figure.tight_layout(pad=1.5)
+        # Eliminate all possible empty space around the chart natively
+        self.figure.tight_layout(pad=0.2)
+        
+        # Explicitly force the underlying Qt ScrollArea to be dark so "white flashes" never happen
+        self.chart_scroll.setStyleSheet(f"""
+            QScrollArea {{ background: {bg_c}; border: none; }} 
+            QWidget#qt_scrollarea_viewport {{ background: {bg_c}; }} 
+            QScrollBar:horizontal {{ height: 8px; background: transparent; }} 
+            QScrollBar::handle:horizontal {{ background: #30363d; border-radius: 4px; }} 
+            QScrollBar::handle:horizontal:hover {{ background: #58a6ff; }}
+            QScrollBar:vertical {{ width: 8px; background: transparent; }} 
+            QScrollBar::handle:vertical {{ background: #30363d; border-radius: 4px; }}
+        """)
+
+        # --- RESPONSIVE MOBILE-APP SIZING LOGIC ---
+        if is_scrollable and item_count > 0 and "Ratio" not in mode:
+            self.chart_scroll.setWidgetResizable(False)
+            
+            vw = self.chart_scroll.viewport().width()
+            vh = self.chart_scroll.viewport().height()
+            
+            if "Largest" in mode:
+                # Top 10/Largest scales vertically, locks horizontal
+                w_px = vw
+                h_px = max(vh, item_count * 28) 
+            else:
+                # Standard charts scale horizontally, lock vertical
+                w_px = max(vw, item_count * 28) # 28 pixels per bar makes it extremely tight and clean
+                h_px = vh
+                
+            self.canvas.setFixedSize(w_px, h_px)
+        else:
+            # Let Qt handle 100% of the scaling naturally
+            self.chart_scroll.setWidgetResizable(True)
+            self.canvas.setMinimumSize(0, 0)
+            self.canvas.setMaximumSize(16777215, 16777215)
+            
         self.canvas.draw()
 
     def export_to_zip(self, items_to_export):
@@ -7960,7 +8266,7 @@ class vmanVirtualManager(QMainWindow):
         except Exception: pass
 
     def closeEvent(self, ev):
-        # --- NEW: Save Session Usage Time ---
+        # --- NEW: Save Session Usage Time to JSON ---
         try:
             end_time = datetime.now()
             duration = end_time - self.session_start
@@ -7971,13 +8277,22 @@ class vmanVirtualManager(QMainWindow):
             log_file = DATA_DIR / "usage.json"
             logs = []
             if log_file.exists():
-                with open(log_file, "r") as f: logs = json.load(f)
-            logs.append({"start": self.session_start.strftime("%Y-%m-%d %H:%M:%S"), "end": end_time.strftime("%Y-%m-%d %H:%M:%S"), "duration": dur_str})
-            with open(log_file, "w") as f: json.dump(logs, f)
-        except Exception: pass
+                with open(log_file, "r", encoding="utf-8") as f: logs = json.load(f)
+            
+            logs.append({
+                "start": self.session_start.strftime("%Y-%m-%d %H:%M:%S"), 
+                "end": end_time.strftime("%Y-%m-%d %H:%M:%S"), 
+                "duration": dur_str
+            })
+            
+            with open(log_file, "w", encoding="utf-8") as f: json.dump(logs, f)
+        except Exception as e: 
+            print(f"Failed to log session: {e}")
         # ------------------------------------
 
+        # Save columns mathematically before exiting
         self.settings.setValue("main_table_state", self.file_table.horizontalHeader().saveState())
+        
         if HAS_MULTIMEDIA and hasattr(self, 'player'): self.player.stop()
         if self.render_timer.isActive(): self.render_timer.stop()
         for w in list(self._workers):
@@ -8420,54 +8735,50 @@ class vmanVirtualManager(QMainWindow):
         self.compiler.finished.connect(on_compile_finished)
         self.compiler.error.connect(lambda e: (self.compile_dlg.close(), QMessageBox.critical(self, "Error", e)))
         self._register_worker(self.compiler)
-        self.compiler.start()            
+        self.compiler.start()       
 
-    def refresh_quick_text(self):
-        self.qt_toolbar.clear()
-        json_file = DATA_DIR / "text.json"
-        saved_texts = []
-        if json_file.exists():
-            try:
-                with open(json_file, "r", encoding="utf-8") as f: saved_texts = json.load(f)
-            except Exception: pass
-            
-        lbl = QLabel(" ⚡ Quick Text: ")
-        lbl.setStyleSheet("font-weight: bold; color: #8b949e;")
-        self.qt_toolbar.addWidget(lbl)
+    def show_chart_menu(self, pos):
+        menu = QMenu(self)
+        menu.setStyleSheet("background-color: #161b22; color: white; border: 1px solid #30363d;")
+        act_scroll = menu.addAction("↔️ Horizontal Scroll (For large datasets)")
+        act_scroll.setCheckable(True)
+        act_scroll.setChecked(getattr(self, 'chart_is_scrollable', False))
         
-        btn_add = QToolButton()
-        btn_add.setText("➕ Add Text")
-        btn_add.setStyleSheet("color: #3fb950; font-weight: bold;")
-        btn_add.clicked.connect(self.add_quick_text)
-        self.qt_toolbar.addWidget(btn_add)
-        self.qt_toolbar.addSeparator()
+        if menu.exec(self.chart_scroll.mapToGlobal(pos)) == act_scroll:
+            self.chart_is_scrollable = not self.chart_is_scrollable
+            self.update_statistics()
+
+    def on_chart_click(self, event):
+        if event.inaxes and hasattr(self, '_chart_elements'):
+            for patch, copy_text, _ in self._chart_elements:
+                if patch.contains(event)[0]:
+                    QApplication.clipboard().setText(copy_text)
+                    self.status.showMessage(f"Copied to clipboard: {copy_text}", 3000)
+                    break
+
+    def on_chart_hover(self, event):
+        if event.inaxes and hasattr(self, '_chart_elements'):
+            for patch, _, tooltip_text in self._chart_elements:
+                if patch.contains(event)[0]:
+                    self.chart_tooltip.setText(tooltip_text)
+                    self.chart_tooltip.adjustSize()
+                    
+                    # Qt coordinates
+                    x = int(event.x) + 12
+                    y = self.canvas.height() - int(event.y) + 12
+                    
+                    # Strict Bounds checking against the Canvas
+                    if x + self.chart_tooltip.width() > self.canvas.width():
+                        x = int(event.x) - self.chart_tooltip.width() - 8
+                    if y + self.chart_tooltip.height() > self.canvas.height():
+                        y = self.canvas.height() - int(event.y) - self.chart_tooltip.height() - 8
+                        
+                    self.chart_tooltip.move(max(0, x), max(0, y))
+                    self.chart_tooltip.show()
+                    return
+        if hasattr(self, 'chart_tooltip'):
+            self.chart_tooltip.hide()
         
-        for t in saved_texts:
-            self.qt_toolbar.addWidget(QuickTextButton(t, self))
-
-    def add_quick_text(self):
-        text, ok = QInputDialog.getText(self, "Add Quick Text", "Enter text to save to ribbon:")
-        if ok and text.strip():
-            json_file = DATA_DIR / "text.json"
-            saved = []
-            if json_file.exists():
-                try:
-                    with open(json_file, "r", encoding="utf-8") as f: saved = json.load(f)
-                except Exception: pass
-            if text.strip() not in saved: saved.append(text.strip())
-            with open(json_file, "w", encoding="utf-8") as f: json.dump(saved, f)
-            self.refresh_quick_text()
-
-    def remove_quick_text(self, text):
-        json_file = DATA_DIR / "text.json"
-        if json_file.exists():
-            try:
-                with open(json_file, "r", encoding="utf-8") as f: saved = json.load(f)
-                if text in saved: saved.remove(text)
-                with open(json_file, "w", encoding="utf-8") as f: json.dump(saved, f)
-                self.refresh_quick_text()
-            except Exception: pass
- 
         
 if __name__ == "__main__":
     app = QApplication(sys.argv)
