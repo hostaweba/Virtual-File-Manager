@@ -101,19 +101,45 @@ CHUNK_SIZE = 150
 
 
 FILE_CATEGORIES = {
-    "Images": ['.png', '.jpg', '.jpeg', '.bmp', '.gif', '.webp', '.svg'],
-    "Videos": ['.mp4', '.avi', '.mkv', '.mov', '.wmv', '.flv'],
-    "Audio": ['.mp3', '.wav', '.ogg', '.flac', '.aac', '.m4a', '.amr', '.arm'], # Added new formats
-    "Documents": ['.pdf', '.doc', '.docx', '.txt', '.csv', '.xlsx', '.xls', '.ppt', '.pptx', '.md'],
-    "Code": ['.py', '.js', '.html', '.css', '.cpp', '.c', '.java', '.json', '.xml', '.sh'],
-    "Archives": ['.zip', '.rar', '.7z', '.tar', '.gz']
+    "Images": ['.arw', '.avif', '.bmp', '.cr2', '.gif', '.heic', '.heif', '.ico', '.jfif', '.jp2', '.jpe', '.jpeg', '.jpg', '.nef', '.pbm', '.pcx', '.pgm', '.png', '.pnm', '.ppm', '.psd', '.raw', '.svg', '.tga', '.tif', '.tiff', '.webp'],
+    "Videos": ['.3gp', '.3gpp', '.avi', '.flv', '.m2ts', '.m4v', '.mkv', '.mng', '.mov', '.mp4', '.ogv', '.swf', '.vob', '.webm', '.wmv'],
+    "Audio": ['.aac', '.aif', '.aifc', '.aiff', '.alac', '.amr', '.au', '.bnk', '.flac', '.m4a', '.mid', '.midi', '.mp3', '.ogg', '.opus', '.wav', '.wma'],
+    "Design": ['.ai', '.cur', '.eps', '.exr', '.fla', '.fon', '.gpl'],
+    "Documents": ['.adoc', '.chm', '.doc', '.docs', '.docx', '.dot', '.dotx', '.epub', '.fodt', '.md', '.mobi', '.odp', '.ods', '.odt', '.pdf', '.ppsx', '.ppt', '.pptx', '.rtf', '.tex', '.text', '.txt'],
+    "Data": ['.accda', '.accdb', '.accde', '.accdu', '.arff', '.bib', '.csv', '.db', '.db-journal', '.db-shm', '.db-wal', '.dbf', '.dic', '.dict', '.fdb', '.frm', '.h5', '.ibd', '.mat', '.mdb', '.npz', '.parquet', '.pkl', '.sqlite', '.sqlite3', '.sqlitedb', '.tsv'],
+    "Code": ['.a', '.asm', '.asp', '.aspx', '.awk', '.bash', '.bash_logout', '.bashrc', '.bat', '.c', '.cc', '.class', '.cmake', '.cmd', '.coffeescript', '.cpp', '.cs', '.css', '.cu', '.cxx', '.d', '.diff', '.el', '.erl', '.es', '.f', '.f90', '.fs', '.g4', '.go', '.groovy', '.h', '.hpp', '.htm', '.html', '.java', '.js', '.jsx', '.less', '.lua', '.php', '.pl', '.ps1', '.pug', '.py', '.rb', '.rs', '.sass', '.scss', '.sh', '.shx', '.sql', '.swift', '.ts', '.tsx', '.vbs', '.wasm'],
+    "Configs": ['.apache', '.apache2', '.cfg', '.conf', '.dtd', '.env', '.fish', '.ini', '.json', '.manifest', '.plist', '.properties', '.toml', '.xml', '.yaml', '.yml'],
+    "Python": ['.egg', '.egg-info'],
+    "Apps": ['.apk', '.apks', '.app', '.appimage', '.asar', '.bin', '.com', '.command', '.cpl', '.deb', '.desktop', '.dmg', '.efi', '.exe', '.jar', '.msi', '.rpm', '.run', '.whl', '.xapk'],
+    "System": ['.dat', '.dll', '.drv', '.dylib', '.inf', '.kext', '.pid', '.reg', '.so', '.sys', '.sysk'],
+    "Archives": ['.7z', '.apkzstd', '.bz2', '.cab', '.gz', '.iso', '.lz4', '.lzma', '.rar', '.tar', '.tgz', '.xz', '.z', '.zip'],
+    "Forensics": ['.crash', '.dmp', '.evtx', '.har', '.mem', '.pcap', '.pcapng', '.ulog'],
+    "Security": ['.asc', '.cer', '.certs', '.crl', '.crt', '.der', '.gpg', '.key', '.p12', '.pem', '.pfx', '.pub', '.rsa'],
+    "VMs": ['.ova', '.ovf', '.qcow2', '.vdi', '.vhd', '.vhdx', '.vmdk'],
+    "3D": ['.blend', '.dae', '.dwg', '.dxf', '.fbx', '.obj', '.step', '.stl'],
+    "GIS": ['.geojson', '.gpx', '.kml', '.kmz', '.shp'],
+    "Fonts": ['.afm', '.eot', '.otf', '.pfb', '.ttf', '.woff', '.woff2'],
+    "Chats": ['.crypt1', '.crypt12', '.crypt14', '.crypt15', '.vcf', '.wa'],
+    "Temp": ['.~', '.backup', '.bak', '.cache', '.chk', '.clean', '.crdownload', '.download', '.dthumb', '.exo', '.log', '.nomedia', '.old', '.part', '.swatch', '.swp', '.temp', '.thumb', '.thumbnails', '.tmp', '.trashed']
 }
 
+# ZERO-LAG O(1) LOOKUP ENGINE
+EXT_TO_CAT_MAIN = {}
+for cat, exts in FILE_CATEGORIES.items():
+    for ext in exts:
+        EXT_TO_CAT_MAIN[ext] = cat
+        
+GLOBAL_CAT_COLORS = {
+    "Images": "#a371f7", "Videos": "#f85149", "Audio": "#ff7b72", "Design": "#ff9ade",
+    "Documents": "#d2a8ff", "Data": "#58a6ff", "Code": "#79c0ff", "Configs": "#7ee787",
+    "Python": "#e3b341", "Apps": "#ff9429", "System": "#8b949e", "Archives": "#e3b341",
+    "Forensics": "#ff7b72", "Security": "#f0883e", "VMs": "#8b949e", "3D": "#a371f7",
+    "GIS": "#3fb950", "Fonts": "#c9d1d9", "Chats": "#2ea043", "Temp": "#484f58", "Others": "#8b949e"
+}        
 
 def get_category_for_ext(ext):
-    for cat, exts in FILE_CATEGORIES.items():
-        if ext in exts: return cat
-    return "Others"
+    return EXT_TO_CAT_MAIN.get(str(ext).lower(), "Others")
+
 
 def now_ts(): return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -2788,8 +2814,7 @@ class HeatmapColorConfigDialog(QDialog):
         if not isinstance(self.color_map, dict): self.color_map = {}
         
         # Default Category Colors (High Contrast)
-        defaults = {"Category_Images": "#a371f7", "Category_Videos": "#f85149", "Category_Audio": "#ff7b72", 
-                    "Category_Documents": "#d2a8ff", "Category_Code": "#79c0ff", "Category_Archives": "#e3b341", "Category_Others": "#8b949e"}
+        defaults = {f"Category_{k}": v for k, v in GLOBAL_CAT_COLORS.items()}
         for k, v in defaults.items():
             if k not in self.color_map: self.color_map[k] = v
 
@@ -2865,8 +2890,7 @@ class HeatmapColorConfigDialog(QDialog):
     def reset_colors(self):
         self.settings.remove("custom_colors")
         self.color_map = {}
-        defaults = {"Category_Images": "#a371f7", "Category_Videos": "#f85149", "Category_Audio": "#ff7b72", 
-                    "Category_Documents": "#d2a8ff", "Category_Code": "#79c0ff", "Category_Archives": "#e3b341", "Category_Others": "#8b949e"}
+        defaults = {f"Category_{k}": v for k, v in GLOBAL_CAT_COLORS.items()}
         for k, v in defaults.items(): self.color_map[k] = v
         self.populate_table()
         if self.parent():
@@ -2957,7 +2981,7 @@ class HeatmapFilterDialog(QDialog):
         self.combo_type.setCurrentText(str(self.settings.value("data_type", "Files Only")))
         
         self.combo_cat = QComboBox()
-        self.combo_cat.addItems(["All", "Images", "Videos", "Audio", "Documents", "Code", "Archives", "Others"])
+        self.combo_cat.addItems(["All"] + list(FILE_CATEGORIES.keys()) + ["Others"])
         self.combo_cat.setCurrentText(str(self.settings.value("category", "All")))
         
         self.txt_skip_names = QLineEdit(str(self.settings.value("skip_names", "")))
@@ -3038,8 +3062,14 @@ class TimelineDiaryDialog(QDialog):
         
         # --Add Minimize, Maximize, and Restore buttons ---
         self.setWindowFlags(self.windowFlags() | Qt.WindowMaximizeButtonHint | Qt.WindowMinimizeButtonHint)
-        self.resize(1100, 670)
-        self.setMinimumSize(950, 660)
+
+        if sys.platform == "win32":
+            self.resize(1100, 670)
+            self.setMinimumSize(950, 660)
+        elif sys.platform == "darwin":
+            self.resize(1105, 670)
+            self.setMinimumSize(950, 660)   
+        
         
         # FORCE DARK MODE ALWAYS
         self.setStyleSheet(THEMES["Dark"])
@@ -3168,7 +3198,7 @@ class TimelineDiaryDialog(QDialog):
         self.log_search_box.textChanged.connect(self.filter_activity_log)
         
         self.log_cat_box = QComboBox()
-        self.log_cat_box.addItems(["All Types", "Images", "Videos", "Audio", "Documents", "Code", "Archives"])
+        self.log_cat_box.addItems(["All Types"] + list(FILE_CATEGORIES.keys()) + ["Others"])
         self.log_cat_box.setEditable(True)
         self.log_cat_box.lineEdit().setPlaceholderText("Or type ext (e.g. .jpg)")
         self.log_cat_box.currentTextChanged.connect(self.filter_activity_log)
@@ -3721,7 +3751,7 @@ class TimelineDiaryDialog(QDialog):
             db_cat_dict = {r[0] if r[0] else "Others": (r[1], r[2]) for r in cat_data_raw}
             
             # Strict Template ensures they are injected in this exact order
-            cat_order = ["Images", "Videos", "Audio", "Documents", "Code", "Archives", "Others"]
+            cat_order = list(FILE_CATEGORIES.keys()) + ["Others"]
             cat_data = []
             for c in cat_order:
                 count, size = db_cat_dict.get(c, (0, 0))
@@ -3808,7 +3838,7 @@ class TimelineDiaryDialog(QDialog):
             labels = [r[0] for r in cat_data if (r[2] or 0) > 0]
             sizes = [r[2] or 0 for r in cat_data if (r[2] or 0) > 0]
             
-            c_map = {"Images": "#a371f7", "Videos": "#f85149", "Audio": "#ff7b72", "Documents": "#d2a8ff", "Code": "#79c0ff", "Archives": "#e3b341", "Others": "#8b949e"}
+            c_map = GLOBAL_CAT_COLORS
             colors = [c_map.get(lbl, "#30363d") for lbl in labels]
             
             if sizes:
@@ -4123,7 +4153,7 @@ class TimelineDiaryDialog(QDialog):
         
         saved_colors = QSettings("vmanOS", "HeatmapColors").value("custom_colors", {})
         if not isinstance(saved_colors, dict): saved_colors = {}
-        cat_colors = {"Images": "#a371f7", "Videos": "#f85149", "Audio": "#ff7b72", "Documents": "#d2a8ff", "Code": "#79c0ff", "Archives": "#e3b341", "Others": "#8b949e"}
+        cat_colors = GLOBAL_CAT_COLORS
         
         grid_settings = QSettings("vmanOS", "HeatmapGridSettings")
         layout_style = grid_settings.value("layout_style", "Standard")
@@ -4349,16 +4379,18 @@ class TimelineDiaryDialog(QDialog):
     def filter_activity_log(self):
         term = self.log_search_box.text().lower()
         cat_ext = self.log_cat_box.currentText().lower()
-        is_cat = cat_ext in ["all types", "images", "videos", "audio", "documents", "code", "archives"]
         
-        cat_map = {
-            "images": ['.png', '.jpg', '.jpeg', '.bmp', '.gif', '.webp', '.svg'],
-            "videos": ['.mp4', '.avi', '.mkv', '.mov', '.wmv', '.flv'],
-            "audio": ['.mp3', '.wav', '.ogg', '.flac', '.aac'],
-            "documents": ['.pdf', '.doc', '.docx', '.txt', '.csv', '.xlsx', '.xls', '.ppt', '.pptx', '.md'],
-            "code": ['.py', '.js', '.html', '.css', '.cpp', '.c', '.java', '.json', '.xml', '.sh'],
-            "archives": ['.zip', '.rar', '.7z', '.tar', '.gz']
-        }
+        is_cat = False
+        target_exts = []
+        
+        if cat_ext == "all types":
+            is_cat = True
+        else:
+            for c_name, c_exts in FILE_CATEGORIES.items():
+                if cat_ext == c_name.lower():
+                    is_cat = True
+                    target_exts = c_exts
+                    break
 
         self.table.setUpdatesEnabled(False)
         for r in range(self.table.rowCount()):
@@ -4372,7 +4404,7 @@ class TimelineDiaryDialog(QDialog):
             if not is_cat and cat_ext:
                 match_ext = (cat_ext in ext)
             elif is_cat and cat_ext != "all types":
-                match_ext = any(e in ext for e in cat_map.get(cat_ext, []))
+                match_ext = any(e in ext for e in target_exts)
             
             self.table.setRowHidden(r, not (match_text and match_ext))
         self.table.setUpdatesEnabled(True)
@@ -4545,7 +4577,7 @@ class TimelineDiaryDialog(QDialog):
 
         saved_colors = QSettings("vmanOS", "HeatmapColors").value("custom_colors", {})
         if not isinstance(saved_colors, dict): saved_colors = {}
-        cat_colors = {"Images": "#a371f7", "Videos": "#f85149", "Audio": "#ff7b72", "Documents": "#d2a8ff", "Code": "#79c0ff", "Archives": "#e3b341", "Others": "#8b949e"}
+        cat_colors = GLOBAL_CAT_COLORS
 
         for day, val in data_dict.items():
             fmt = QTextCharFormat()
