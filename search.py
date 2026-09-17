@@ -1759,29 +1759,20 @@ class AdvancedSearchWindow(QMainWindow):
         self.local_tag_filter_input = QLineEdit(); self.local_tag_filter_input.setPlaceholderText("🏷️ Quick Filter (Alt+T): Tags...")
         self.local_tag_filter_input.textChanged.connect(self.apply_local_filter)
         quick_lay.addWidget(self.local_filter_input); quick_lay.addWidget(self.local_tag_filter_input)
-        tab1_layout.addLayout(quick_lay)
         
-        # Add after quick_lay.addWidget(self.local_tag_filter_input):
         self.btn_search_view_mode = QPushButton("🖼️ Grid View")
         self.btn_search_view_mode.setFixedHeight(28)
         self.btn_search_view_mode.clicked.connect(self.toggle_search_view_mode)
         quick_lay.addWidget(self.btn_search_view_mode)
+        tab1_layout.addLayout(quick_lay)
         
         self.table = QTableWidget(0, 10)
         self.table.setHorizontalHeaderLabels(["S.No.", "Name", "Database", "Virtual Path", "Type", "Size", "Date", "Labels", "SHA-256", "HiddenMeta"])
-        self.table.setColumnWidth(0, 50)
-        self.table.setColumnWidth(1, 250)
-        self.table.setColumnWidth(2, 120) # Database
-        self.table.setColumnWidth(3, 250)
-        self.table.setColumnWidth(4, 100)
-        self.table.setColumnWidth(5, 90)
-        self.table.setColumnWidth(6, 140)
-        self.table.setColumnWidth(7, 120)
-        self.table.setColumnWidth(8, 180)
-        self.table.setColumnHidden(9, True) # HiddenMeta
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
-        self.table.setColumnWidth(0, 50); self.table.setColumnWidth(1, 280); self.table.setColumnWidth(2, 280)
-        self.table.setColumnWidth(3, 120); self.table.setColumnWidth(4, 90); self.table.setColumnWidth(5, 140); self.table.setColumnWidth(6, 120); self.table.setColumnWidth(7, 200)
+        self.table.setColumnWidth(0, 50); self.table.setColumnWidth(1, 280); self.table.setColumnWidth(2, 120)
+        self.table.setColumnWidth(3, 280); self.table.setColumnWidth(4, 100); self.table.setColumnWidth(5, 90)
+        self.table.setColumnWidth(6, 140); self.table.setColumnWidth(7, 120); self.table.setColumnWidth(8, 200)
+        self.table.setColumnHidden(9, True) # HiddenMeta
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.setSortingEnabled(True); self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers); self.table.setShowGrid(False)
@@ -1792,10 +1783,13 @@ class AdvancedSearchWindow(QMainWindow):
         self.table.horizontalHeader().setContextMenuPolicy(Qt.CustomContextMenu)
         self.table.horizontalHeader().customContextMenuRequested.connect(self.show_header_menu)
         
+        # Initialize Stack EXACTLY ONCE
         self.search_view_stack = QStackedWidget()
+        self.search_view_stack.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.search_view_stack.addWidget(self.table)
         
         self.search_grid = QListWidget()
+        self.search_grid.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.search_grid.setViewMode(QListWidget.IconMode)
         self.search_grid.setGridSize(QSize(140, 160))
         self.search_grid.setIconSize(QSize(80, 80))
@@ -1806,9 +1800,15 @@ class AdvancedSearchWindow(QMainWindow):
         self.search_grid.customContextMenuRequested.connect(self.show_grid_context_menu)
         self.search_grid.itemDoubleClicked.connect(lambda item: self.handle_double_click_meta(item.data(Qt.UserRole)))
         
+        self.search_grid.setStyleSheet("""
+            QListWidget { background: transparent; border: none; outline: none; color: #c9d1d9; font-weight: bold; }
+            QListWidget::item { background: rgba(33, 38, 45, 0.6); border: 1px solid #30363d; border-radius: 10px; padding: 10px; margin: 6px; }
+            QListWidget::item:hover { background: rgba(88, 166, 255, 0.15); border: 1px solid #58a6ff; }
+            QListWidget::item:selected { background: rgba(88, 166, 255, 0.35); border: 2px solid #58a6ff; color: #ffffff; }
+        """)
+        
         self.search_view_stack.addWidget(self.search_grid)
         tab1_layout.addWidget(self.search_view_stack)
-
 
         self.tabs.addTab(tab1_container, "📋 Search Results")
 
