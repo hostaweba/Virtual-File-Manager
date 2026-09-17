@@ -91,6 +91,7 @@ from console import VManConsole
 from jobs import ExtraFeaturesDialog
 from floating_widgets import FloatingClock, FloatingNotepad, FloatingQuickText, FloatingQuotes
 from usage_logger import UsageLogDialog
+from multi_db_manager import MultiDBExplorerDialog
 
 # ---------------- Constants & Themes ----------------
 APP_TITLE = "VMan"
@@ -3014,6 +3015,7 @@ class TimelineDiaryDialog(QDialog):
         
         
         # FORCE DARK MODE ALWAYS
+        #self.setStyleSheet(THEMES["Dark"])
         self.setStyleSheet("""
             * { background-color: #0d1117; color: #c9d1d9; }
             QDialog { background-color: #0d1117; color: #c9d1d9; }
@@ -3456,37 +3458,35 @@ class TimelineDiaryDialog(QDialog):
         self.tbl_rep_tag = create_rep_table(["Tag", "Files", "Size", "Avg Size"])
         self.tbl_rep_largest = create_rep_table(["Largest Files", "Size", "Type", "ID"])
         self.tbl_rep_smallest = create_rep_table(["Smallest Files", "Size", "Type", "ID"])
+        
         self.tbl_rep_ext_by_cat = create_rep_table(["Category", "Extension", "File Count", "Total Size"])
-        # --- NEW CUSTOM TABLES ---
-        self.tbl_rep_size_tiers = create_rep_table(["Size Tier Range", "Number of Files", "Used Extensions"])
-        self.tbl_rep_micro_buckets = create_rep_table(["File Size Threshold", "Number of Files"])
-        self.tbl_rep_ext_extremes = create_rep_table(["Extension", "Smallest File", "Smallest Size", "Largest File", "Largest Size"])
-        self.tbl_rep_cat_extremes = create_rep_table(["Category", "Smallest File", "Smallest Size", "Largest File", "Largest Size"])
+        self.tbl_rep_common_sizes = create_rep_table(["Exact File Size", "Number of Files", "Total Volume"])
 
+        # Hide internal ID columns
         self.tbl_rep_largest.setColumnHidden(3, True)
         self.tbl_rep_smallest.setColumnHidden(3, True)
+        
+        # FIX: Allow interactive resizing while still stretching to fill the right side!
+        self.tbl_rep_largest.horizontalHeader().setSectionResizeMode(0, QHeaderView.Interactive)
+        self.tbl_rep_smallest.horizontalHeader().setSectionResizeMode(0, QHeaderView.Interactive)
 
+        # Helper to add full-width sections cleanly
         def add_section(title, subtitle, widget):
             header = QLabel(f"<span style='font-size: 20px; color: #58a6ff; font-weight: bold;'>{title}</span><br><span style='color: #8b949e; font-size: 13px;'>{subtitle}</span>")
             self.rep_vbox.addWidget(header)
             self.rep_vbox.addWidget(widget)
 
-        # Append all sections to Report Tab
+        # Add Full-Width Stacked Layout
         add_section("📅 Temporal Grouping", "Double-click any row to filter the Activity Log to that specific time period.", self.tbl_rep_group)
         add_section("📁 Data by Category", "Distribution of storage and file counts across major file categories.", self.tbl_rep_cat)
         
-        # --- ADD THE NEW TABLES ---
-        add_section("📊 File Size Range Tiers", "Volume distribution across custom byte-range brackets.", self.tbl_rep_size_tiers)
-        add_section("🔬 Micro File Size Thresholds", "Exact file counts for fine-grained sub-kilobyte file dimensions.", self.tbl_rep_micro_buckets)
-        add_section("📐 Extension Extremes", "Smallest and largest files found for each specific file extension.", self.tbl_rep_ext_extremes)
-        add_section("📊 Category Extremes", "Smallest and largest files tracked within each major category.", self.tbl_rep_cat_extremes)
+        add_section("🗂️ Extensions by Category", "Detailed breakdown of file formats within each category.", self.tbl_rep_ext_by_cat)
+        add_section("📊 Most Common File Sizes", "Groups files by their exact byte size to find massively duplicated or identical files.", self.tbl_rep_common_sizes)
         
         add_section("📄 Top 50 Extensions", "Most dominant file formats matching your current filters.", self.tbl_rep_ext)
         add_section("🏷️ Custom Tag Utilization", "File metrics grouped by your user-defined tags.", self.tbl_rep_tag)
-        add_section("🐘 Top 20 Largest Files", "Heaviest outliers in the current dataset.", self.tbl_rep_largest)
-        add_section("🦠 Top 20 Smallest Files", "Smallest tracked items.", self.tbl_rep_smallest)
-
-
+        add_section("🐘 Top 20 Largest Files", "Heaviest outliers in the current dataset (Double click to locate).", self.tbl_rep_largest)
+        add_section("🦠 Top 20 Smallest Files", "Smallest tracked items (Double click to locate).", self.tbl_rep_smallest)
         
         self.rep_vbox.addStretch()
         self.rep_scroll.setWidget(self.rep_container)
@@ -3768,91 +3768,22 @@ class TimelineDiaryDialog(QDialog):
                     self.tbl_rep_ext_by_cat.setItem(r, 3, SizeTableWidgetItem(row_data[3] or 0))
                 self.tbl_rep_ext_by_cat.setSortingEnabled(True)
 
-                # --- 7. NEW TABLE: File Size Range Tiers (1KB to Beyond + Exts) ---
-                prog.setLabelText("Computing Size Tiers..."); prog.setValue(85); QApplication.processEvents()
-                tiers = [
-                    ("1 KB to 1 MB", 1024, 1024 * 1024),
-                    ("1.1 MB to 10 MB", 1024 * 1024 * 1.1, 10 * 1024 * 1024),
-                    ("10.1 MB to 50 MB", 10 * 1024 * 1024 * 1.01, 50 * 1024 * 1024),
-                    ("50.1 MB to 100 MB", 50 * 1024 * 1024 * 1.01, 100 * 1024 * 1024),
-                    ("100.1 MB to 500 MB", 100 * 1024 * 1024 * 1.01, 500 * 1024 * 1024),
-                    ("500.1 MB to 1000 MB", 500 * 1024 * 1024 * 1.01, 1000 * 1024 * 1024),
-                    ("1000.1 MB to 5000 MB", 1000 * 1024 * 1024 * 1.01, 5000 * 1024 * 1024),
-                    ("5000.1 MB and Beyond", 5000 * 1024 * 1024 * 1.01, float('inf'))
-                ]
-                self.tbl_rep_size_tiers.setSortingEnabled(False)
-                self.tbl_rep_size_tiers.setRowCount(0)
-                for r, (range_label, low, high) in enumerate(tiers):
-                    self.tbl_rep_size_tiers.insertRow(r)
-                    if high == float('inf'):
-                        cur.execute(f"SELECT COUNT(id), GROUP_CONCAT(DISTINCT extension) FROM virtual_fs WHERE {base_where} AND size >= ?", params + [low])
-                    else:
-                        cur.execute(f"SELECT COUNT(id), GROUP_CONCAT(DISTINCT extension) FROM virtual_fs WHERE {base_where} AND size >= ? AND size <= ?", params + [low, high])
-                    cnt, exts = cur.fetchone()
-                    cnt = cnt or 0
-                    exts_str = ", ".join(sorted(set([str(e).upper() for e in exts.split(',') if e]))) if exts else "None"
-                    
-                    self.tbl_rep_size_tiers.setItem(r, 0, QTableWidgetItem(range_label))
-                    cnt_item = NumericTableItem(f"{cnt:,}"); cnt_item.setData(Qt.UserRole, cnt)
-                    self.tbl_rep_size_tiers.setItem(r, 1, cnt_item)
-                    self.tbl_rep_size_tiers.setItem(r, 2, QTableWidgetItem(exts_str))
-                self.tbl_rep_size_tiers.setSortingEnabled(True)
-
-                # --- 8. NEW TABLE: Micro File Size Thresholds (<1KB to <64KB) ---
-                prog.setLabelText("Computing Micro Buckets..."); prog.setValue(90); QApplication.processEvents()
-                micro_limits = [
-                    ("1 KB or less", 1024), ("2 KB or less", 2048), ("4 KB or less", 4096),
-                    ("8 KB or less", 8192), ("16 KB or less", 16384), ("32 KB or less", 32768), ("64 KB or less", 65536)
-                ]
-                self.tbl_rep_micro_buckets.setSortingEnabled(False)
-                self.tbl_rep_micro_buckets.setRowCount(0)
-                for r, (label_t, limit_b) in enumerate(micro_limits):
-                    self.tbl_rep_micro_buckets.insertRow(r)
-                    cur.execute(f"SELECT COUNT(id) FROM virtual_fs WHERE {base_where} AND size <= ?", params + [limit_b])
-                    cnt = cur.fetchone()[0] or 0
-                    self.tbl_rep_micro_buckets.setItem(r, 0, QTableWidgetItem(label_t))
-                    cnt_item = NumericTableItem(f"{cnt:,}"); cnt_item.setData(Qt.UserRole, cnt)
-                    self.tbl_rep_micro_buckets.setItem(r, 1, cnt_item)
-                self.tbl_rep_micro_buckets.setSortingEnabled(True)
-
-                # --- 9. NEW TABLE: Extension Extremes (Smallest & Largest) ---
-                prog.setLabelText("Computing Extension Extremes..."); prog.setValue(93); QApplication.processEvents()
-                cur.execute(f"SELECT DISTINCT extension FROM virtual_fs WHERE {base_where} AND extension IS NOT NULL AND extension != ''", params)
-                exts_list = [row[0] for row in cur.fetchall()]
+                # 8. Most Common File Sizes
+                prog.setLabelText("Analyzing Common File Sizes..."); prog.setValue(88); QApplication.processEvents()
+                cur.execute(f"SELECT size, COUNT(id), SUM(size) FROM virtual_fs WHERE {base_where} AND is_folder=0 AND size > 0 GROUP BY size ORDER BY COUNT(id) DESC LIMIT 50", params)
+                common_sizes_data = cur.fetchall()
                 
-                self.tbl_rep_ext_extremes.setSortingEnabled(False)
-                self.tbl_rep_ext_extremes.setRowCount(0)
-                for r, ext in enumerate(sorted(exts_list)):
-                    self.tbl_rep_ext_extremes.insertRow(r)
-                    cur.execute(f"SELECT name, size FROM virtual_fs WHERE {base_where} AND extension = ? AND size > 0 ORDER BY size ASC LIMIT 1", params + [ext])
-                    small = cur.fetchone()
-                    cur.execute(f"SELECT name, size FROM virtual_fs WHERE {base_where} AND extension = ? ORDER BY size DESC LIMIT 1", params + [ext])
-                    large = cur.fetchone()
+                self.tbl_rep_common_sizes.setSortingEnabled(False)
+                self.tbl_rep_common_sizes.setRowCount(0)
+                for r, row_data in enumerate(common_sizes_data):
+                    self.tbl_rep_common_sizes.insertRow(r)
+                    self.tbl_rep_common_sizes.setItem(r, 0, SizeTableWidgetItem(row_data[0] or 0))
                     
-                    self.tbl_rep_ext_extremes.setItem(r, 0, QTableWidgetItem(str(ext).upper()))
-                    self.tbl_rep_ext_extremes.setItem(r, 1, QTableWidgetItem(str(small[0]) if small else "N/A"))
-                    self.tbl_rep_ext_extremes.setItem(r, 2, SizeTableWidgetItem(small[1]) if small else SizeTableWidgetItem(0))
-                    self.tbl_rep_ext_extremes.setItem(r, 3, QTableWidgetItem(str(large[0]) if large else "N/A"))
-                    self.tbl_rep_ext_extremes.setItem(r, 4, SizeTableWidgetItem(large[1]) if large else SizeTableWidgetItem(0))
-                self.tbl_rep_ext_extremes.setSortingEnabled(True)
-
-                # --- 10. NEW TABLE: Category Extremes (Smallest & Largest) ---
-                prog.setLabelText("Computing Category Extremes..."); prog.setValue(96); QApplication.processEvents()
-                self.tbl_rep_cat_extremes.setSortingEnabled(False)
-                self.tbl_rep_cat_extremes.setRowCount(0)
-                for r, cat in enumerate(cat_order):
-                    self.tbl_rep_cat_extremes.insertRow(r)
-                    cur.execute(f"SELECT name, size FROM virtual_fs WHERE {base_where} AND category = ? AND size > 0 ORDER BY size ASC LIMIT 1", params + [cat])
-                    small = cur.fetchone()
-                    cur.execute(f"SELECT name, size FROM virtual_fs WHERE {base_where} AND category = ? ORDER BY size DESC LIMIT 1", params + [cat])
-                    large = cur.fetchone()
+                    cnt_item = NumericTableItem(f"{row_data[1]:,}"); cnt_item.setData(Qt.UserRole, row_data[1])
+                    self.tbl_rep_common_sizes.setItem(r, 1, cnt_item)
                     
-                    self.tbl_rep_cat_extremes.setItem(r, 0, QTableWidgetItem(cat))
-                    self.tbl_rep_cat_extremes.setItem(r, 1, QTableWidgetItem(str(small[0]) if small else "N/A"))
-                    self.tbl_rep_cat_extremes.setItem(r, 2, SizeTableWidgetItem(small[1]) if small else SizeTableWidgetItem(0))
-                    self.tbl_rep_cat_extremes.setItem(r, 3, QTableWidgetItem(str(large[0]) if large else "N/A"))
-                    self.tbl_rep_cat_extremes.setItem(r, 4, SizeTableWidgetItem(large[1]) if large else SizeTableWidgetItem(0))
-                self.tbl_rep_cat_extremes.setSortingEnabled(True)
+                    self.tbl_rep_common_sizes.setItem(r, 2, SizeTableWidgetItem(row_data[2] or 0))
+                self.tbl_rep_common_sizes.setSortingEnabled(True)
                 
             prog.setLabelText("Rendering Charts..."); prog.setValue(95); QApplication.processEvents()
             self.render_report_charts(grp_data, cat_data)
@@ -3941,50 +3872,7 @@ class TimelineDiaryDialog(QDialog):
 
             self.fig_rep.tight_layout(pad=3.0)
             
-            # --- INTERACTIVE TOOLTIPS & CLICK ROUTING ---
-            if not hasattr(self, 'chart_tooltip'):
-                self.chart_tooltip = QLabel(self.canvas_rep)
-                self.chart_tooltip.setStyleSheet("background-color: rgba(13, 17, 23, 0.95); color: #58a6ff; border: 1px solid #30363d; border-radius: 4px; padding: 6px; font-weight: bold; font-size: 11px;")
-                self.chart_tooltip.hide()
-                
-            def on_motion(event):
-                if event.inaxes and hasattr(self, '_chart_elements'):
-                    for el in self._chart_elements:
-                        if hasattr(el, 'contains') and el.contains(event)[0]:
-                            if hasattr(el, 'category_name'):
-                                txt = f"Category: {el.category_name}\nSize: {human_size(el.category_size)}"
-                            else:
-                                txt = f"Group: {el.group_key}\nValue: {el.group_val:.2f}"
-                            self.chart_tooltip.setText(txt)
-                            self.chart_tooltip.adjustSize()
-                            self.chart_tooltip.move(int(event.x) + 12, self.canvas_rep.height() - int(event.y) + 12)
-                            self.chart_tooltip.show()
-                            return
-                if hasattr(self, 'chart_tooltip'): self.chart_tooltip.hide()
-
-            def on_click(event):
-                if event.inaxes and hasattr(self, '_chart_elements'):
-                    for el in self._chart_elements:
-                        if hasattr(el, 'contains') and el.contains(event)[0]:
-                            if hasattr(el, 'category_name'):
-                                drill_q = f"SELECT id, name, is_folder, extension, size, parent_path, {self.rep_date_col}, custom_tags FROM virtual_fs WHERE {self.rep_base_where} AND category = ?"
-                                self.execute_search(drill_q, self.rep_base_params + (el.category_name,), update_highlights=False)
-                                self.tabs.setCurrentIndex(1)
-                            else:
-                                val = el.group_key
-                                drill_q = f"SELECT id, name, is_folder, extension, size, parent_path, {self.rep_date_col}, custom_tags FROM virtual_fs WHERE {self.rep_base_where}"
-                                params = list(self.rep_base_params)
-                                groupby = self.cb_rep_groupby.currentText()
-                                if groupby == "Day": drill_q += f" AND SUBSTR({self.rep_date_col}, 1, 10) = ?"; params.append(val)
-                                elif groupby == "Month": drill_q += f" AND SUBSTR({self.rep_date_col}, 1, 7) = ?"; params.append(val)
-                                elif groupby == "Year": drill_q += f" AND SUBSTR({self.rep_date_col}, 1, 4) = ?"; params.append(val)
-                                self.execute_search(drill_q, tuple(params), update_highlights=False)
-                                self.tabs.setCurrentIndex(1)
-                            break
-
-            self.canvas_rep.mpl_connect('motion_notify_event', on_motion)
-            self.canvas_rep.mpl_connect('button_press_event', on_click)
-
+            # Force UI to instantly paint the canvas
             self.canvas_rep.draw()
             self.canvas_rep.update()
             
@@ -4068,44 +3956,6 @@ class TimelineDiaryDialog(QDialog):
                 db_id = sender.item(row, 3).text()
                 drill_query += " AND id = ?"; drill_params.append(db_id)
 
-            # ... right after sender == self.tbl_rep_largest ...
-            elif sender == self.tbl_rep_size_tiers:
-                range_label = sender.item(row, 0).text()
-                tiers_map = {
-                    "1 KB to 1 MB": (1024, 1024 * 1024),
-                    "1.1 MB to 10 MB": (1024 * 1024 * 1.1, 10 * 1024 * 1024),
-                    "10.1 MB to 50 MB": (10 * 1024 * 1024 * 1.01, 50 * 1024 * 1024),
-                    "50.1 MB to 100 MB": (50 * 1024 * 1024 * 1.01, 100 * 1024 * 1024),
-                    "100.1 MB to 500 MB": (100 * 1024 * 1024 * 1.01, 500 * 1024 * 1024),
-                    "500.1 MB to 1000 MB": (500 * 1024 * 1024 * 1.01, 1000 * 1024 * 1024),
-                    "1000.1 MB to 5000 MB": (1000 * 1024 * 1024 * 1.01, 5000 * 1024 * 1024),
-                    "5000.1 MB and Beyond": (5000 * 1024 * 1024 * 1.01, float('inf'))
-                }
-                if range_label in tiers_map:
-                    low, high = tiers_map[range_label]
-                    if high == float('inf'):
-                        drill_query += " AND size >= ?"; drill_params.append(low)
-                    else:
-                        drill_query += " AND size >= ? AND size <= ?"; drill_params.extend([low, high])
-
-            elif sender == self.tbl_rep_micro_buckets:
-                label_t = sender.item(row, 0).text()
-                micro_map = {
-                    "1 KB or less": 1024, "2 KB or less": 2048, "4 KB or less": 4096,
-                    "8 KB or less": 8192, "16 KB or less": 16384, "32 KB or less": 32768, "64 KB or less": 65536
-                }
-                if label_t in micro_map:
-                    drill_query += " AND size <= ?"; drill_params.append(micro_map[label_t])
-
-            elif sender == self.tbl_rep_ext_extremes:
-                ext_val = sender.item(row, 0).text().lower()
-                drill_query += " AND LOWER(extension) = ?"
-                drill_params.append(ext_val if ext_val.startswith('.') else f".{ext_val}")
-
-            elif sender == self.tbl_rep_cat_extremes:
-                cat_val = sender.item(row, 0).text()
-                drill_query += " AND category = ?"; drill_params.append(cat_val)
-            
             # --- NEW: Drilldown logic for the 2 new tables ---
             elif sender == self.tbl_rep_ext_by_cat:
                 cat_val = sender.item(row, 0).text()
@@ -6177,6 +6027,15 @@ class vmanVirtualManager(QMainWindow):
         self._build_ui()
         self._setup_shortcuts()
         self.apply_theme("Dark") 
+        # Force the UI to fully render in memory BEFORE doing heavy file loads
+        QApplication.processEvents()
+        
+        # Delay the heavy data loading by 200 milliseconds to let the Splash Screen animate smoothly
+        QTimer.singleShot(200, self.smooth_startup)
+
+    def smooth_startup(self):
+        """Called automatically after the UI finishes painting."""
+        QApplication.processEvents() # Ensure no ghosting artifacts
         self.refresh_all()
         
         # ADD THIS BLOCK to restore column sizes and visibility
@@ -6284,6 +6143,10 @@ class vmanVirtualManager(QMainWindow):
         act_csv_lib = QAction("📚 Tags", self)
         act_csv_lib.setToolTip("Tag Library")
         act_csv_lib.triggered.connect(self.open_tag_library)
+        
+        act_multi_db = QAction("🌐 Multi-DB", self)
+        act_multi_db.setToolTip("Multi-Database Cross-Auditor & Deduplication Explorer")
+        act_multi_db.triggered.connect(self.open_multi_db_explorer)
 
         act_set_storage = QAction("💾 Set Storage", self)
         act_set_storage.triggered.connect(self.set_storage_capacity)
@@ -6328,7 +6191,7 @@ class vmanVirtualManager(QMainWindow):
         tb.addSeparator()
         
  
-        tb.addActions([act_analyzer, act_bulk_del, act_timeline, act_csv_lib, act_load_ext, act_set_storage])
+        tb.addActions([act_analyzer, act_bulk_del, act_timeline, act_csv_lib, act_multi_db, act_load_ext, act_set_storage])
         tb.addSeparator()
 
         # Replaced Inspector with Search, removed Fast Mode from here
@@ -8365,6 +8228,10 @@ class vmanVirtualManager(QMainWindow):
         
         menu.addSeparator()
         
+        act_open_multi_db = menu.addAction("🌐 Multi-Database Cross-Auditor & Deduplication...")
+        act_open_multi_db.triggered.connect(self.open_multi_db_explorer)
+        menu.addSeparator()
+        
         if not item: 
             menu.exec(self.folder_tree.viewport().mapToGlobal(pos))
             return
@@ -8778,36 +8645,85 @@ class vmanVirtualManager(QMainWindow):
                     return
         if hasattr(self, 'chart_tooltip'):
             self.chart_tooltip.hide()
+    
+    def open_multi_db_explorer(self):
+        if not hasattr(self, 'multi_db_instance') or self.multi_db_instance is None:
+            self.multi_db_instance = MultiDBExplorerDialog(VIEWS_DIR, DB_FILE, self)
+        else:
+            self.multi_db_instance._populate_db_list()
+        self.multi_db_instance.show()
+        self.multi_db_instance.raise_()
+        self.multi_db_instance.activateWindow()    
         
-        
+import time
+from PySide6.QtGui import QPalette, QColor
+
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     app.setApplicationName(APP_TITLE)
-    win = vmanVirtualManager()
-   
     
-    #------splash----
-    # 2. Initialize and show the splash screen
+    # Force Native OS Dark Palette
+    dark_palette = QPalette()
+    dark_palette.setColor(QPalette.Window, QColor("#0d1117")) 
+    dark_palette.setColor(QPalette.WindowText, QColor("#c9d1d9"))
+    dark_palette.setColor(QPalette.Base, QColor("#161b22"))
+    dark_palette.setColor(QPalette.AlternateBase, QColor("#21262d"))
+    dark_palette.setColor(QPalette.ToolTipBase, QColor("#0d1117"))
+    dark_palette.setColor(QPalette.ToolTipText, QColor("#c9d1d9"))
+    dark_palette.setColor(QPalette.Text, QColor("#c9d1d9"))
+    dark_palette.setColor(QPalette.Button, QColor("#21262d"))
+    dark_palette.setColor(QPalette.ButtonText, QColor("#c9d1d9"))
+    dark_palette.setColor(QPalette.Highlight, QColor("#58a6ff"))
+    dark_palette.setColor(QPalette.HighlightedText, QColor("#ffffff"))
+    app.setPalette(dark_palette)
+    
+    app.setStyleSheet("QWidget { background-color: #0d1117; color: #c9d1d9; }")
+    
+    # 1. Initialize and show the splash screen FIRST
     splash = PremiumSplash()
+    splash.show()
     splash.start_fade_in()
     
-    # Optional: If you want to show it loading for a couple of seconds visually
+    for _ in range(20):
+        app.processEvents()
+        time.sleep(0.01)
+        
     splash.update_text("Booting Core Engine...")
-    app.processEvents()
-    time.sleep(0.5) 
-    
+    for _ in range(30):
+        app.processEvents()
+        time.sleep(0.01)
+
     splash.update_text("Loading Databases...")
-    app.processEvents()
-    time.sleep(0.5)
+    for _ in range(30):
+        app.processEvents()
+        time.sleep(0.01)
 
     splash.update_text("Starting UI...")
     app.processEvents()
 
-    # 3. Initialize your main window
+    # 2. Initialize the main window EXACTLY ONCE
     win = vmanVirtualManager()
+    
+    # --- ULTIMATE WHITE FLASH FIX: The Zero-Opacity Trick ---
+    # We make the window 100% transparent. Windows opens it invisibly.
+    win.setWindowOpacity(0.0)
+    win.show() 
+    
+    # Force Qt to completely paint the dark UI into memory while it's invisible!
+    for _ in range(15):
+        app.processEvents()
+        time.sleep(0.01)
+    # --------------------------------------------------------
+    
+    # 3. Trigger fade out for the splash screen
     splash.start_fade_out()
-    #------splash----
+    for _ in range(20):
+        app.processEvents()
+        time.sleep(0.01)
     
+    # 4. Snap the perfectly rendered window into view instantly and close splash
+    win.showMaximized()
+    win.setWindowOpacity(1.0)
+    splash.finish(win)
     
-    win.show()
     sys.exit(app.exec())
