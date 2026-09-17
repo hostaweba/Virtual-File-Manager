@@ -27,7 +27,8 @@ from PySide6.QtWidgets import (
     QGraphicsView, QGraphicsScene, QScrollArea, QMessageBox, QInputDialog, 
     QMenu, QFileDialog, QApplication, QGraphicsOpacityEffect, QTabWidget,
     QSplitter, QGroupBox, QLineEdit, QTableWidget, QTableWidgetItem, QHeaderView, QColorDialog,
-    QListWidget, QFormLayout, QTextBrowser, QScroller, QAbstractItemView
+    QListWidget, QFormLayout, QTextBrowser, QScroller, QAbstractItemView,
+    QGraphicsDropShadowEffect  # <--- ADD THIS
 )
 
 # --- PROTECT SLOW DRIVES (2MB/s) BY LIMITING CONCURRENT I/O ---
@@ -70,6 +71,7 @@ try:
                 delta = event.position() - self._drag_start_pos
                 self.horizontalScrollBar().setValue(int(self._h_scroll_start - delta.x()))
                 self.verticalScrollBar().setValue(int(self._v_scroll_start - delta.y()))
+                return
             super().mouseMoveEvent(event)
 
         def mouseReleaseEvent(self, event):
@@ -81,13 +83,41 @@ try:
         def wheelEvent(self, event):
             if event.modifiers() == Qt.AltModifier or event.modifiers() == Qt.ControlModifier:
                 delta = event.angleDelta().y() if event.angleDelta().y() != 0 else event.angleDelta().x() 
+                
+                old_factor = self.zoomFactor()
+                if old_factor <= 0: old_factor = 1.0
+                
+                if delta > 0: new_factor = old_factor * 1.15
+                elif delta < 0: new_factor = old_factor / 1.15
+                else: return event.accept()
+                
+                pos = event.position()
+                h_bar = self.horizontalScrollBar()
+                v_bar = self.verticalScrollBar()
+                
+                # Snapshot absolute document coordinates under the cursor
+                doc_x = (h_bar.value() + pos.x()) / old_factor
+                doc_y = (v_bar.value() + pos.y()) / old_factor
+                
+                p = self
+                while p and not hasattr(p, 'macro_scroll_paused'): p = p.parent()
+                if p: p.macro_scroll_paused = True
+                
                 self.setZoomMode(QPdfView.ZoomMode.Custom)
-                if delta > 0: self.setZoomFactor(self.zoomFactor() * 1.15)
-                elif delta < 0: self.setZoomFactor(self.zoomFactor() / 1.15)
-                self.zoomChanged.emit(self.zoomFactor()) 
+                self.setZoomFactor(new_factor)
+                
+                # FIX: Force instant layout recalculation so scrollbars adjust before we set their value!
+                QApplication.processEvents()
+                
+                h_bar.setValue(int(doc_x * new_factor - pos.x()))
+                v_bar.setValue(int(doc_y * new_factor - pos.y()))
+                if p: p.macro_scroll_paused = False
+                self.zoomChanged.emit(new_factor) 
+                
                 event.accept()
             else:
                 super().wheelEvent(event)
+
 
     class MagazineWrapper(QGraphicsView):
         """Unified Master Controller with Macro Recording & Spread Sync"""
@@ -107,25 +137,26 @@ try:
                 delta = event.angleDelta().y() if event.angleDelta().y() != 0 else event.angleDelta().x()
                 if delta > 0: self.zoom_req.emit(1.15)
                 elif delta < 0: self.zoom_req.emit(1/1.15)
-                self._emit_change() # Emits zoom change to Macro Recorder
+                self._emit_change()
                 event.accept()
             else:
                 vbar = self.verticalScrollBar()
                 old_val = vbar.value()
                 super().wheelEvent(event)
                 
-                # If we hit the visual gap padding and keep scrolling, swap to next spread
                 delta = event.angleDelta().y()
-                if delta < 0 and old_val == vbar.maximum():
-                    self.scroll_spread.emit(1)
-                elif delta > 0 and old_val == vbar.minimum():
-                    self.scroll_spread.emit(-1)
+                if delta < 0 and old_val == vbar.maximum(): self.scroll_spread.emit(1)
+                elif delta > 0 and old_val == vbar.minimum(): self.scroll_spread.emit(-1)
+
+        def scrollContentsBy(self, dx, dy):
+            super().scrollContentsBy(dx, dy)
+            self._emit_change()
 
         def _emit_change(self):
             z = self.transform().m11()
             c = self.mapToScene(self.viewport().rect().center())
             self.viewChanged.emit(z, c.x(), c.y())
-                
+            
 except ImportError:
     HAS_PDF = False
 
@@ -280,6 +311,7 @@ class PreDecidedDialog(QDialog):
             "                             FILTER SYNTAX GUIDE                       \n"
             "========================================================================\n\n"
             "• Frames/Indices : 1-10, 15, 20\n"
+            "• Media Groups   : images, videos, docs, audios, codes (Filters by type)\n"
             "• Built-in Sort  : sn (Natural serial sorting), shuffle\n"
             "• Transforms     : c90, cc90, hf, vf (Applies to preceding frames)\n"
             "• Modifiers      : repeat=X, loop=X (e.g., repeat=5)\n"
@@ -290,7 +322,10 @@ class PreDecidedDialog(QDialog):
             "• Name Length    : minic=3, maxc=6 (Filename character count, ignores ext)\n"
             "• Include Text   : includeFilename=hello (Filename must contain 'hello')\n"
             "• Exclude Text   : excludeFilename=bad   (Filename must NOT contain 'bad')\n\n"
-            "Example Query:\n"
+            "Example Queries:\n"
+            "images, sn, includeFilename=vacation, max:5mb\n"
+            "1-50, videos, -mkv, loop=3\n"
+            "1-5:c90 6-10, images, sn, max:2mb"
             "1-50, jpg, png, -mp4, max:5mb, min:200kb, minic=3, includeFilename=hello, loop=3\n"
             "1-50, jpg, sn, repeat=3, max:5mb, minic=3, includeFilename=hello\n"
             "1-5:c90 6-10 12:hf cc90, jpg, sn, repeat=3, max:5mb"
@@ -570,6 +605,8 @@ class LazyImageLabel(QLabel):
         super().__init__()
         self.path = path; self.loaded = False; self.loading = False
         self.load_id = 0; self.orig_size = None; self.current_zoom = 1.0
+        self.flip_h = False; self.flip_v = False; self.rot_angle = 0
+        self.raw_image = None
         self.setAlignment(Qt.AlignCenter); self.setFont(QFont("Segoe UI", 11))
         self.setStyleSheet("color: rgba(255,255,255,0.4); background: #050505; border-radius: 6px;")
         self.setText("Waiting..."); self.setScaledContents(True); self.setMinimumHeight(600)
@@ -585,15 +622,33 @@ class LazyImageLabel(QLabel):
         if self.loaded or self.loading:
             self.load_id += 1 # Invalidate pending callbacks
             self.loaded = False; self.loading = False; self.orig_size = None
+            self.raw_image = None
             self.setPixmap(QPixmap()) # Force garbage collection
             self.setText("Waiting..."); self.setMinimumHeight(600)
             
     def _on_loaded(self, path, image, load_id):
         if load_id != self.load_id: return # Stale callback
         if image and not image.isNull() and image.width() > 0:
-            pm = QPixmap.fromImage(image); self.setPixmap(pm); self.orig_size = pm.size(); self.apply_zoom(self.current_zoom)
+            self.raw_image = image
+            self._render_pixmap()
         else: self.setText("Decode Error")
         self.loaded = True; self.loading = False
+        
+    def _render_pixmap(self):
+        if not self.raw_image or self.raw_image.isNull(): return
+        img = self.raw_image
+        if getattr(self, 'flip_h', False) or getattr(self, 'flip_v', False):
+            img = img.mirrored(getattr(self, 'flip_h', False), getattr(self, 'flip_v', False))
+            
+        if getattr(self, 'rot_angle', 0) != 0:
+            trans = QTransform().rotate(self.rot_angle)
+            pm = QPixmap.fromImage(img).transformed(trans, Qt.SmoothTransformation)
+        else:
+            pm = QPixmap.fromImage(img)
+            
+        self.setPixmap(pm)
+        self.orig_size = pm.size()
+        self.apply_zoom(self.current_zoom)
         
     def apply_zoom(self, factor):
         self.current_zoom = factor
@@ -615,6 +670,11 @@ class AdvancedImageViewer(QGraphicsView):
         self.setDragMode(QGraphicsView.ScrollHandDrag)
         self._pixmap_item = None
         self.zoom_factor = 1.15
+        
+        # --- NEW: Hide scrollbars and remove borders ---
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.setStyleSheet("background: transparent; border: none;")
         
     def set_image(self, pixmap, ufit=True):
         self.scene.clear()
@@ -649,6 +709,11 @@ class AdvancedVideoViewer(QGraphicsView):
         self.setRenderHints(QPainter.Antialiasing | QPainter.SmoothPixmapTransform)
         self.setDragMode(QGraphicsView.ScrollHandDrag)
         self.zoom_factor = 1.15
+        
+        # --- NEW: Hide scrollbars and remove borders for true full screen ---
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.setStyleSheet("background: transparent; border: none;")
       
     def wheelEvent(self, event):
         if event.modifiers() == Qt.ControlModifier:
@@ -724,6 +789,7 @@ class RealAudioVisualizer(QWidget):
             b['target_amp'] = 0.0; b['amp'] = 0.0
 
     def update_pos(self, pos_ms, dur_ms):
+        if self.vis_mode == "OFF": return
         if not self.file_obj or dur_ms <= 0 or not self.playing: return
         ratio = max(0, min(1.0, pos_ms / dur_ms))
         offset = int(ratio * self.file_size)
@@ -765,6 +831,7 @@ class RealAudioVisualizer(QWidget):
         self.target_string_bars = [0] * self.num_string_points
 
     def smooth_animation(self):
+        if self.vis_mode == "OFF": return
         w = self.width() or 1280; h = self.height() or 720
         time_now = time.time()
         
@@ -800,6 +867,7 @@ class RealAudioVisualizer(QWidget):
         self.update()
 
     def paintEvent(self, event):
+        if self.vis_mode == "OFF": return
         painter = QPainter(self); painter.setRenderHint(QPainter.Antialiasing)
         if self.vis_mode == "BUBBLES":
             for b in self.bubbles:
@@ -848,6 +916,7 @@ class VerticalStripViewer(QScrollArea):
         self.setWidget(self.container)
         
         self.labels = []; self.playlist = []; self._render_idx = 0; self.zoom_factor = 1.0
+        self.flip_h = False; self.flip_v = False; self.rot_angle = 0
         self.viewport().setCursor(Qt.OpenHandCursor); self._is_dragging = False
         self.verticalScrollBar().valueChanged.connect(self.check_visibility)
         
@@ -880,7 +949,17 @@ class VerticalStripViewer(QScrollArea):
             delta = event.angleDelta().y() if event.angleDelta().y() != 0 else event.angleDelta().x() 
             if delta > 0: self.zoom_factor = min(5.0, self.zoom_factor * 1.15)
             elif delta < 0: self.zoom_factor = max(0.1, self.zoom_factor / 1.15)
+            
+            p = self
+            while p and not hasattr(p, 'macro_scroll_paused'): p = p.parent()
+            if p: p.macro_scroll_paused = True
+            
             for lbl in self.labels: lbl.apply_zoom(self.zoom_factor)
+            
+            def release_blindfold():
+                if p: p.macro_scroll_paused = False
+            QTimer.singleShot(25, release_blindfold)
+            
             self.zoomChanged.emit(self.zoom_factor)
             event.accept()
         else: super().wheelEvent(event)
@@ -892,12 +971,26 @@ class VerticalStripViewer(QScrollArea):
         self.labels.clear(); self.playlist = playlist; self._render_idx = 0; self.verticalScrollBar().setValue(0)
         self._render_next_batch(5)
         
+    def apply_global_transforms(self, flip_h, flip_v, rot_angle):
+        self.flip_h = flip_h
+        self.flip_v = flip_v
+        self.rot_angle = rot_angle
+        for lbl in self.labels:
+            lbl.flip_h = flip_h
+            lbl.flip_v = flip_v
+            lbl.rot_angle = rot_angle
+            if hasattr(lbl, '_render_pixmap'):
+                lbl._render_pixmap()    
+        
     def _render_next_batch(self, count=10):
         end = min(self._render_idx + count, len(self.playlist))
         rad = "0px" if self.layout.spacing() == 0 else "6px"
         for i in range(self._render_idx, end):
             item = self.playlist[i]
             lbl = LazyImageLabel(item['path'])
+            lbl.flip_h = getattr(self, 'flip_h', False)
+            lbl.flip_v = getattr(self, 'flip_v', False)
+            lbl.rot_angle = getattr(self, 'rot_angle', 0)
             lbl.current_zoom = self.zoom_factor; lbl.setStyleSheet(f"background: #050505; border-radius: {rad};")
             self.layout.addWidget(lbl, 0, self.align_flag | Qt.AlignTop)
             self.labels.append(lbl)
@@ -965,7 +1058,17 @@ class AdvancedLoopDialog(QDialog):
         self.txt_input = QPlainTextEdit()
         self.txt_input.setPlainText(current_raw)
         self.txt_input.setFont(QFont("Consolas", 14))
-        self.txt_input.setStyleSheet("background: #080808; color: #f8f8f2; border: none; padding: 15px;")
+        # --- CRITICAL FIX: Explicitly styling and enabling scrollbars for the code editor ---
+        self.txt_input.setStyleSheet("""
+            QPlainTextEdit { background: #080808; color: #f8f8f2; border: none; padding: 15px; }
+            QScrollBar:vertical { border: none; background: #111; width: 14px; margin: 0px; }
+            QScrollBar::handle:vertical { background: #444; border-radius: 7px; min-height: 20px; }
+            QScrollBar::handle:vertical:hover { background: #555; }
+            QScrollBar:horizontal { border: none; background: #111; height: 14px; margin: 0px; }
+            QScrollBar::handle:horizontal { background: #444; border-radius: 7px; min-width: 20px; }
+            QScrollBar::handle:horizontal:hover { background: #555; }
+            QScrollBar::add-line, QScrollBar::sub-line { border: none; background: none; }
+        """)
         self.txt_input.setLineWrapMode(QPlainTextEdit.NoWrap)
         
         self.highlighter = VMSLHighlighter(self.txt_input.document())
@@ -983,7 +1086,16 @@ class AdvancedLoopDialog(QDialog):
                     VMAN MACRO SCRIPTING LANGUAGE (VMSL)
 ================================================================================
 
-[1] FAST COMPACT SYNTAX (Optional defaults)
+[1] MODES & VIEW COMMANDS
+-------------------------
+mode=pdf               : Switches to Normal PDF Mode
+mode=magazine_cover    : Switches to 2-Page Cover Mode (1, 2-3, 4-5)
+mode=magazine_double   : Switches to 2-Page Double Mode (1-2, 3-4)
+mode=web               : Switches to Webpage Mode (Vertical scroll)
+mode=norm              : Standard Image/Video Mode
+spread=1 / spread=-1   : Flips to the next/prev PDF Magazine spread
+
+[2] FAST COMPACT SYNTAX (Optional defaults)
 -------------------------------------------
 Format:  [frames][:durXloops][:transforms]
 Example: 1-5,8:150x5:hf     (Frames 1 to 5 & 8, 150ms, 5 loops, H-Flip)
@@ -993,19 +1105,19 @@ Examples: 1:c90      (Rotate 90)
           1:1000:hf  (1 second, horiz flip)
           1:3000x5:vf
 
-[2] SYSTEM COMMANDS
+[3] SYSTEM COMMANDS
 -------------------
 pause           : Pauses execution until you manually hit play again.
 stop            : Ends the macro script entirely.
 wait [ms]       : Waits for [ms] milliseconds (e.g. wait 2000).
 
-[3] VARIABLES & COMMENTS
+[4] VARIABLES & COMMENTS
 ------------------------
 # This is a comment
 $intro = 1-10           # Define a variable
 $intro dur=200 t=c90    # Execute variable
 
-[4] PARAMETERS (Used after a target)
+[5] PARAMETERS (Used after a target)
 ------------------------------------------------------
 dur=ms      : Duration in ms (e.g., dur=200)
 loop=x      : Times to repeat block (e.g., loop=5)
@@ -1024,7 +1136,7 @@ rev=1       : Reverse frame sequence
 ufit=1/0    : Force universal fit-to-screen globally or explicitly (e.g., ufit=1)
 
 
-[5] FULL EXAMPLES
+[6] FULL EXAMPLES
 -------------------
 # Fast syntax with default speed fallback
 1-2,6,2,8-6:150x5:c90
@@ -1106,7 +1218,7 @@ class vmanViewer(QDialog):
         self.current_highlighter = None
         self.is_md_rendered = True
         
-        self.setWindowTitle("VMan Media Engine")
+        self.setWindowTitle("VMan Media")
         self.setMinimumSize(800, 600)  # CRITICAL: Prevents the small window flash
         self.resize(1280, 850)
         self.setWindowFlags(self.windowFlags() | Qt.WindowMaximizeButtonHint | Qt.WindowMinimizeButtonHint)
@@ -1158,7 +1270,10 @@ class vmanViewer(QDialog):
             self.pdf_view.setDocument(self.pdf_doc)
             self.pdf_view.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
             self.pdf_view.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-            self.pdf_view.setStyleSheet("background: transparent; border: none; padding: 0px; margin: 0px;") # Strip hidden borders
+            self.pdf_view.setStyleSheet("background: transparent; border: none; padding: 0px; margin: 0px;") 
+            
+            # --- CRITICAL FIX: Direct Normal Mode Zoom to the new Tracker ---
+            self.pdf_view.zoomChanged.connect(self._on_normal_zoom_changed)
             
             self.pdf_view_right = AdvancedPdfViewer(self.pdf_container)
             self.pdf_view_right.setDocument(self.pdf_doc)
@@ -1288,8 +1403,8 @@ class vmanViewer(QDialog):
         self.btn_cp_ab.clicked.connect(self._set_ab_loop)
         self.btn_cp_shuffle.clicked.connect(self._shuffle_current_playlist) 
         if HAS_MULTIMEDIA: self.btn_cp_repeat.clicked.connect(self._toggle_repeat)
-        self.btn_cp_z_in.clicked.connect(lambda: self.img_view.scale(1.15, 1.15))
-        self.btn_cp_z_out.clicked.connect(lambda: self.img_view.scale(1/1.15, 1/1.15))
+        self.btn_cp_z_in.clicked.connect(lambda: self._apply_general_zoom(1.15))
+        self.btn_cp_z_out.clicked.connect(lambda: self._apply_general_zoom(1/1.15))
         
         # --- NEW: Toast Notification OSD ---
         self.toast_osd = QLabel(self)
@@ -1423,11 +1538,24 @@ class vmanViewer(QDialog):
         
         # --- Subtitles ---
         self.subtitles = []
+        if not hasattr(self, 'subtitle_color'): self.subtitle_color = "#FFFFFF"
+        
         self.lbl_subtitle = QLabel(self)
         self.lbl_subtitle.setAttribute(Qt.WA_TransparentForMouseEvents)
         self.lbl_subtitle.setAlignment(Qt.AlignCenter | Qt.AlignBottom)
-        self.lbl_subtitle.setFont(QFont("Arial", 22, QFont.Bold))
-        self.lbl_subtitle.setStyleSheet("color: white; background: rgba(0, 0, 0, 0.4); border-radius: 4px; padding: 5px;")
+        self.lbl_subtitle.setFont(QFont("Arial", 24, QFont.Bold))
+        self.lbl_subtitle.setWordWrap(True) # FIX: Ensure long subtitles wrap to next line
+        
+        # FIX: Make background transparent so it shows directly on screen
+        self.lbl_subtitle.setStyleSheet(f"color: {self.subtitle_color}; background: transparent; padding: 0px;")
+        
+        # Add a text shadow so it's readable without a container
+        shadow = QGraphicsDropShadowEffect(self)
+        shadow.setBlurRadius(5)
+        shadow.setColor(QColor(0, 0, 0, 255))
+        shadow.setOffset(2, 2)
+        self.lbl_subtitle.setGraphicsEffect(shadow)
+        
         self.lbl_subtitle.hide()
         
         # --- Miniplayer State ---
@@ -1630,77 +1758,210 @@ class vmanViewer(QDialog):
         # Initialize
         self._apply_filter("ALL", reset_index=False)
         self._is_initialized = True
+
+    def _set_subtitle_color(self, hex_color):
+        if hex_color == "CUSTOM":
+            color = QColorDialog.getColor(QColor(getattr(self, 'subtitle_color', "#FFFFFF")), self, "Select Subtitle Color")
+            if color.isValid():
+                hex_color = color.name()
+            else:
+                return
+                
+        self.subtitle_color = hex_color
+        self.lbl_subtitle.setStyleSheet(f"color: {self.subtitle_color}; background: transparent; padding: 0px;")
+        self.save_settings()
         
     def _apply_pdf_zoom(self, multiplier):
         if not HAS_PDF: return
+        self.macro_scroll_paused = True # Blindfold
+
         if getattr(self, 'is_magazine_mode', False):
-            # Scale the entire spread seamlessly as a single block
             self.pdf_wrapper.scale(multiplier, multiplier)
+            QTimer.singleShot(15, lambda: setattr(self, 'macro_scroll_paused', False))
         else:
-            new_zoom = self.pdf_view.zoomFactor() * multiplier
+            old_z = self.pdf_view.zoomFactor()
+            if old_z <= 0: old_z = 1.0
+            new_zoom = old_z * multiplier
+            
+            cx = self.pdf_view.viewport().width() / 2.0
+            cy = self.pdf_view.viewport().height() / 2.0
+            
+            doc_x = (self.pdf_view.horizontalScrollBar().value() + cx) / old_z
+            doc_y = (self.pdf_view.verticalScrollBar().value() + cy) / old_z
+            
             self.pdf_view.setZoomMode(QPdfView.ZoomMode.Custom)
             self.pdf_view.setZoomFactor(new_zoom)
+            
+            # FIX: Force instant layout update to stop it jumping large first
+            QApplication.processEvents()
+            
+            self.pdf_view.horizontalScrollBar().setValue(int(doc_x * new_zoom - cx))
+            self.pdf_view.verticalScrollBar().setValue(int(doc_y * new_zoom - cy))
+            
+            self.macro_scroll_paused = False
+            self._on_normal_zoom_changed(new_zoom)
 
     def _set_pdf_zoom_mode(self, mode):
         if not HAS_PDF: return
         if getattr(self, 'is_magazine_mode', False):
-            self._fit_magazine_view() # Locks the spread perfectly back to screen size
+            self._fit_magazine_view() 
         else:
-            self.pdf_view.setZoomMode(mode)
+            self.pdf_wrapper.resetTransform()
+            if getattr(self, 'btn_pdf_flip', None) and self.btn_pdf_flip.isChecked():
+                trans = QTransform()
+                trans.translate(self.pdf_wrapper.width(), 0)
+                trans.scale(-1, 1)
+                self.pdf_wrapper.setTransform(trans)
+                
+            # FIX: Force exact math calculation instead of buggy Qt layout mode
+            if mode == QPdfView.ZoomMode.FitInView:
+                self._fit_normal_pdf()
+            else:
+                self.pdf_view.setZoomMode(mode)
+            self._show_toast("📄 Fit Width" if mode == QPdfView.ZoomMode.FitToWidth else "📄 Fit Page")
 
     def _toggle_pdf_mag(self, checked):
         if not HAS_PDF: return
         self.is_magazine_mode = checked
         if checked:
+            self.is_webpage_mode = False # <-- FIX: Clear conflicting webpage state
             self.pdf_view.setPageMode(QPdfView.PageMode.SinglePage)
             self.pdf_view_right.setPageMode(QPdfView.PageMode.SinglePage)
-            
-            # Hand all mouse/zoom/drag control directly to the master wrapper
             self.pdf_view.setAttribute(Qt.WA_TransparentForMouseEvents, True)
             self.pdf_view_right.setAttribute(Qt.WA_TransparentForMouseEvents, True)
-            
-            # CRITICAL: Completely paralyze internal scrollbars so pages NEVER slide out of sync
             self.pdf_view.verticalScrollBar().setDisabled(True)
             self.pdf_view.horizontalScrollBar().setDisabled(True)
             self.pdf_view_right.verticalScrollBar().setDisabled(True)
             self.pdf_view_right.horizontalScrollBar().setDisabled(True)
-            
             self.pdf_wrapper.setDragMode(QGraphicsView.ScrollHandDrag)
-            
             self._sync_magazine_pages(self.pdf_view.pageNavigator().currentPage())
             QTimer.singleShot(50, self._fit_magazine_view)
         else:
             self.pdf_view.setPageMode(QPdfView.PageMode.MultiPage)
             self.pdf_view_right.hide()
-            
-            # Return control to normal viewing behavior
             self.pdf_view.setAttribute(Qt.WA_TransparentForMouseEvents, False)
             self.pdf_view_right.setAttribute(Qt.WA_TransparentForMouseEvents, False)
-            
-            # Re-enable scrollbars
             self.pdf_view.verticalScrollBar().setDisabled(False)
             self.pdf_view.horizontalScrollBar().setDisabled(False)
             self.pdf_view_right.verticalScrollBar().setDisabled(False)
             self.pdf_view_right.horizontalScrollBar().setDisabled(False)
-            
             self.pdf_wrapper.setDragMode(QGraphicsView.NoDrag)
-            
             self.pdf_view.setMinimumSize(0,0)
             self.pdf_view.setMaximumSize(16777215, 16777215)
             self.pdf_container.setMinimumSize(0,0)
             self.pdf_container.setMaximumSize(16777215, 16777215)
             self.pdf_wrapper.resetTransform()
-            self.pdf_view.setZoomMode(QPdfView.ZoomMode.FitToWidth)
+            
+            self.resizeEvent(None)
+            QApplication.processEvents()
+            self._fit_normal_pdf()
             
         if self.macro_recording and not self.macro_paused:
+            self._flush_macro_state()
             if checked:
                 layout = getattr(self, 'magazine_layout', 'COVER').lower()
                 self._record_macro_action(f"mode=magazine_{layout}")
             else:
                 self._record_macro_action("mode=norm")
             self._record_macro_action(f"{self.current_index + 1} pdf_mag={1 if checked else 0} dur=0")
+            QTimer.singleShot(100, lambda: self._snapshot_macro_state(self.IDX_PDF))
+            
         self._show_toast("📖 Magazine Mode" if checked else "📄 Normal View")
+            
+        if self.macro_recording and not self.macro_paused:
+            # FLUSH pending actions before wiping memory!
+            self._commit_scroll_macro()
+            self._commit_view_change()
+            
+            # Wipe memory to prevent massive scroll glitches when switching modes
+            self.last_macro_scroll_state = None
+            self.pending_scroll_state = None
+            self.last_macro_view_state = None
+            self.pending_view_state = None
+            
+            if checked:
+                layout = getattr(self, 'magazine_layout', 'COVER').lower()
+                self._record_macro_action(f"mode=magazine_{layout}")
+            else:
+                self._record_macro_action("mode=norm")
+            self._record_macro_action(f"{self.current_index + 1} pdf_mag={1 if checked else 0} dur=0")
+            
+        self._show_toast("📖 Magazine Mode" if checked else "📄 Normal View")
+    
+    def _fit_normal_pdf(self):
+        if not HAS_PDF or self.pdf_doc.pageCount() == 0: return
+        nav = self.pdf_view.pageNavigator()
+        sz = self.pdf_doc.pagePointSize(nav.currentPage())
         
+        vw = self.pdf_view.viewport().width()
+        vh = self.pdf_view.viewport().height()
+        
+        if sz.width() > 0 and sz.height() > 0 and vw > 0 and vh > 0:
+            # FIX: Calculate exact zoom and add a small padding to prevent scrollbars
+            factor = min((vw - 20) / sz.width(), (vh - 20) / sz.height())
+            
+            self.pdf_view.setZoomMode(QPdfView.ZoomMode.Custom)
+            self.pdf_view.setZoomFactor(factor)
+            
+            QApplication.processEvents()
+            self.pdf_view.verticalScrollBar().setValue(0)
+            self.pdf_view.horizontalScrollBar().setValue(0)
+    
+    def _flush_macro_state(self):
+        """Wipes and commits all pending tracking data safely"""
+        self._commit_scroll_macro()
+        self._commit_view_change()
+        self.last_macro_scroll_state = None
+        self.pending_scroll_state = None
+        self.last_macro_view_state = None
+        self.pending_view_state = None
+
+    def _get_t_str(self):
+        """Helper to get the current transform state formatted for macros."""
+        t_parts = []
+        if getattr(self, 'flip_h', False): t_parts.append('hf')
+        if getattr(self, 'flip_v', False): t_parts.append('vf')
+        
+        is_video = self.stack.currentIndex() == getattr(self, 'IDX_MEDIA', 3)
+        rot = getattr(self, 'rot_v_angle', 0) if is_video else getattr(self, 'rot_angle', 0)
+        
+        if rot == 90: t_parts.append('c90')
+        elif rot == 180: t_parts.append('c180')
+        elif rot == 270: t_parts.append('c270')
+        
+        t_str = "".join(t_parts)
+        return f"t={t_str} " if t_str else ""
+
+    def _snapshot_macro_state(self, idx):
+        """Grabs the exact mathematical starting coordinates for the current mode"""
+        if not self.macro_recording or self.macro_paused: return
+        t_str = self._get_t_str()
+        
+        if getattr(self, 'is_magazine_mode', False) and HAS_PDF:
+            # FIX: Use absolute value to prevent negative zoom scale log
+            z = abs(self.pdf_wrapper.transform().m11())
+            c = self.pdf_wrapper.mapToScene(self.pdf_wrapper.viewport().rect().center())
+            self._record_macro_action(f"{self.current_index + 1} {t_str}zs={z:.2f} zxs={int(c.x())} zys={int(c.y())} ufit=0 dur=0")
+            self.last_macro_view_state = (z, c.x(), c.y())
+            
+        elif getattr(self, 'is_webpage_mode', False):
+            z = self.vert_view.zoom_factor
+            sx = self.vert_view.horizontalScrollBar().value()
+            sy = self.vert_view.verticalScrollBar().value()
+            self._record_macro_action(f"{self.current_index + 1} {t_str}z={z:.2f} sxs={sx} sys={sy} ufit=0 dur=0")
+            self.last_macro_scroll_state = (sx, sy)
+            
+        elif idx == self.IDX_PDF and HAS_PDF:
+            z = self.pdf_view.zoomFactor()
+            self._record_macro_action(f"{self.current_index + 1} {t_str}z={z:.2f} ufit=0 dur=0")
+            self.last_macro_scroll_state = (self.pdf_view.horizontalScrollBar().value(), self.pdf_view.verticalScrollBar().value())
+            
+        elif idx == self.IDX_IMG:
+            z = self.img_view.transform().m11()
+            c = self.img_view.mapToScene(self.img_view.viewport().rect().center())
+            self._record_macro_action(f"{self.current_index + 1} {t_str}zs={z:.2f} zxs={int(c.x())} zys={int(c.y())} ufit=0 dur=0")
+            self.last_macro_view_state = (z, c.x(), c.y())
+    
     def _set_magazine_layout(self, layout):
         self.magazine_layout = layout
         self.save_settings()
@@ -1789,9 +2050,9 @@ class vmanViewer(QDialog):
             QTimer.singleShot(10, self._update_magazine_layout)
 
     def _navigate_spread(self, direction):
-        if not HAS_PDF: return
+        # CRITICAL FIX: Never execute or record spread flips in normal PDF mode
+        if not HAS_PDF or not getattr(self, 'is_magazine_mode', False): return
         
-        # CRITICAL FIX: Hardware Debounce. Prevents high-speed mouse wheels from double-jumping spreads!
         if not hasattr(self, '_last_spread_jump'): self._last_spread_jump = 0
         if time.time() - self._last_spread_jump < 0.25: return
         self._last_spread_jump = time.time()
@@ -1836,18 +2097,35 @@ class vmanViewer(QDialog):
  
     def _toggle_pdf_flip(self, checked):
         if HAS_PDF and hasattr(self, 'pdf_wrapper'):
+            is_mag = getattr(self, 'is_magazine_mode', False)
+            
+            # Save state ONLY if in magazine mode
+            curr_z = abs(self.pdf_wrapper.transform().m11()) if is_mag else 1.0
+            if curr_z == 0: curr_z = 1.0
+            curr_c = self.pdf_wrapper.mapToScene(self.pdf_wrapper.viewport().rect().center()) if is_mag else None
+            
+            self.pdf_wrapper.resetTransform()
+            
             if checked:
                 trans = QTransform()
                 trans.translate(self.pdf_wrapper.width(), 0)
                 trans.scale(-1, 1)
                 self.pdf_wrapper.setTransform(trans)
-            else:
-                self.pdf_wrapper.setTransform(QTransform())
-            if self.macro_recording and not self.macro_paused:
+                
+            if is_mag:
+                self.pdf_wrapper.scale(curr_z, curr_z)
+                self.pdf_wrapper.centerOn(curr_c)
+                
+            if getattr(self, 'macro_recording', False) and not getattr(self, 'macro_paused', False):
+                self._commit_scroll_macro()
+                self._commit_view_change()
                 self._record_macro_action(f"{self.current_index + 1} pdf_flip={1 if checked else 0} dur=0")
+                if is_mag:
+                    new_c = self.pdf_wrapper.mapToScene(self.pdf_wrapper.viewport().rect().center())
+                    self.last_macro_view_state = (curr_z, new_c.x(), new_c.y())
+                self.pending_view_state = None
+                
             self._show_toast("↔ PDF Flipped" if checked else "↔ PDF Normal")
-
-    
             
     def _set_scroll_speed(self, speed):
         self.auto_scroll_speed = speed
@@ -1863,10 +2141,6 @@ class vmanViewer(QDialog):
             # Otherwise, just act as the macro recorder pause button
             self._pause_macro()
             
-    def _record_zoom_event(self, z):
-        if self.macro_recording and not self.macro_paused:
-            self._record_macro_action(f"{self.current_index + 1} z={z:.2f} ufit=0 dur=0")
-        
     def _record_web_zoom(self, z):
         if self.macro_recording and not self.macro_paused:
             self._record_macro_action(f"{self.current_index + 1} z={z:.2f} ufit=0 dur=0")
@@ -1892,24 +2166,52 @@ class vmanViewer(QDialog):
     def _update_deck_buttons(self):
         idx = self.stack.currentIndex()
         is_media = (idx == self.IDX_MEDIA)
-        is_img = (idx == self.IDX_IMG)
+        is_img_or_web = (idx in [self.IDX_IMG, self.IDX_WEB])
         is_doc = (idx in [self.IDX_TXT, self.IDX_CSV, self.IDX_MD, self.IDX_PDF, self.IDX_WEB])
         sqt = getattr(self, 'show_quick_tools', False)
         
-        # Context-Aware Display Logic
-        self.btn_cp_flip.setVisible(sqt and is_img)
-        self.btn_cp_rot.setVisible(sqt and is_img)
-        
-        # A-B Loop applies to Media and Docs!
+        self.btn_cp_flip.setVisible(sqt and is_img_or_web)
+        self.btn_cp_rot.setVisible(sqt and is_img_or_web)
         self.btn_cp_ab.setVisible(sqt and (is_media or is_doc))
-        
-        # Shuffle/Repeat ONLY for Media
         self.btn_cp_repeat.setVisible(is_media)
         self.btn_cp_shuffle.setVisible(sqt and is_media)
         
-        # Zoom ONLY for Images (replaces Shuffle/Repeat visually)
-        self.btn_cp_z_in.setVisible(is_img)
-        self.btn_cp_z_out.setVisible(is_img)
+        # Zoom now explicitly supports BOTH Images and Webpages!
+        is_zoomable = (idx in [self.IDX_IMG, self.IDX_WEB])
+        self.btn_cp_z_in.setVisible(is_zoomable)
+        self.btn_cp_z_out.setVisible(is_zoomable)
+
+    def _apply_general_zoom(self, multiplier):
+        """Universal handler for the UI zoom buttons across Image and Webpage modes"""
+        if self.stack.currentIndex() == self.IDX_IMG:
+            self.img_view.scale(multiplier, multiplier)
+            self.img_view._emit_change() # Emits to macro recorder
+            
+        elif self.stack.currentIndex() == self.IDX_WEB:
+            old_z = self.vert_view.zoom_factor
+            new_z = max(0.1, min(5.0, old_z * multiplier))
+            
+            # Anchor to the center of the UI window
+            pos = QPointF(self.vert_view.viewport().width() / 2.0, self.vert_view.viewport().height() / 2.0)
+            h_bar = self.vert_view.horizontalScrollBar()
+            v_bar = self.vert_view.verticalScrollBar()
+            
+            doc_x = (h_bar.value() + pos.x()) / old_z
+            doc_y = (v_bar.value() + pos.y()) / old_z
+            
+            self.macro_scroll_paused = True
+            self.vert_view.zoom_factor = new_z
+            for lbl in self.vert_view.labels:
+                lbl.apply_zoom(new_z)
+                
+            def apply_ui_scroll():
+                h_bar.setValue(int(doc_x * new_z - pos.x()))
+                v_bar.setValue(int(doc_y * new_z - pos.y()))
+                self.macro_scroll_paused = False
+                self.vert_view.zoomChanged.emit(new_z) # Safely records macro after settling
+                
+            QTimer.singleShot(25, apply_ui_scroll)
+        
         
     def _shuffle_current_playlist(self):
         if not self.active_playlist: return
@@ -1924,6 +2226,7 @@ class vmanViewer(QDialog):
             try:
                 with open(self.settings_file, "r") as f:
                     d = json.load(f)
+                    self.subtitle_color = d.get("subtitle_color", "#FFFFFF")
                     self.vis_mode = d.get("vis_mode", "CIRCULAR_STRING")
                     self.prog_mode = d.get("prog_mode", "SHOW")
                     self.count_mode = d.get("count_mode", "SHOW")
@@ -1945,6 +2248,7 @@ class vmanViewer(QDialog):
             v = self.audio.volume() if hasattr(self, 'audio') and self.audio is not None else getattr(self, 'saved_vol', 0.5)
             with open(self.settings_file, "w") as f:
                 json.dump({
+                    "subtitle_color": getattr(self, 'subtitle_color', "#FFFFFF"),
                     "vis_mode": getattr(self, 'vis_mode', "CIRCULAR_STRING"), 
                     "prog_mode": getattr(self, 'prog_mode', 'SHOW'),
                     "count_mode": getattr(self, 'count_mode', 'SHOW'), 
@@ -1978,13 +2282,20 @@ class vmanViewer(QDialog):
                 self.video_view.fitInView(self.video_item.boundingRect(), Qt.KeepAspectRatio)
         
         if self.stack.currentIndex() == self.IDX_PDF and HAS_PDF:
-            self.pdf_wrapper.setSceneRect(0, 0, w, h)
-            self.pdf_container.setFixedSize(w, h)
-            if self.btn_pdf_flip.isChecked():
-                trans = QTransform()
-                trans.translate(w, 0)
-                trans.scale(-1, 1)
-                self.pdf_wrapper.setTransform(trans)
+            if getattr(self, 'is_magazine_mode', False):
+                QTimer.singleShot(10, self._update_magazine_layout)
+            else:
+                self.pdf_wrapper.resetTransform()
+                self.pdf_wrapper.setSceneRect(0, 0, w, h)
+                self.pdf_container.setFixedSize(w, h)
+                if getattr(self, 'btn_pdf_flip', None) and self.btn_pdf_flip.isChecked():
+                    trans = QTransform()
+                    trans.translate(w, 0)
+                    trans.scale(-1, 1)
+                    self.pdf_wrapper.setTransform(trans)
+                
+                if self.pdf_view.zoomMode() == QPdfView.ZoomMode.FitInView:
+                    self.pdf_view.setZoomMode(QPdfView.ZoomMode.FitInView)
                 
         self.slide_progress.setGeometry(0, 0, w, 2)
         self.header_widget.setGeometry(0, 2, w, 40)
@@ -2004,7 +2315,8 @@ class vmanViewer(QDialog):
         self.macro_osd.setGeometry((w - 550) // 2, 60, 550, 50)
         
         self.brightness_overlay.setGeometry(0, 0, w, h)
-        self.lbl_subtitle.setGeometry(20, h - 100, w - 40, 80)
+        # Expand height to 200px so multi-line text doesn't get cut off
+        self.lbl_subtitle.setGeometry(40, h - 250, w - 80, 200)
         
         self._restore_title()
         if hasattr(self, 'toast_osd'):
@@ -2131,22 +2443,57 @@ class vmanViewer(QDialog):
 
     # --- Feature: Macro Recorder Hooks ---
     def _on_view_changed(self, z, zx, zy):
-        if not self.macro_recording or self.macro_paused: return
-        self.pending_view_state = (z, zx, zy)
-        self.macro_debouncer.start(150) # Faster continuous polling
+        """Strictly handles Images and Magazine Mode dragging/zooming"""
+        if not getattr(self, 'macro_recording', False) or getattr(self, 'macro_paused', False): return
+        if self.stack.currentIndex() == self.IDX_PDF and not getattr(self, 'is_magazine_mode', False): return
+            
+        # FIX: Always record absolute zoom to prevent negative scale flipping on playback
+        self.pending_view_state = (abs(z), zx, zy)
+        self.macro_debouncer.start(150)
+    
+    def _on_normal_zoom_changed(self, z_factor):
+        if not getattr(self, 'macro_recording', False) or getattr(self, 'macro_paused', False): return
+        if getattr(self, 'is_magazine_mode', False): return
+        self._commit_scroll_macro()
+        t_str = self._get_t_str()
+        self._record_macro_action(f"{self.current_index + 1} {t_str}z={z_factor:.2f} ufit=0 dur=0")
+        if hasattr(self, 'pdf_view'):
+            self.last_macro_scroll_state = (self.pdf_view.horizontalScrollBar().value(), self.pdf_view.verticalScrollBar().value())
+            self.pending_scroll_state = None
+
+    def _record_zoom_event(self, z):
+        if self.macro_recording and not self.macro_paused:
+            self._commit_scroll_macro() 
+            w = self.stack.currentWidget()
+            t_str = self._get_t_str()
+            if hasattr(w, 'horizontalScrollBar') and self.stack.currentIndex() == self.IDX_WEB:
+                sx = w.horizontalScrollBar().value()
+                sy = w.verticalScrollBar().value()
+                self._record_macro_action(f"{self.current_index + 1} {t_str}z={z:.2f} sxs={sx} sys={sy} ufit=0 dur=0")
+                self.last_macro_scroll_state = (sx, sy)
+                self.pending_scroll_state = None
+            else:
+                self._record_macro_action(f"{self.current_index + 1} {t_str}z={z:.2f} ufit=0 dur=0")
         
     def _on_scroll_changed(self, widget):
-        if not self.macro_recording or self.macro_paused: return
+        if not getattr(self, 'macro_recording', False) or getattr(self, 'macro_paused', False): return
+        if getattr(self, 'macro_scroll_paused', False): return
+        
+        is_mag = getattr(self, 'is_magazine_mode', False)
+        if is_mag and widget == getattr(self, 'pdf_view', None): return
+        if widget == getattr(self, 'pdf_wrapper', None): return 
+            
         self.pending_scroll_state = (widget.horizontalScrollBar().value(), widget.verticalScrollBar().value())
-        self.macro_scroll_debouncer.start(150) # Faster continuous polling
+        self.macro_scroll_debouncer.start(150)
 
     def _commit_scroll_macro(self):
         if not self.pending_scroll_state: return
         sx, sy = self.pending_scroll_state
+        t_str = self._get_t_str()
         
         if not self.last_macro_scroll_state:
             self.last_macro_scroll_state = (sx, sy)
-            self._record_macro_action(f"{self.current_index + 1} sxs={int(sx)} sys={int(sy)} dur=0")
+            self._record_macro_action(f"{self.current_index + 1} {t_str}sxs={int(sx)} sys={int(sy)} ufit=0 dur=0")
             self.pending_scroll_state = None
             return
 
@@ -2161,7 +2508,7 @@ class vmanViewer(QDialog):
         elif dy < 0: parts.append(f"scrollu={int(-dy)}px")
         
         if parts:
-            self._record_macro_action(f"{self.current_index + 1} {' '.join(parts)} dur=350")
+            self._record_macro_action(f"{self.current_index + 1} {t_str}{' '.join(parts)} ufit=0 dur=150")
             
         self.last_macro_scroll_state = (sx, sy)
         self.pending_scroll_state = None
@@ -2186,35 +2533,9 @@ class vmanViewer(QDialog):
                 img = QImage(path)
                 info += f"<b>Resolution:</b> {img.width()} x {img.height()} px<br>"
                 
-            QMessageBox.information(self, "ℹ️ File Properties", info)
+            QMessageBox.information(self, "File Properties", info)
         except Exception as e:
             QMessageBox.warning(self, "Error", f"Could not read properties: {e}")    
-
-    def _commit_scroll_macro(self):
-        if not self.pending_scroll_state: return
-        sx, sy = self.pending_scroll_state
-        
-        if not self.last_macro_scroll_state:
-            self.last_macro_scroll_state = (sx, sy)
-            self._record_macro_action(f"{self.current_index + 1} sxs={int(sx)} sys={int(sy)} ufit=0 dur=0")
-            self.pending_scroll_state = None
-            return
-
-        last_sx, last_sy = self.last_macro_scroll_state
-        dx = sx - last_sx
-        dy = sy - last_sy
-        
-        parts = []
-        if dx > 0: parts.append(f"scrollr={int(dx)}px")
-        elif dx < 0: parts.append(f"scrolll={int(-dx)}px")
-        if dy > 0: parts.append(f"scrolld={int(dy)}px")
-        elif dy < 0: parts.append(f"scrollu={int(-dy)}px")
-        
-        if parts:
-            self._record_macro_action(f"{self.current_index + 1} {' '.join(parts)} ufit=0 dur=150")
-            
-        self.last_macro_scroll_state = (sx, sy)
-        self.pending_scroll_state = None
         
     def _on_seek_recorded(self):
         if not self.macro_recording or self.macro_paused: return
@@ -2224,11 +2545,12 @@ class vmanViewer(QDialog):
     def _commit_view_change(self):
         if not self.pending_view_state: return
         z, zx, zy = self.pending_view_state
+        t_str = self._get_t_str()
         
         if not self.last_macro_view_state:
             self.last_macro_view_state = (z, zx, zy)
             # CRITICAL: Append ufit=0 so the engine stops trying to auto-fit!
-            self._record_macro_action(f"{self.current_index + 1} zs={z:.2f} zxs={int(zx)} zys={int(zy)} ufit=0 dur=0")
+            self._record_macro_action(f"{self.current_index + 1} {t_str}zs={z:.2f} zxs={int(zx)} zys={int(zy)} ufit=0 dur=0")
             self.pending_view_state = None
             return
 
@@ -2236,7 +2558,7 @@ class vmanViewer(QDialog):
         
         # If zoom changed significantly, record Absolute values
         if abs(z - last_z) > 0.01:
-            action = f"{self.current_index + 1} zs={z:.2f} zxs={int(zx)} zys={int(zy)} ufit=0 dur=150"
+            action = f"{self.current_index + 1} {t_str}zs={z:.2f} zxs={int(zx)} zys={int(zy)} ufit=0 dur=150"
         else:
             # CRITICAL FIX: Convert Scene Coordinates to TRUE Physical Viewport Pixels
             dx_px = (zx - last_zx) * last_z
@@ -2251,7 +2573,7 @@ class vmanViewer(QDialog):
             if not parts: 
                 self.pending_view_state = None
                 return
-            action = f"{self.current_index + 1} {' '.join(parts)} ufit=0 dur=150"
+            action = f"{self.current_index + 1} {t_str}{' '.join(parts)} ufit=0 dur=150"
 
         self._record_macro_action(action)
         self.last_macro_view_state = (z, zx, zy)
@@ -2267,11 +2589,15 @@ class vmanViewer(QDialog):
             self.lbl_macro_log.setText(f"Logged: {action_str}") # Live UI Feedback
 
     def _record_transform_macro(self):
-        if not self.macro_recording or self.macro_paused: return
+        if not getattr(self, 'macro_recording', False) or getattr(self, 'macro_paused', False): return
         t_parts = []
         if getattr(self, 'flip_h', False): t_parts.append('hf')
         if getattr(self, 'flip_v', False): t_parts.append('vf')
-        rot = getattr(self, 'rot_angle', 0) if self.stack.currentIndex() == self.IDX_IMG else getattr(self, 'rot_v_angle', 0)
+        
+        # FIX: Ensure we use the correct rotation variable for Webpage Mode
+        is_video = self.stack.currentIndex() == self.IDX_MEDIA
+        rot = getattr(self, 'rot_v_angle', 0) if is_video else getattr(self, 'rot_angle', 0)
+        
         if rot == 90: t_parts.append('c90')
         elif rot == 180: t_parts.append('c180')
         elif rot == 270: t_parts.append('c270')
@@ -2279,64 +2605,71 @@ class vmanViewer(QDialog):
         t_str = "".join(t_parts)
         if t_str: self._record_macro_action(f"{self.current_index + 1} t={t_str} dur=0")
         else: self._record_macro_action(f"{self.current_index + 1} t=none dur=0")
-
+        
     def _start_macro(self):
         self.macro_recording = True
         self.macro_paused = False
         self.macro_events = [f"# Recorded Macro - {datetime.now().strftime('%H:%M:%S')}"]
         
-        # Explicit Mode Identification
-        if getattr(self, 'is_magazine_mode', False):
+        idx = self.stack.currentIndex()
+        if idx == self.IDX_WEB and getattr(self, 'is_webpage_mode', False):
+            self.macro_events.append("mode=web")
+        elif idx == self.IDX_PDF and getattr(self, 'is_magazine_mode', False):
             layout = getattr(self, 'magazine_layout', 'COVER').lower()
             self.macro_events.append(f"mode=magazine_{layout}")
-        elif getattr(self, 'is_webpage_mode', False):
-            self.macro_events.append("mode=web")
-        elif self.stack.currentIndex() == self.IDX_PDF:
+        elif idx == self.IDX_PDF: 
             self.macro_events.append("mode=pdf")
-        else:
+        else: 
             self.macro_events.append("mode=norm")
             
         self.macro_last_time = time.time()
-        self.last_macro_view_state = None
-        self.last_macro_scroll_state = None
+        self._flush_macro_state()
         
+        # FIX: Delay snapshot by 200ms so PDF engines finish "Fit In View" calculations natively!
+        QTimer.singleShot(200, lambda: self._snapshot_macro_state(idx)) 
+        
+        # Visually lock in the Recording UI State
         self.btn_m_rec.setText("🔴 Recording...")
+        self.btn_m_rec.setStyleSheet("color: #22c55e; font-weight: bold;") 
         self.btn_m_pause.setText("⏸ Pause [P]")
         self.lbl_macro_log.setText("Recording started... (P: Pause | K: Kill)")
+        QApplication.processEvents() 
         
-        # Capture current item & video state if playing
-        init_act = f"{self.current_index + 1}"
-        if HAS_MULTIMEDIA and self.stack.currentIndex() == self.IDX_MEDIA:
+        if HAS_MULTIMEDIA and idx == self.IDX_MEDIA:
             pos = self.player.position() / 1000.0
-            init_act += f" start={pos:.2f} rate={self.player.playbackRate():.2f}"
-        self._record_macro_action(f"{init_act} dur=0")
-        
+            self._record_macro_action(f"{self.current_index + 1} start={pos:.2f} rate={self.player.playbackRate():.2f} dur=0")
+            
     def _pause_macro(self):
-        if not self.macro_recording: return
+        if not getattr(self, 'macro_recording', False): return
         self.macro_paused = not self.macro_paused
         if self.macro_paused: 
+            # FIX: Show Resume state when paused
             self.btn_m_pause.setText("▶ Resume [P]")
+            self.btn_m_rec.setText("⏸ Paused")
+            self.btn_m_rec.setStyleSheet("color: #eab308; font-weight: bold;") # Yellow warning
             self.lbl_macro_log.setText("Recording PAUSED [P to Resume].")
         else:
+            # Revert back to active recording state
             self.btn_m_pause.setText("⏸ Pause [P]")
+            self.btn_m_rec.setText("🔴 Recording...")
+            self.btn_m_rec.setStyleSheet("color: #22c55e; font-weight: bold;")
             self.macro_last_time = time.time()
             self.lbl_macro_log.setText("Recording resumed...")
 
     def _stop_macro(self):
         self.macro_recording = False
         self.macro_osd.hide()
+        # FIX: Reset original UI styling
         self.btn_m_rec.setText("🔴 Rec")
+        self.btn_m_rec.setStyleSheet("color: #ef4444; font-weight: bold;") 
         self.lbl_macro_log.setText("Ready...")
         
-        # Save to raw memory so it isn't lost
-        self.adv_loop_raw = "\n".join(self.macro_events)
+        if self.macro_events and self.macro_events[-1] != "stop":
+            self.macro_events.append("stop")
         
-        # Open Editor so user can hit "Test / Play" without forcing a file save
-        dlg = AdvancedLoopDialog(self.adv_loop_raw, self)
-        if dlg.exec():
-            self.adv_loop_raw = dlg.result_raw
-            self._show_toast("▶️ Playing Macro...")
-
+        self.adv_loop_raw = "\n".join(self.macro_events)
+        self._open_adv_loop()
+        
     def _smooth_anim_tick(self):
         t = self.smooth_target
         if t.get('steps_left', 0) <= 0:
@@ -2357,6 +2690,14 @@ class vmanViewer(QDialog):
             
             view = t['view']
             view.resetTransform()
+            
+            # FIX: Re-apply PDF Magazine horizontal flip base transform during smooth animation
+            if view == getattr(self, 'pdf_wrapper', None) and getattr(self, 'btn_pdf_flip', None) and self.btn_pdf_flip.isChecked():
+                trans = QTransform()
+                trans.translate(view.width(), 0)
+                trans.scale(-1, 1)
+                view.setTransform(trans)
+                
             view.scale(curr_z, curr_z)
             view.centerOn(curr_zx, curr_zy)
             
@@ -2379,6 +2720,14 @@ class vmanViewer(QDialog):
         max_size = float('inf'); min_size = 0; min_chars = 0; max_chars = float('inf')
         includes_filename = []; excludes_filename = []
         
+        category_exts = {
+            'image': ['png', 'jpg', 'jpeg', 'bmp', 'gif', 'webp'], 'images': ['png', 'jpg', 'jpeg', 'bmp', 'gif', 'webp'],
+            'video': ['mp4', 'avi', 'mkv', 'mov', 'webm'], 'videos': ['mp4', 'avi', 'mkv', 'mov', 'webm'],
+            'audio': ['mp3', 'wav', 'ogg', 'flac'], 'audios': ['mp3', 'wav', 'ogg', 'flac'],
+            'doc': ['txt', 'csv', 'json', 'xml', 'py', 'md', 'log', 'ini', 'sh', 'cpp', 'c', 'h', 'pdf'], 'docs': ['txt', 'csv', 'json', 'xml', 'py', 'md', 'log', 'ini', 'sh', 'cpp', 'c', 'h', 'pdf'],
+            'code': ['json', 'xml', 'py', 'sh', 'cpp', 'c', 'h', 'js', 'css', 'html'], 'codes': ['json', 'xml', 'py', 'sh', 'cpp', 'c', 'h', 'js', 'css', 'html']
+        }
+        
         def parse_size(val):
             val = val.lower()
             if val.endswith('mb'): return float(val[:-2]) * 1024 * 1024
@@ -2386,7 +2735,6 @@ class vmanViewer(QDialog):
             if val.endswith('b'): return float(val[:-1])
             return float(val)
 
-        # Better tokenization to support spaces in filenames but split commands cleanly
         clean_tokens = []
         for chunk in seq_str.split(','):
             chunk = chunk.strip()
@@ -2400,7 +2748,8 @@ class vmanViewer(QDialog):
         current_frames = []; frame_transforms = {}
         
         for t in clean_tokens:
-            if t.startswith("max:"):
+            if t in category_exts: includes_ext.extend(category_exts[t])
+            elif t.startswith("max:"):
                 try: max_size = parse_size(t.split(":", 1)[1])
                 except: pass
             elif t.startswith("min:"):
@@ -2429,7 +2778,6 @@ class vmanViewer(QDialog):
                 current_frames = [f for f in new_frames if 0 <= f < len(master_playlist)]
                 for f in current_frames: frame_transforms[f] = frame_transforms.get(f, "") + t_part
             elif t in ['c90', 'c180', 'c270', 'cc90', 'cc270', 'hf', 'vf']:
-                # FIX: If no frames specified yet, apply to ALL frames globally
                 targets = current_frames if current_frames else range(len(master_playlist))
                 for f in targets: frame_transforms[f] = frame_transforms.get(f, "") + t
             else: includes_ext.append(t)
@@ -2465,19 +2813,8 @@ class vmanViewer(QDialog):
             key = []
             for chunk in chunks:
                 if not chunk: continue
-                if chunk.isdigit():
-                    # Priority 1: Numbers (Natural sorting)
-                    key.append((1, int(chunk)))
-                else:
-                    # Split letters and symbols to enforce strict priority
-                    sub_chunks = re.findall(r'[^a-z0-9]+|[a-z]+', chunk)
-                    for sc in sub_chunks:
-                        if sc.isalpha():
-                            # Priority 2: Alphabets
-                            key.append((2, sc))
-                        else:
-                            # Priority 0: Symbols
-                            key.append((0, sc))
+                if chunk.isdigit(): key.append((1, int(chunk)))
+                else: key.append((0, chunk))
             return key
 
         if 'sn' in command_tokens: final_items.sort(key=natural_keys)
@@ -2486,7 +2823,6 @@ class vmanViewer(QDialog):
             if t.startswith("repeat=") or t.startswith("loop="):
                 try: 
                     count = int(t.split("=")[1])
-                    # FIX: Properly duplicate the items for repeating list sequences
                     final_items = [item.copy() for _ in range(count) for item in final_items]
                 except: pass
                 
@@ -2538,6 +2874,18 @@ class vmanViewer(QDialog):
         self.vis_mode = mode
         self.wave_vis.vis_mode = mode
         self.save_settings()
+        
+        # Instantly hide/show the widget based on the mode if audio is playing
+        if self.stack.currentIndex() == self.IDX_MEDIA and getattr(self, 'active_playlist', None):
+            item = self.active_playlist[self.current_index]
+            if item.get('ext', '').lower() in ['.mp3', '.wav', '.ogg', '.flac']:
+                if mode == "OFF":
+                    self.wave_vis.hide()
+                    self.wave_vis.stop_vis()
+                else:
+                    self.wave_vis.show()
+                    if hasattr(self, 'player') and self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+                        self.wave_vis.start_vis()
 
     def show_context_menu(self, pos):
         menu = QMenu(self)
@@ -2662,15 +3010,22 @@ class vmanViewer(QDialog):
             vol_menu.addAction("Set Exact Volume...").triggered.connect(self._set_exact_volume)
             vol_menu.addSeparator()
             vol_menu.addAction("Load Subtitle (.srt)...").triggered.connect(self._load_subtitle_file)
+            
+            # --- NEW: Subtitle Color Menu ---
+            sub_color_menu = vol_menu.addMenu("📝 Subtitle Color")
+            for c_name, c_hex in [("White", "#FFFFFF"), ("Dark Yellow", "#B8860B"), ("Yellow", "#FFFF00"), ("Custom...", "CUSTOM")]:
+                a = sub_color_menu.addAction(c_name)
+                a.triggered.connect(lambda checked, h=c_hex: self._set_subtitle_color(h))
+                
             vol_menu.addAction("Toggle Miniplayer Mode").triggered.connect(self._toggle_miniplayer)
             vol_menu.addSeparator()
             vis_menu = vol_menu.addMenu("🎸 Visualizer Style")
-            for mode_name, mode_val in [("Bubbles (Zero-G)", "BUBBLES"), ("Circular String (Dark Yellow)", "CIRCULAR_STRING")]:
+            for mode_name, mode_val in [("Bubbles (Zero-G)", "BUBBLES"), ("Circular String (Dark Yellow)", "CIRCULAR_STRING"), ("None (Off)", "OFF")]:
                 a = vis_menu.addAction(mode_name)
                 a.setCheckable(True)
                 a.setChecked(self.vis_mode == mode_val)
                 a.triggered.connect(lambda checked, m=mode_val: self._set_vis_mode(m))
-
+                
         menu.addSeparator()
 
         v_menu = menu.addMenu("⚙️ UI Settings")
@@ -2752,15 +3107,18 @@ class vmanViewer(QDialog):
 
 
     def _set_webpage_mode(self, enabled):
-        self.is_webpage_mode = enabled
-        if self.macro_recording and not self.macro_paused:
+        if getattr(self, 'macro_recording', False) and not getattr(self, 'macro_paused', False):
+            self._flush_macro_state()
             self._record_macro_action("mode=web" if enabled else "mode=norm")
             
+        self.is_webpage_mode = enabled
         if enabled:
-            self.stack.setCurrentIndex(self.IDX_WEB); 
+            self.is_magazine_mode = False # <-- FIX: Clear conflicting magazine state
+            self.stack.setCurrentIndex(self.IDX_WEB)
             self.vert_view.set_alignment(self.webpage_align)
             self.vert_view.load_playlist(self.active_playlist)
             self.vert_view.scroll_to_index(self.current_index)
+            if getattr(self, 'macro_recording', False): self._snapshot_macro_state(self.IDX_WEB)
         else: self._load_current_item()
 
     def _adjust_spacing(self):
@@ -2981,9 +3339,13 @@ class vmanViewer(QDialog):
 
         # 2. PDF Flip & Magazine Execution
         if 'pdf_flip' in ins and HAS_PDF:
-            self._toggle_pdf_flip(ins['pdf_flip'] == 1)
+            btn = getattr(self, 'btn_pdf_flip', None)
+            if btn and btn.isChecked() != (ins['pdf_flip'] == 1):
+                btn.setChecked(ins['pdf_flip'] == 1)
+                
         if 'pdf_mag' in ins and HAS_PDF:
-            self._toggle_pdf_mag(ins['pdf_mag'] == 1)
+            if getattr(self, 'is_magazine_mode', False) != (ins['pdf_mag'] == 1):
+                self._toggle_pdf_mag(ins['pdf_mag'] == 1)
 
         just_loaded = getattr(self, '_last_loaded_index', -1) != ins['frame']
         if just_loaded:
@@ -2993,23 +3355,43 @@ class vmanViewer(QDialog):
         # 3. Media Transforms (Flip / Rotate)
         t = ins.get('t', '').lower()
         needs_transform = False
-        if 'hf' in t and not self.flip_h: self.flip_h = True; needs_transform = True
-        if 'vf' in t and not self.flip_v: self.flip_v = True; needs_transform = True
+        is_video = self.stack.currentIndex() == self.IDX_MEDIA
         
-        new_rot = self.rot_angle
+        # FIX: Explicitly evaluate target flip state so it can flip BACK
+        target_flip_h = 'hf' in t
+        target_flip_v = 'vf' in t
+        
+        if target_flip_h != self.flip_h:
+            self.flip_h = target_flip_h
+            needs_transform = True
+            
+        if target_flip_v != self.flip_v:
+            self.flip_v = target_flip_v
+            needs_transform = True
+            
+        current_rot = self.rot_v_angle if is_video else self.rot_angle
+        new_rot = 0 if 'none' in t else current_rot
+        
         if 'c90' in t: new_rot = 90
         elif 'c180' in t: new_rot = 180
         elif 'c270' in t or 'cc90' in t: new_rot = 270
         elif 'cc270' in t: new_rot = 90
-        if new_rot != self.rot_angle:
-            self.rot_angle = new_rot
+        
+        if new_rot != current_rot:
+            if is_video: self.rot_v_angle = new_rot
+            else: self.rot_angle = new_rot
             needs_transform = True
             
         if 'ufit' in ins: self.universal_fit = ins['ufit']
         
+        # FIX: Actively apply the recorded transforms to Webpage Mode during Playback
         if needs_transform and not just_loaded:
-            self._apply_img_transform()
-            if HAS_MULTIMEDIA: self._apply_video_transform()
+            if self.stack.currentIndex() == self.IDX_IMG:
+                self._apply_img_transform()
+            elif self.stack.currentIndex() == self.IDX_WEB:
+                self.vert_view.apply_global_transforms(getattr(self, 'flip_h', False), getattr(self, 'flip_v', False), getattr(self, 'rot_angle', 0))
+            elif HAS_MULTIMEDIA and self.stack.currentIndex() == self.IDX_MEDIA: 
+                self._apply_video_transform()
         
         # 4. Audio / Video Controls
         if ins.get('vol', -1) >= 0 and HAS_MULTIMEDIA and hasattr(self, 'audio'):
@@ -3027,25 +3409,25 @@ class vmanViewer(QDialog):
             if ins['start'] >= 0: self.player.setPosition(int(ins['start'] * 1000))
             if ins['rate'] != 1.0: self.player.setPlaybackRate(ins['rate'])
 
-        # 5. Routing Views for Smooth Drag / Pan / Zoom
+
+        # 5. Routing Views for Strict Playback Separation
         view = None
         scroll_widget = None
         
-        if getattr(self, 'is_magazine_mode', False) and HAS_PDF:
-            view = self.pdf_wrapper # Enables zoom macro playback
-            scroll_widget = self.pdf_wrapper # CRITICAL FIX: Enables scroll macro playback
-        elif self.stack.currentIndex() == self.IDX_IMG:
-            view = self.img_view
-        elif self.stack.currentIndex() == self.IDX_MEDIA:
-            view = self.video_view
-        elif self.stack.currentIndex() == self.IDX_WEB:
-            scroll_widget = self.vert_view
-        elif self.stack.currentIndex() == self.IDX_PDF and HAS_PDF:
-            scroll_widget = self.pdf_view
-        elif self.stack.currentIndex() == self.IDX_TXT:
-            scroll_widget = self.txt_view
-        elif self.stack.currentIndex() == self.IDX_CSV:
-            scroll_widget = self.csv_view
+        is_mag = getattr(self, 'is_magazine_mode', False) and HAS_PDF
+        is_pdf = self.stack.currentIndex() == self.IDX_PDF and HAS_PDF and not is_mag
+        is_web = self.stack.currentIndex() == self.IDX_WEB
+        is_img = self.stack.currentIndex() == self.IDX_IMG
+        is_media = self.stack.currentIndex() == self.IDX_MEDIA
+        
+        if is_mag: view = self.pdf_wrapper; scroll_widget = self.pdf_wrapper
+        elif is_img: view = self.img_view
+        # FIX: Route Video Viewer to the smooth animation engine for zoom/drag!
+        elif is_media and hasattr(self, 'video_view'): view = self.video_view 
+        elif is_web: scroll_widget = self.vert_view
+        elif is_pdf: scroll_widget = self.pdf_view
+        elif self.stack.currentIndex() == self.IDX_TXT: scroll_widget = self.txt_view
+        elif self.stack.currentIndex() == self.IDX_CSV: scroll_widget = self.csv_view
 
         dx = ins.get('dx', 0.0)
         dy = ins.get('dy', 0.0)
@@ -3062,52 +3444,95 @@ class vmanViewer(QDialog):
         steps = max(1, int(ins.get('dur', self.slideshow_speed) / 30))
         self.smooth_target = {'steps_left': steps}
 
-        # Setup Smooth View Drag / Zoom Animation
+        # --- A) Magazine & Image Smooth Panning ---
         if view and has_smooth:
-            curr_z = view.transform().m11()
+            curr_z = abs(view.transform().m11()) # FIX: Prevent negative physics interpolation
             scene_center = view.mapToScene(view.viewport().rect().center())
-            
             final_z = z_target if z_target is not None else curr_z
             final_zx = zx_target if zx_target is not None else scene_center.x()
             final_zy = zy_target if zy_target is not None else scene_center.y()
-            
             if dx != 0: final_zx += (dx / final_z)
             if dy != 0: final_zy += (dy / final_z)
-            
             self.smooth_target.update({
-                'start_z': curr_z, 'end_z': final_z,
-                'start_zx': scene_center.x(), 'end_zx': final_zx,
-                'start_zy': scene_center.y(), 'end_zy': final_zy,
-                'total_steps': steps,
-                'view': view
+                'start_z': curr_z, 'end_z': final_z, 'start_zx': scene_center.x(), 'end_zx': final_zx,
+                'start_zy': scene_center.y(), 'end_zy': final_zy, 'total_steps': steps, 'view': view
             })
         elif view:
             if z_target is not None or zx_target is not None or zy_target is not None:
-                curr_z = view.transform().m11()
+                curr_z = abs(view.transform().m11())
                 scene_center = view.mapToScene(view.viewport().rect().center())
+                
                 view.resetTransform()
-                view.scale(z_target if z_target is not None else curr_z, z_target if z_target is not None else curr_z)
+                # FIX: Re-apply PDF Magazine horizontal flip base transform before zooming
+                if view == getattr(self, 'pdf_wrapper', None) and getattr(self, 'btn_pdf_flip', None) and self.btn_pdf_flip.isChecked():
+                    trans = QTransform()
+                    trans.translate(view.width(), 0)
+                    trans.scale(-1, 1)
+                    view.setTransform(trans)
+                    
+                final_z = z_target if z_target is not None else curr_z
+                view.scale(final_z, final_z)
                 view.centerOn(zx_target if zx_target is not None else scene_center.x(), zy_target if zy_target is not None else scene_center.y())
+                
+        # --- B) Normal PDF (Proportional Zoom) ---
+        if is_pdf and z_target is not None:
+            self.macro_scroll_paused = True 
+            old_z = self.pdf_view.zoomFactor()
+            self.pdf_view.setZoomMode(QPdfView.ZoomMode.Custom)
+            self.pdf_view.setZoomFactor(z_target)
+            
+            # Perfect Proportional Math for PDF!
+            if old_z > 0:
+                ratio = z_target / old_z
+                cx = self.pdf_view.viewport().width() / 2.0
+                cy = self.pdf_view.viewport().height() / 2.0
+                old_x = self.pdf_view.horizontalScrollBar().value() + cx
+                old_y = self.pdf_view.verticalScrollBar().value() + cy
+                
+                def apply_playback_scroll_pdf():
+                    self.pdf_view.horizontalScrollBar().setValue(int(old_x * ratio - cx))
+                    self.pdf_view.verticalScrollBar().setValue(int(old_y * ratio - cy))
+                    self.macro_scroll_paused = False
+                QTimer.singleShot(15, apply_playback_scroll_pdf)
+                
+            # Clear explicit scroll targets so they don't fight the proportional math
+            sx_target = -1
+            sy_target = -1
+            
+        # --- C) Webpage Mode (Absolute Zoom) ---
+        elif is_web and z_target is not None:
+            self.macro_scroll_paused = True
+            self.vert_view.zoom_factor = z_target
+            for lbl in self.vert_view.labels:
+                lbl.apply_zoom(z_target)
+            QTimer.singleShot(30, lambda: setattr(self, 'macro_scroll_paused', False))
 
-        # Setup Document Scroll Animation
-        if scroll_widget and has_scroll_anim:
-            curr_sx = scroll_widget.horizontalScrollBar().value()
-            curr_sy = scroll_widget.verticalScrollBar().value()
-            self.smooth_target.update({
-                'start_sx': curr_sx, 'end_sx': curr_sx + dx if sx_target == -1 else sx_target,
-                'start_sy': curr_sy, 'end_sy': curr_sy + dy if sy_target == -1 else sy_target,
-                'total_steps': steps,
-                'scroll_widget': scroll_widget
-            })
-        elif scroll_widget:
-            if sx_target >= 0: scroll_widget.horizontalScrollBar().setValue(int(sx_target))
-            if sy_target >= 0: scroll_widget.verticalScrollBar().setValue(int(sy_target))
+        # --- Execute Delayed Scroll Animations ---
+        def apply_playback_scrolls():
+            if scroll_widget and has_scroll_anim:
+                curr_sx = scroll_widget.horizontalScrollBar().value()
+                curr_sy = scroll_widget.verticalScrollBar().value()
+                self.smooth_target.update({
+                    'start_sx': curr_sx, 'end_sx': curr_sx + dx if sx_target == -1 else sx_target,
+                    'start_sy': curr_sy, 'end_sy': curr_sy + dy if sy_target == -1 else sy_target,
+                    'total_steps': steps,
+                    'scroll_widget': scroll_widget
+                })
+            elif scroll_widget:
+                if sx_target >= 0: scroll_widget.horizontalScrollBar().setValue(int(sx_target))
+                if sy_target >= 0: scroll_widget.verticalScrollBar().setValue(int(sy_target))
 
-        if has_smooth or has_scroll_anim:
-            self.smooth_anim_timer.start(30)
+            if has_smooth or has_scroll_anim:
+                self.smooth_anim_timer.start(30)
+            else:
+                self.smooth_anim_timer.stop()
+
+        # If a zoom happened on Webpage, wait 30ms for Qt to re-render boundaries before scrolling
+        if z_target is not None and is_web:
+            QTimer.singleShot(30, apply_playback_scrolls)
         else:
-            self.smooth_anim_timer.stop()
-
+            apply_playback_scrolls()
+            
     def _load_current_item(self):
         if not self.active_playlist:
             self.stack.setCurrentIndex(self.IDX_TXT)
@@ -3161,7 +3586,19 @@ class vmanViewer(QDialog):
             self.stack.setCurrentIndex(self.IDX_PDF)
             if HAS_PDF:
                 self.pdf_doc.load(item['path'])
-                self.pdf_view.setZoomMode(QPdfView.ZoomMode.FitToWidth)
+                
+                # FIX: Clean out any lingering magazine sizes before setting zoom
+                self.pdf_view.setMinimumSize(0,0)
+                self.pdf_view.setMaximumSize(16777215, 16777215)
+                self.pdf_container.setMinimumSize(0,0)
+                self.pdf_container.setMaximumSize(16777215, 16777215)
+                self.pdf_wrapper.resetTransform()
+                
+                # Apply True Custom Fit Page Math
+                QTimer.singleShot(50, self._fit_normal_pdf)
+                
+                # Default to Normal Page Size smoothly
+                self.pdf_view.setZoomMode(QPdfView.ZoomMode.FitInView)
             
         elif ext == '.md' and self.is_md_rendered:
             self.stack.setCurrentIndex(self.IDX_MD)
@@ -3232,8 +3669,9 @@ class vmanViewer(QDialog):
             self.cp_slider.show(); self.lbl_time.show()
             if ext in ['.mp3', '.wav', '.ogg', '.flac']: 
                 self.wave_vis.load_file(item['path'])
-                self.wave_vis.show()
-                self.wave_vis.start_vis()
+                if self.vis_mode != "OFF":
+                    self.wave_vis.show()
+                    self.wave_vis.start_vis()
             else: self.video_view.show()
             self.player.setSource(QUrl.fromLocalFile(item['path'])); self.player.play()
         else:
@@ -3244,23 +3682,43 @@ class vmanViewer(QDialog):
         self._update_deck_buttons()
 
     def _flip_img_horiz(self): 
-        if self.stack.currentIndex() == self.IDX_IMG: self.flip_h = not getattr(self, 'flip_h', False); self._apply_img_transform()
-        elif self.stack.currentIndex() == self.IDX_MEDIA and HAS_MULTIMEDIA: self.flip_h = not getattr(self, 'flip_h', False); self._apply_video_transform()
+        if self.stack.currentIndex() == self.IDX_IMG: 
+            self.flip_h = not getattr(self, 'flip_h', False); self._apply_img_transform()
+        elif self.stack.currentIndex() == self.IDX_WEB: 
+            self.flip_h = not getattr(self, 'flip_h', False)
+            self.vert_view.apply_global_transforms(self.flip_h, getattr(self, 'flip_v', False), getattr(self, 'rot_angle', 0))
+        elif self.stack.currentIndex() == self.IDX_MEDIA and HAS_MULTIMEDIA: 
+            self.flip_h = not getattr(self, 'flip_h', False); self._apply_video_transform()
         self._record_transform_macro()
 
     def _flip_img_vert(self):
-        if self.stack.currentIndex() == self.IDX_IMG: self.flip_v = not getattr(self, 'flip_v', False); self._apply_img_transform()
-        elif self.stack.currentIndex() == self.IDX_MEDIA and HAS_MULTIMEDIA: self.flip_v = not getattr(self, 'flip_v', False); self._apply_video_transform()
+        if self.stack.currentIndex() == self.IDX_IMG: 
+            self.flip_v = not getattr(self, 'flip_v', False); self._apply_img_transform()
+        elif self.stack.currentIndex() == self.IDX_WEB: 
+            self.flip_v = not getattr(self, 'flip_v', False)
+            self.vert_view.apply_global_transforms(getattr(self, 'flip_h', False), self.flip_v, getattr(self, 'rot_angle', 0))
+        elif self.stack.currentIndex() == self.IDX_MEDIA and HAS_MULTIMEDIA: 
+            self.flip_v = not getattr(self, 'flip_v', False); self._apply_video_transform()
         self._record_transform_macro()
 
     def _rot_img_cw(self): 
-        if self.stack.currentIndex() == self.IDX_IMG: self.rot_angle = (getattr(self, 'rot_angle', 0) + 90) % 360; self._apply_img_transform()
-        elif self.stack.currentIndex() == self.IDX_MEDIA and HAS_MULTIMEDIA: self.rot_v_angle = (getattr(self, 'rot_v_angle', 0) + 90) % 360; self._apply_video_transform()
+        if self.stack.currentIndex() == self.IDX_IMG: 
+            self.rot_angle = (getattr(self, 'rot_angle', 0) + 90) % 360; self._apply_img_transform()
+        elif self.stack.currentIndex() == self.IDX_WEB: 
+            self.rot_angle = (getattr(self, 'rot_angle', 0) + 90) % 360
+            self.vert_view.apply_global_transforms(getattr(self, 'flip_h', False), getattr(self, 'flip_v', False), self.rot_angle)
+        elif self.stack.currentIndex() == self.IDX_MEDIA and HAS_MULTIMEDIA: 
+            self.rot_v_angle = (getattr(self, 'rot_v_angle', 0) + 90) % 360; self._apply_video_transform()
         self._record_transform_macro()
 
     def _rot_img_ccw(self): 
-        if self.stack.currentIndex() == self.IDX_IMG: self.rot_angle = (getattr(self, 'rot_angle', 0) - 90) % 360; self._apply_img_transform()
-        elif self.stack.currentIndex() == self.IDX_MEDIA and HAS_MULTIMEDIA: self.rot_v_angle = (getattr(self, 'rot_v_angle', 0) - 90) % 360; self._apply_video_transform()
+        if self.stack.currentIndex() == self.IDX_IMG: 
+            self.rot_angle = (getattr(self, 'rot_angle', 0) - 90) % 360; self._apply_img_transform()
+        elif self.stack.currentIndex() == self.IDX_WEB: 
+            self.rot_angle = (getattr(self, 'rot_angle', 0) - 90) % 360
+            self.vert_view.apply_global_transforms(getattr(self, 'flip_h', False), getattr(self, 'flip_v', False), self.rot_angle)
+        elif self.stack.currentIndex() == self.IDX_MEDIA and HAS_MULTIMEDIA: 
+            self.rot_v_angle = (getattr(self, 'rot_v_angle', 0) - 90) % 360; self._apply_video_transform()
         self._record_transform_macro()
         
     def _apply_video_transform(self):
@@ -3424,7 +3882,8 @@ class vmanViewer(QDialog):
         if self.stack.currentIndex() in [self.IDX_IMG, self.IDX_WEB, self.IDX_TXT, self.IDX_CSV, self.IDX_MD, self.IDX_PDF]: 
             self._toggle_slide()
         elif hasattr(self, 'player'):
-            if self.player.playbackState() == QMediaPlayer.PlayingState: 
+            # FIX: Use correct PySide6 PlaybackState enum
+            if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState: 
                 self.player.pause()
                 self.wave_vis.stop_vis()
                 self._record_macro_action(f"{self.current_index + 1} pause dur=0")
@@ -3501,6 +3960,9 @@ class vmanViewer(QDialog):
     def _toggle_fullscreen(self):
         self.showNormal() if self.isFullScreen() else self.showFullScreen()
         self._fade_out_controls()
+        
+        # FIX: Force the layout to immediately auto-fit the media to the new screen size
+        QTimer.singleShot(50, lambda: self.resizeEvent(None))
 
     def _toggle_hide(self):
         if self.isVisible(): self.hide()
