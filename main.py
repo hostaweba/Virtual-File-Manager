@@ -158,295 +158,353 @@ def ensure_dirs():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     VIEWS_DIR.mkdir(parents=True, exist_ok=True)
 
+def resolve_smart_folder(cur, path_val, sanitize_fn):
+    """
+    Recursively resolves Smart Views into actual physical files and their virtual destinations.
+    Returns relative paths that perfectly mirror the visual UI structure.
+    """
+    results = []
+    
+    if path_val.startswith("y_m_f://"):
+        parts = [p for p in path_val.replace("y_m_f://", "").split("/") if p]
+        
+        # 1. Identify which original physical/virtual folders match the criteria
+        if len(parts) == 0:
+            cur.execute("SELECT DISTINCT year, month, parent_path FROM virtual_fs WHERE is_folder=0 AND in_trash=0 AND year!='' AND month!=''")
+            targets = cur.fetchall()
+        elif len(parts) == 1:
+            cur.execute("SELECT DISTINCT year, month, parent_path FROM virtual_fs WHERE year=? AND is_folder=0 AND in_trash=0 AND month!=''", (parts[0],))
+            targets = cur.fetchall()
+        elif len(parts) == 2:
+            cur.execute("SELECT DISTINCT year, month, parent_path FROM virtual_fs WHERE year=? AND month=? AND is_folder=0 AND in_trash=0", (parts[0], parts[1]))
+            targets = cur.fetchall()
+        else:
+            cur.execute("SELECT DISTINCT year, month, parent_path FROM virtual_fs WHERE year=? AND month=? AND is_folder=0 AND in_trash=0", (parts[0], parts[1]))
+            target_folder = parts[2]
+            # Filter targets to only include the specific folder the user clicked on
+            targets = [r for r in cur.fetchall() if (r[2].strip('/').split('/')[-1] if r[2].strip('/') else "Root_Files") == target_folder]
+            
+        # 2. Grab ALL files inside those folders to perfectly mirror the UI!
+        for y, m, pp in targets:
+            folder = pp.strip("/").split("/")[-1] if pp.strip("/") else "Root_Files"
+            # We fetch everything in the parent_path, guaranteeing we don't miss any files!
+            cur.execute("SELECT name, id, real_path, size FROM virtual_fs WHERE parent_path=? AND is_folder=0 AND in_trash=0", (pp,))
+            for n, f_id, rp, sz in cur.fetchall():
+                dest = f"{sanitize_fn(y)}/{sanitize_fn(m)}/{sanitize_fn(folder)}/{sanitize_fn(n)}"
+                results.append((dest, f_id, rp, sz))
+                
+    elif path_val.startswith("tags://"):
+        parts = [p for p in path_val.replace("tags://", "").split("/") if p]
+        if len(parts) == 0:
+            cur.execute("SELECT custom_tags, name, id, real_path, size FROM virtual_fs WHERE custom_tags IS NOT NULL AND custom_tags != '' AND is_folder=0 AND in_trash=0")
+            for tags, n, f_id, rp, sz in cur.fetchall():
+                for t in [x.strip() for x in tags.split(',') if x.strip()]:
+                    results.append((f"{sanitize_fn(t)}/{sanitize_fn(n)}", f_id, rp, sz))
+        else:
+            tag = parts[0]
+            cur.execute("SELECT name, id, real_path, size FROM virtual_fs WHERE custom_tags LIKE ? AND is_folder=0 AND in_trash=0", (f"%{tag}%",))
+            for n, f_id, rp, sz in cur.fetchall():
+                results.append((f"{sanitize_fn(n)}", f_id, rp, sz))
+                
+    else:
+        # Handles all other Smart Views (y_c_m_e://, etc.) dynamically
+        matched_proto = next((p for p in SMART_PROTOCOLS if path_val.startswith(p)), None)
+        if matched_proto:
+            cols = SMART_PROTOCOLS[matched_proto]
+            parts = [p for p in path_val.replace(matched_proto, "").split("/") if p]
+            where = ["is_folder=0", "in_trash=0"]
+            params = []
+            
+            for col in cols: where.append(f"{col}!='' AND {col} IS NOT NULL")
+            for i, p in enumerate(parts):
+                if i < len(cols):
+                    where.append(f"{cols[i]}=?")
+                    params.append(p)
+            
+            select_sql = ", ".join(cols[len(parts):]) + (", name, id, real_path, size" if len(parts) < len(cols) else "name, id, real_path, size")
+            if len(parts) >= len(cols): select_sql = "name, id, real_path, size"
+            
+            cur.execute(f"SELECT {select_sql} FROM virtual_fs WHERE {' AND '.join(where)}", tuple(params))
+            for row in cur.fetchall():
+                f_id, rp, sz = row[-3], row[-2], row[-1]
+                n = row[-4]
+                if len(parts) < len(cols):
+                    path_parts = [sanitize_fn(str(c)) for c in row[:-4]]
+                    path_parts.append(sanitize_fn(n))
+                    dest = "/".join(path_parts)
+                else:
+                    dest = sanitize_fn(n)
+                results.append((dest, f_id, rp, sz))
+                
+    return results
+
 # ---------------- Background Threads ----------------
 
 class MaterializeThread(QThread):
     progress = Signal(int, int, str)
     finished = Signal(int)
     error = Signal(str)
-
     def __init__(self, db_path, items, dest_dir, parent=None):
-        super().__init__(parent)
-        self.db_path = db_path
-        self.items = items
-        self.dest_dir = dest_dir
-        self.is_cancelled = False
-
+        super().__init__(parent); self.db_path, self.items, self.dest_dir = db_path, items, dest_dir; self.is_cancelled = False
     def cancel(self): self.is_cancelled = True
-
-    def sanitize_filename(self, name):
-        return re.sub(r'[\\/*?:"<>|]', '_', str(name))
+    def sanitize_filename(self, name): return re.sub(r'[\\/*?:"<>|]', '_', str(name))
 
     def run(self):
         try:
             with sqlite3.connect(self.db_path) as conn:
-                cur = conn.cursor()
-                all_exports = []
-
-            for typ, path_val, db_id in self.items:
-                if self.is_cancelled: return
-
-                if typ == "file" and db_id != -1:
-                    res = cur.execute("SELECT name, real_path FROM virtual_fs WHERE id=?", (db_id,)).fetchone()
-                    if res: all_exports.append((self.sanitize_filename(res[0]), res[1]))
-                
-                elif typ == "folder":
-                    if "://" in path_val:
-                        prefix, data = path_val.split("://", 1)
-                        parts = [p for p in data.split('/') if p]
-
-                        if prefix == "y_m_f":
-                            if len(parts) == 0:
-                                res = cur.execute("SELECT year, month, name, real_path FROM virtual_fs WHERE is_folder=0 AND in_trash=0").fetchall()
-                                for y, m, n, rp in res:
-                                    dest = os.path.join(self.sanitize_filename(y or "Unknown_Year"), self.sanitize_filename(m or "Unknown_Month"), self.sanitize_filename(n))
-                                    all_exports.append((dest, rp))
-                            elif len(parts) == 1: 
-                                yr = parts[0]
-                                res = cur.execute("SELECT month, name, real_path FROM virtual_fs WHERE year=? AND is_folder=0 AND in_trash=0", (yr,)).fetchall()
-                                for m, n, rp in res:
-                                    dest = os.path.join(self.sanitize_filename(yr), self.sanitize_filename(m or "Unknown_Month"), self.sanitize_filename(n))
-                                    all_exports.append((dest, rp))
-                            elif len(parts) >= 2: 
-                                yr, mo = parts[0], parts[1]
-                                res = cur.execute("SELECT name, real_path FROM virtual_fs WHERE year=? AND month=? AND is_folder=0 AND in_trash=0", (yr, mo)).fetchall()
-                                for n, rp in res:
-                                    dest = os.path.join(self.sanitize_filename(yr), self.sanitize_filename(mo), self.sanitize_filename(n))
-                                    all_exports.append((dest, rp))
-
-                        elif prefix == "tags":
-                            tag = parts[0] if parts else ""
-                            if tag:
-                                res = cur.execute("SELECT name, real_path FROM virtual_fs WHERE custom_tags LIKE ? AND is_folder=0 AND in_trash=0", (f"%{tag}%",)).fetchall()
-                                for n, rp in res: all_exports.append((os.path.join(self.sanitize_filename(tag), self.sanitize_filename(n)), rp))
-                            else:
-                                res = cur.execute("SELECT custom_tags, name, real_path FROM virtual_fs WHERE custom_tags IS NOT NULL AND custom_tags != '' AND is_folder=0 AND in_trash=0").fetchall()
-                                for tags, n, rp in res:
-                                    for t in [x.strip() for x in tags.split(',') if x.strip()]:
-                                        all_exports.append((os.path.join(self.sanitize_filename(t), self.sanitize_filename(n)), rp))
-                        
-                        elif prefix == "category":
-                            cat = parts[0] if parts else ""
-                            if cat:
-                                res = cur.execute("SELECT name, real_path FROM virtual_fs WHERE category=? AND is_folder=0 AND in_trash=0", (cat,)).fetchall()
-                                for n, rp in res: all_exports.append((os.path.join(self.sanitize_filename(cat), self.sanitize_filename(n)), rp))
-                            else:
-                                res = cur.execute("SELECT category, name, real_path FROM virtual_fs WHERE category IS NOT NULL AND category != '' AND is_folder=0 AND in_trash=0").fetchall()
-                                for c, n, rp in res: all_exports.append((os.path.join(self.sanitize_filename(c), self.sanitize_filename(n)), rp))
-                                
-                        elif prefix == "search":
-                            term = parts[0] if parts else ""
-                            res = cur.execute("SELECT name, real_path FROM virtual_fs WHERE (name LIKE ? OR secondary_name LIKE ? OR custom_tags LIKE ?) AND is_folder=0 AND in_trash=0", (f"%{term}%", f"%{term}%", f"%{term}%")).fetchall()
-                            for n, rp in res: all_exports.append((os.path.join("Search_Results", self.sanitize_filename(n)), rp))
-
-                    elif path_val.startswith("/"):
-                        res = cur.execute("SELECT parent_path, name, real_path FROM virtual_fs WHERE parent_path LIKE ? AND is_folder=0 AND in_trash=0", (f"{path_val}%",)).fetchall()
-                        
-                        # Get the selected folder's base name to wrap the contents inside it
-                        base_folder_name = self.sanitize_filename(path_val.strip('/').split('/')[-1]) if path_val.strip('/') else ""
-                        
-                        for pp, n, rp in res:
-                            rel_p = pp[len(path_val):].lstrip('/') 
-                            safe_parts = [self.sanitize_filename(p) for p in rel_p.split('/') if p]
-                            
-                            # Prepend the base folder so it is created in the destination
-                            if base_folder_name:
-                                safe_parts.insert(0, base_folder_name)
-                            
-                            safe_rel_p = os.path.join(*safe_parts) if safe_parts else ""
-                            dest = os.path.join(safe_rel_p, self.sanitize_filename(n))
-                            all_exports.append((dest, rp))
+                cur = conn.cursor(); all_exports = []
+                for typ, path_val, db_id in self.items:
+                    if self.is_cancelled: return
+                    if typ == "file" and db_id != -1:
+                        res = cur.execute("SELECT name, real_path FROM virtual_fs WHERE id=?", (db_id,)).fetchone()
+                        if res: all_exports.append((self.sanitize_filename(res[0]), res[1]))
+                    elif typ == "folder":
+                        if "://" in path_val and not path_val.startswith("trash://") and not path_val.startswith("fav://"):
+                            base_f = self.sanitize_filename(path_val.strip('/').split('/')[-1]) if path_val.strip('/').replace('://', '') else ""
+                            smart_files = resolve_smart_folder(cur, path_val, self.sanitize_filename)
+                            for rel_dest, f_id, rp, sz in smart_files:
+                                dest = os.path.join(base_f, rel_dest) if base_f else rel_dest
+                                all_exports.append((dest, rp))
+                        elif path_val.startswith("/"):
+                            base_f = self.sanitize_filename(path_val.strip('/').split('/')[-1]) if path_val.strip('/') else ""
+                            for pp, n, rp in cur.execute("SELECT parent_path, name, real_path FROM virtual_fs WHERE parent_path LIKE ? AND is_folder=0 AND in_trash=0", (f"{path_val}%",)).fetchall():
+                                rel_p = pp[len(path_val):].lstrip('/') 
+                                safe_parts = [self.sanitize_filename(p) for p in rel_p.split('/') if p]
+                                if base_f: safe_parts.insert(0, base_f)
+                                dest = os.path.join(os.path.join(*safe_parts) if safe_parts else "", self.sanitize_filename(n))
+                                all_exports.append((dest, rp))
 
             total = len(all_exports)
-            if total == 0:
-                self.error.emit("No files found in this view to export. (The virtual folder or smart view might be empty).")
-                conn.close()
-                return
+            if total == 0: return self.error.emit("View is empty. Compilation cancelled.")
 
             count = 0
             for i, (rel_dest, source_rp) in enumerate(all_exports):
                 if self.is_cancelled: return
-                
                 safe_rel_dest = rel_dest.replace('\\', '/').strip('/')
                 final_dest = os.path.join(self.dest_dir, os.path.normpath(safe_rel_dest))
-                
                 os.makedirs(os.path.dirname(final_dest), exist_ok=True)
-                self.progress.emit(i+1, total, f"Materializing: {safe_rel_dest}")
-
+                self.progress.emit(i+1, total, f"Materializing:\n{safe_rel_dest}")
                 try:
-                    # FIX: Correctly skipping broken files instead of spamming ghost files
                     if source_rp and str(source_rp).strip() not in ("None", "") and os.path.exists(str(source_rp)):
-                        shutil.copy2(str(source_rp), final_dest)
-                        count += 1
-                    else:
-                        print(f"VMan Warning: Skipping export of {safe_rel_dest} because physical source is disconnected.")
-                except Exception as e:
-                    print(f"Materialize Error on {final_dest}: {e}")
-
-            conn.close()
+                        shutil.copy2(str(source_rp), final_dest); count += 1
+                except Exception: pass
             self.finished.emit(count)
-        except Exception as e:
-            self.error.emit(str(e))
+        except Exception as e: self.error.emit(str(e))
 
 class DummyReplicaThread(QThread):
     progress = Signal(int, int, str)
     finished = Signal(int)
     error = Signal(str)
-
     def __init__(self, db_path, items, dest_dir, zero_byte_mode=False, parent=None):
-        super().__init__(parent)
-        self.db_path = db_path
-        self.items = items
-        self.dest_dir = dest_dir
-        self.zero_byte_mode = zero_byte_mode
-        self.is_cancelled = False
-
+        super().__init__(parent); self.db_path, self.items, self.dest_dir, self.zero_byte_mode = db_path, items, dest_dir, zero_byte_mode; self.is_cancelled = False
     def cancel(self): self.is_cancelled = True
-
-    def sanitize_filename(self, name):
-        return re.sub(r'[\\/*?:"<>|]', '_', str(name))
-
+    def sanitize_filename(self, name): return re.sub(r'[\\/*?:"<>|]', '_', str(name))
     def _parse_size(self, size_val):
-        """Aggressively parses raw DB sizes or strings (e.g. '5.4 MB', '1024') into strict byte integers."""
         if not size_val: return 0
         if isinstance(size_val, (int, float)): return int(size_val)
-        
         s = str(size_val).strip().upper().replace(',', '')
-        
-        # 1. Try direct conversion first (if it's just a raw number string)
-        try:
-            return int(float(s))
-        except ValueError:
-            pass
-            
-        # 2. Extract unit-based text (e.g., "15.4 MB")
+        try: return int(float(s))
+        except ValueError: pass
         m = re.search(r'([\d\.]+)\s*([A-Z]+)', s)
         if m:
-            val = float(m.group(1))
-            unit = m.group(2)
+            val, unit = float(m.group(1)), m.group(2)
             if unit in ['B', 'BYTE', 'BYTES']: return int(val)
             elif unit in ['KB', 'K', 'KIB']: return int(val * 1024)
             elif unit in ['MB', 'M', 'MIB']: return int(val * 1024**2)
             elif unit in ['GB', 'G', 'GIB']: return int(val * 1024**3)
-            elif unit in ['TB', 'T', 'TIB']: return int(val * 1024**4)
             return int(val)
-            
         return 0
 
     def run(self):
         try:
             with sqlite3.connect(self.db_path) as conn:
-                cur = conn.cursor()
-                all_exports = []
-
+                cur = conn.cursor(); all_exports = []
                 for typ, path_val, db_id in self.items:
                     if self.is_cancelled: return
-
                     if typ == "file" and db_id != -1:
                         res = cur.execute("SELECT name, size FROM virtual_fs WHERE id=?", (db_id,)).fetchone()
                         if res: all_exports.append((self.sanitize_filename(res[0]), res[1]))
-                    
                     elif typ == "folder":
-                        if "://" in path_val:
-                            prefix, data = path_val.split("://", 1)
-                            parts = [p for p in data.split('/') if p]
-
-                            if prefix == "y_m_f":
-                                if len(parts) == 0:
-                                    res = cur.execute("SELECT year, month, name, size FROM virtual_fs WHERE is_folder=0 AND in_trash=0").fetchall()
-                                    for y, m, n, sz in res:
-                                        dest = os.path.join(self.sanitize_filename(y or "Unknown_Year"), self.sanitize_filename(m or "Unknown_Month"), self.sanitize_filename(n))
-                                        all_exports.append((dest, sz))
-                                elif len(parts) == 1: 
-                                    yr = parts[0]
-                                    res = cur.execute("SELECT month, name, size FROM virtual_fs WHERE year=? AND is_folder=0 AND in_trash=0", (yr,)).fetchall()
-                                    for m, n, sz in res:
-                                        dest = os.path.join(self.sanitize_filename(yr), self.sanitize_filename(m or "Unknown_Month"), self.sanitize_filename(n))
-                                        all_exports.append((dest, sz))
-                                elif len(parts) >= 2: 
-                                    yr, mo = parts[0], parts[1]
-                                    res = cur.execute("SELECT name, size FROM virtual_fs WHERE year=? AND month=? AND is_folder=0 AND in_trash=0", (yr, mo)).fetchall()
-                                    for n, sz in res:
-                                        dest = os.path.join(self.sanitize_filename(yr), self.sanitize_filename(mo), self.sanitize_filename(n))
-                                        all_exports.append((dest, sz))
-
-                            elif prefix == "tags":
-                                tag = parts[0] if parts else ""
-                                if tag:
-                                    res = cur.execute("SELECT name, size FROM virtual_fs WHERE custom_tags LIKE ? AND is_folder=0 AND in_trash=0", (f"%{tag}%",)).fetchall()
-                                    for n, sz in res: all_exports.append((os.path.join(self.sanitize_filename(tag), self.sanitize_filename(n)), sz))
-                                else:
-                                    res = cur.execute("SELECT custom_tags, name, size FROM virtual_fs WHERE custom_tags IS NOT NULL AND custom_tags != '' AND is_folder=0 AND in_trash=0").fetchall()
-                                    for tags, n, sz in res:
-                                        for t in [x.strip() for x in tags.split(',') if x.strip()]:
-                                            all_exports.append((os.path.join(self.sanitize_filename(t), self.sanitize_filename(n)), sz))
-                            
-                            elif prefix == "category":
-                                cat = parts[0] if parts else ""
-                                if cat:
-                                    res = cur.execute("SELECT name, size FROM virtual_fs WHERE category=? AND is_folder=0 AND in_trash=0", (cat,)).fetchall()
-                                    for n, sz in res: all_exports.append((os.path.join(self.sanitize_filename(cat), self.sanitize_filename(n)), sz))
-                                else:
-                                    res = cur.execute("SELECT category, name, size FROM virtual_fs WHERE category IS NOT NULL AND category != '' AND is_folder=0 AND in_trash=0").fetchall()
-                                    for c, n, sz in res: all_exports.append((os.path.join(self.sanitize_filename(c), self.sanitize_filename(n)), sz))
-                                    
-                            elif prefix == "search":
-                                term = parts[0] if parts else ""
-                                res = cur.execute("SELECT name, size FROM virtual_fs WHERE (name LIKE ? OR secondary_name LIKE ? OR custom_tags LIKE ?) AND is_folder=0 AND in_trash=0", (f"%{term}%", f"%{term}%", f"%{term}%")).fetchall()
-                                for n, sz in res: all_exports.append((os.path.join("Search_Results", self.sanitize_filename(n)), sz))
-
+                        if "://" in path_val and not path_val.startswith("trash://") and not path_val.startswith("fav://"):
+                            base_f = self.sanitize_filename(path_val.strip('/').split('/')[-1]) if path_val.strip('/').replace('://', '') else ""
+                            smart_files = resolve_smart_folder(cur, path_val, self.sanitize_filename)
+                            for rel_dest, f_id, rp, sz in smart_files:
+                                dest = os.path.join(base_f, rel_dest) if base_f else rel_dest
+                                all_exports.append((dest, sz))
                         elif path_val.startswith("/"):
-                            res = cur.execute("SELECT parent_path, name, size FROM virtual_fs WHERE parent_path LIKE ? AND is_folder=0 AND in_trash=0", (f"{path_val}%",)).fetchall()
-                            base_folder_name = self.sanitize_filename(path_val.strip('/').split('/')[-1]) if path_val.strip('/') else ""
-                            
-                            for pp, n, sz in res:
+                            base_f = self.sanitize_filename(path_val.strip('/').split('/')[-1]) if path_val.strip('/') else ""
+                            for pp, n, sz in cur.execute("SELECT parent_path, name, size FROM virtual_fs WHERE parent_path LIKE ? AND is_folder=0 AND in_trash=0", (f"{path_val}%",)).fetchall():
                                 rel_p = pp[len(path_val):].lstrip('/') 
                                 safe_parts = [self.sanitize_filename(p) for p in rel_p.split('/') if p]
-                                if base_folder_name:
-                                    safe_parts.insert(0, base_folder_name)
-                                safe_rel_p = os.path.join(*safe_parts) if safe_parts else ""
-                                dest = os.path.join(safe_rel_p, self.sanitize_filename(n))
+                                if base_f: safe_parts.insert(0, base_f)
+                                dest = os.path.join(os.path.join(*safe_parts) if safe_parts else "", self.sanitize_filename(n))
                                 all_exports.append((dest, sz))
 
             total = len(all_exports)
-            if total == 0:
-                self.error.emit("No files found to replicate.")
-                return
+            if total == 0: return self.error.emit("No files found to replicate.")
 
             count = 0
             for i, (rel_dest, f_size) in enumerate(all_exports):
                 if self.is_cancelled: return
-                
                 safe_rel_dest = rel_dest.replace('\\', '/').strip('/')
                 final_dest = os.path.join(self.dest_dir, os.path.normpath(safe_rel_dest))
-                
                 os.makedirs(os.path.dirname(final_dest), exist_ok=True)
-                self.progress.emit(i+1, total, f"Creating Sparse Replica: {safe_rel_dest}")
-
+                self.progress.emit(i+1, total, f"Creating Replica:\n{safe_rel_dest}")
                 try:
-                    # Parse guaranteed pure byte integer
                     sz = self._parse_size(f_size)
-                    
-                    # 1. Create the base empty file
-                    with open(final_dest, "wb") as f:
-                        pass
-                    
+                    with open(final_dest, "wb") as f: pass
                     if not self.zero_byte_mode and sz > 0:
-                        # 2. Flag as sparse to ensure OS knows NOT to write physical sectors
-                        if sys.platform == "win32":
-                            subprocess.run(["fsutil", "sparse", "setflag", final_dest], creationflags=subprocess.CREATE_NO_WINDOW)
-                            
-                        # 3. Native Truncation expands logical footprint size with ZERO SSD wear
-                        with open(final_dest, "r+b") as f:
-                            f.truncate(sz)
-                            
+                        if sys.platform == "win32": subprocess.run(["fsutil", "sparse", "setflag", final_dest], creationflags=subprocess.CREATE_NO_WINDOW)
+                        with open(final_dest, "r+b") as f: f.truncate(sz)
                     count += 1
-                except Exception as e:
-                    print(f"Dummy Replica Error on {final_dest}: {e}")
-
+                except Exception: pass
             self.finished.emit(count)
-        except Exception as e:
-            self.error.emit(str(e))
+        except Exception as e: self.error.emit(str(e))
+
+class CompilerThread(QThread):
+    progress = Signal(int, int, str)
+    finished = Signal(str)
+    error = Signal(str)
+    def __init__(self, source_db, target_db, items, append_mode=False, parent=None):
+        super().__init__(parent); self.source_db = source_db; self.target_db = target_db; self.items = items; self.append_mode = append_mode; self.is_cancelled = False
+    def cancel(self): self.is_cancelled = True
+    def sanitize_filename(self, name): return re.sub(r'[\\/*?:"<>|]', '_', str(name))
+
+    def run(self):
+        try:
+            if self.is_cancelled: return
+            self.progress.emit(0, 100, "Initializing transfer...")
+            
+            if not self.append_mode and os.path.exists(self.target_db): 
+                os.remove(self.target_db)
+            
+            src_conn = sqlite3.connect(self.source_db); src_cur = src_conn.cursor()
+            src_cur.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='virtual_fs'")
+            schema = src_cur.fetchone()[0]
+            
+            tgt_conn = sqlite3.connect(self.target_db); tgt_cur = tgt_conn.cursor()
+            if not self.append_mode or not os.path.exists(self.target_db) or os.path.getsize(self.target_db) == 0:
+                tgt_cur.execute(schema)
+            tgt_conn.commit()
+            
+            src_cur.execute("PRAGMA table_info(virtual_fs)")
+            cols = [row[1] for row in src_cur.fetchall()]
+            pp_idx = cols.index("parent_path")
+            id_idx = cols.index("id") 
+            
+            self.progress.emit(10, 100, "Resolving folder structures...")
+            
+            all_exports = []
+            for typ, path_val, db_id in self.items:
+                if self.is_cancelled: return
+                if typ == "file" and db_id != -1: all_exports.append(("/", db_id))
+                elif typ == "folder":
+                    if "://" in path_val and not path_val.startswith("trash://") and not path_val.startswith("fav://"):
+                        base_f = self.sanitize_filename(path_val.strip('/').split('/')[-1]) if path_val.strip('/').replace('://', '') else ""
+                        smart_files = resolve_smart_folder(src_cur, path_val, self.sanitize_filename)
+                        for rel_dest, f_id, rp, sz in smart_files:
+                            dest = "/" + (f"{base_f}/{rel_dest}" if base_f else rel_dest)
+                            
+                            # --- CRITICAL FIX: Clean Double Slashes ---
+                            dest_folder = "/".join(dest.split("/")[:-1]) + "/"
+                            while "//" in dest_folder: dest_folder = dest_folder.replace("//", "/")
+                            if not dest_folder.startswith("/"): dest_folder = "/" + dest_folder
+                            
+                            all_exports.append((dest_folder, f_id))
+                    elif path_val.startswith("/"):
+                        base_f = self.sanitize_filename(path_val.strip('/').split('/')[-1]) if path_val.strip('/') else ""
+                        for pp, f_id in src_cur.execute("SELECT parent_path, id FROM virtual_fs WHERE parent_path LIKE ? AND is_folder=0 AND in_trash=0", (f"{path_val}%",)).fetchall():
+                            rel_p = pp[len(path_val):].lstrip('/') 
+                            safe_parts = [self.sanitize_filename(p) for p in rel_p.split('/') if p]
+                            if base_f: safe_parts.insert(0, base_f)
+                            dest = "/" + "/".join(safe_parts) + "/" if safe_parts else "/"
+                            while "//" in dest: dest = dest.replace("//", "/")
+                            all_exports.append((dest, f_id))
+
+            total = len(all_exports)
+            if total == 0: 
+                self.error.emit("View is empty. Compilation cancelled.")
+                src_conn.close(); tgt_conn.close(); return
+                
+            created_folders = set(); modified_rows = []
+            
+            for i, (new_pp, f_id) in enumerate(all_exports):
+                if self.is_cancelled: return
+                
+                row = src_cur.execute("SELECT * FROM virtual_fs WHERE id=?", (f_id,)).fetchone()
+                if not row: continue
+                r_list = list(row)
+                r_list[pp_idx] = new_pp
+                r_list[id_idx] = None 
+                modified_rows.append(tuple(r_list))
+                
+                path_build = "/"
+                for part in [p for p in new_pp.split('/') if p]:
+                    if path_build + part + "/" not in created_folders:
+                        if not tgt_cur.execute("SELECT id FROM virtual_fs WHERE parent_path=? AND name=? AND is_folder=1", (path_build, part)).fetchone():
+                            tgt_cur.execute(f"INSERT OR IGNORE INTO virtual_fs (parent_path, name, is_folder) VALUES (?, ?, 1)", (path_build, part))
+                        created_folders.add(path_build + part + "/")
+                    path_build += part + "/"
+                    
+                if len(modified_rows) >= 1000:
+                    tgt_cur.executemany(f"INSERT OR IGNORE INTO virtual_fs VALUES ({','.join(['?']*len(cols))})", modified_rows)
+                    tgt_conn.commit(); modified_rows.clear()
+                    self.progress.emit(int(30 + (i/total)*70), 100, f"Compiled {i}/{total} items...")
+                    
+            if modified_rows:
+                tgt_cur.executemany(f"INSERT OR IGNORE INTO virtual_fs VALUES ({','.join(['?']*len(cols))})", modified_rows)
+                tgt_conn.commit()
+                
+            src_conn.close(); tgt_conn.close(); self.finished.emit(self.target_db)
+        except Exception as e: self.error.emit(str(e))
+
+class ExportZipThread(QThread):
+    progress = Signal(int, int, str)
+    finished = Signal(str)
+    error = Signal(str)
+    def __init__(self, db_path, items, zip_filepath, parent=None):
+        super().__init__(parent); self.db_path, self.items, self.zip_filepath = db_path, items, zip_filepath; self.is_cancelled = False
+    def cancel(self): self.is_cancelled = True
+    def sanitize_filename(self, name): return re.sub(r'[\\/*?:"<>|]', '_', str(name))
+
+    def run(self):
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cur = conn.cursor(); all_exports = []
+                for typ, path_val, db_id in self.items:
+                    if self.is_cancelled: return
+                    if typ == "file" and db_id != -1:
+                        res = cur.execute("SELECT real_path, name FROM virtual_fs WHERE id=?", (db_id,)).fetchone()
+                        if res and res[0] and os.path.exists(res[0]): all_exports.append((res[0], self.sanitize_filename(res[1])))
+                    elif typ == "folder":
+                        if "://" in path_val and not path_val.startswith("trash://") and not path_val.startswith("fav://"):
+                            base_f = self.sanitize_filename(path_val.strip('/').split('/')[-1]) if path_val.strip('/').replace('://', '') else ""
+                            smart_files = resolve_smart_folder(cur, path_val, self.sanitize_filename)
+                            for rel_dest, f_id, rp, sz in smart_files:
+                                if rp and os.path.exists(rp): 
+                                    dest = os.path.join(base_f, rel_dest) if base_f else rel_dest
+                                    all_exports.append((rp, dest))
+                        elif path_val.startswith("/"):
+                            base_f = self.sanitize_filename(path_val.strip('/').split('/')[-1]) if path_val.strip('/') else ""
+                            for pp, n, rp in cur.execute("SELECT parent_path, name, real_path FROM virtual_fs WHERE parent_path LIKE ? AND is_folder=0 AND in_trash=0", (f"{path_val}%",)).fetchall():
+                                if not rp or not os.path.exists(rp): continue
+                                rel_p = pp[len(path_val):].lstrip('/') 
+                                safe_parts = [self.sanitize_filename(p) for p in rel_p.split('/') if p]
+                                if base_f: safe_parts.insert(0, base_f)
+                                dest = os.path.join(os.path.join(*safe_parts) if safe_parts else "", self.sanitize_filename(n))
+                                all_exports.append((rp, dest))
+
+            total = len(all_exports)
+            if total == 0: return self.error.emit("No physical files found to zip.")
+                
+            with zipfile.ZipFile(self.zip_filepath, 'w', zipfile.ZIP_DEFLATED) as zf:
+                for i, (real_os_path, zip_virtual_path) in enumerate(all_exports):
+                    if self.is_cancelled: return
+                    self.progress.emit(i+1, total, f"Compressing:\n{zip_virtual_path}")
+                    zf.write(real_os_path, arcname=zip_virtual_path)
+                    
+            self.finished.emit(self.zip_filepath)
+        except Exception as e: self.error.emit(str(e))
 
 class BulkHashCalculator(QThread):
     progress = Signal(int, int, str)
@@ -665,6 +723,10 @@ class CustomSortWidgetItem(QTableWidgetItem):
             return self.sort_val < other.sort_val
         return super().__lt__(other)        
 
+class NumericTableItem(QTableWidgetItem):
+    def __lt__(self, other):
+        return self.data(Qt.UserRole) < other.data(Qt.UserRole)
+
 class SpaceScannerThread(QThread):
     progress = Signal(int, int, str)
     found = Signal(str, str, str, str, object, str, str, str, str, object) 
@@ -807,119 +869,6 @@ class ImportFilesThread(QThread):
         except Exception as e: 
             self.error.emit(str(e))
 
-class CompilerThread(QThread):
-    progress = Signal(int, int, str)
-    finished = Signal(str)
-    error = Signal(str)
-    def __init__(self, source_db, target_db, source_prefix, query, params, parent=None):
-        super().__init__(parent)
-        self.source_db, self.target_db, self.source_prefix, self.query, self.params = source_db, target_db, source_prefix, query, params
-        self.is_cancelled = False
-    def cancel(self): self.is_cancelled = True
-    def run(self):
-        try:
-            if self.is_cancelled: return
-            self.progress.emit(0, 100, "Initializing compiler...")
-            if os.path.exists(self.target_db): os.remove(self.target_db)
-            tgt_db = vmanDB(Path(self.target_db))
-            src_conn = sqlite3.connect(self.source_db)
-            src_cur = src_conn.cursor()
-            
-            # --- Dynamically fetch exact columns expected by the target DB ---
-            tgt_conn = tgt_db.conn
-            tgt_cur = tgt_conn.cursor()
-            tgt_cur.execute("PRAGMA table_info(virtual_fs)")
-            tgt_cols = [row[1] for row in tgt_cur.fetchall()]
-            
-            self.progress.emit(20, 100, "Executing extraction query...")
-            
-            # --- Rewrite query to safely pull ONLY the matching columns ---
-            actual_query = self.query.replace("SELECT *", f"SELECT {','.join(tgt_cols)}")
-            src_cur.execute(actual_query, self.params)
-            
-            rows = src_cur.fetchall()
-            total = len(rows)
-            if total == 0: 
-                self.error.emit("View is empty. Compilation cancelled.")
-                return
-                
-            self.progress.emit(40, 100, f"Pathing and writing {total} records...")
-            is_smart_view = "://" in self.source_prefix
-            modified_rows = []
-            
-            # Dynamically locate the index for 'parent_path' to adjust paths safely
-            pp_idx = tgt_cols.index("parent_path")
-            
-            for r in rows:
-                if self.is_cancelled: return
-                r_list = list(r)
-                if is_smart_view: r_list[pp_idx] = "/"
-                else:
-                    if r_list[pp_idx].startswith(self.source_prefix):
-                        r_list[pp_idx] = "/" + r_list[pp_idx][len(self.source_prefix):]
-                        if not r_list[pp_idx].startswith("/"): r_list[pp_idx] = "/" + r_list[pp_idx]
-                modified_rows.append(tuple(r_list))
-                
-            batch_size = 1000
-            num_cols = len(tgt_cols)
-            
-            for i in range(0, total, batch_size):
-                if self.is_cancelled: return
-                tgt_cur.executemany(f"INSERT INTO virtual_fs VALUES ({','.join(['?']*num_cols)})", modified_rows[i:i+batch_size])
-                tgt_conn.commit()
-                self.progress.emit(int(40 + (i/total)*60), 100, f"Compiled {min(i+batch_size, total)}/{total} records...")
-            
-            src_conn.close()
-            tgt_conn.close()
-            self.finished.emit(self.target_db)
-        except Exception as e: self.error.emit(str(e))
-
-class ExportZipThread(QThread):
-    progress = Signal(int, int, str)
-    finished = Signal(str)
-    error = Signal(str)
-    def __init__(self, db_path, items_to_export, zip_filepath, parent=None):
-        super().__init__(parent)
-        self.db_path, self.items_to_export, self.zip_filepath = db_path, items_to_export, zip_filepath
-        self.is_cancelled = False
-    def cancel(self): self.is_cancelled = True
-    def run(self):
-        try:
-            conn = sqlite3.connect(str(self.db_path))
-            cur = conn.cursor()
-            all_files_to_zip = []
-            
-            for typ, path_val, db_id in self.items_to_export: 
-                if self.is_cancelled: return
-                
-                if typ == "file":
-                    cur.execute("SELECT real_path, name FROM virtual_fs WHERE id=?", (db_id,))
-                    res = cur.fetchone()
-                    if res and res[0] and os.path.exists(res[0]):
-                        all_files_to_zip.append((res[0], res[1]))
-                elif typ == "folder":
-                    cur.execute("SELECT parent_path, name, real_path, is_folder FROM virtual_fs WHERE parent_path LIKE ? AND in_trash=0", (f"{path_val}%",))
-                    for pp, n, rp, is_f in cur.fetchall():
-                        if not is_f and rp and os.path.exists(rp):
-                            rel_dest = f"{path_val.strip('/').split('/')[-1]}/{pp[len(path_val):]}{n}".replace("//", "/")
-                            all_files_to_zip.append((rp, rel_dest))
-                            
-            total = len(all_files_to_zip)
-            if total == 0: 
-                self.error.emit("No physical files found to zip.")
-                return
-                
-            with zipfile.ZipFile(self.zip_filepath, 'w', zipfile.ZIP_DEFLATED) as zf:
-                for i, (real_os_path, zip_virtual_path) in enumerate(all_files_to_zip):
-                    if self.is_cancelled: return
-                    self.progress.emit(i+1, total, f"Compressing: {zip_virtual_path}")
-                    zf.write(real_os_path, arcname=zip_virtual_path)
-                    
-            conn.close()
-            self.finished.emit(self.zip_filepath)
-        except Exception as e: self.error.emit(str(e))
-
-
 
 class HashCalculator(QThread):
     finished = Signal(str)
@@ -949,6 +898,7 @@ class InteractiveBreadcrumb(QWidget):
         while self.layout.count():
             item = self.layout.takeAt(0)
             if item.widget(): item.widget().deleteLater()
+            
         def add_btn(text, target):
             if self.layout.count() > 0:
                 lbl = QLabel("❯")
@@ -966,6 +916,14 @@ class InteractiveBreadcrumb(QWidget):
         if actual_path == "/": pass
         elif actual_path.startswith("trash://"): add_btn("🗑 Trash", "trash://")
         elif actual_path.startswith("fav://"): add_btn("⭐ Favorites", "fav://")
+        elif actual_path.startswith("y_m_f://"):
+            add_btn("💡 STAT: YEAR ➔ MONTH ➔ FOLDER", "y_m_f://")
+            p_str = actual_path.replace("y_m_f://", "").strip("/")
+            if p_str:
+                curr = "y_m_f://"
+                for part in p_str.split("/"): 
+                    curr += part + "/"
+                    add_btn(part, curr)
         else:
             matched = False
             for proto in SMART_PROTOCOLS.keys():
@@ -983,6 +941,7 @@ class InteractiveBreadcrumb(QWidget):
                 for part in [p for p in actual_path.split("/") if p]: 
                     current_build += part + "/"
                     add_btn(part, current_build)
+                    
         self.layout.addStretch()
 
 class vmanTableModel(QAbstractTableModel):
@@ -3501,6 +3460,9 @@ class TimelineDiaryDialog(QDialog):
         self.tbl_rep_tag = create_rep_table(["Tag", "Files", "Size", "Avg Size"])
         self.tbl_rep_largest = create_rep_table(["Largest Files", "Size", "Type", "ID"])
         self.tbl_rep_smallest = create_rep_table(["Smallest Files", "Size", "Type", "ID"])
+        
+        self.tbl_rep_ext_by_cat = create_rep_table(["Category", "Extension", "File Count", "Total Size"])
+        self.tbl_rep_common_sizes = create_rep_table(["Exact File Size", "Number of Files", "Total Volume"])
 
         # Hide internal ID columns
         self.tbl_rep_largest.setColumnHidden(3, True)
@@ -3519,6 +3481,10 @@ class TimelineDiaryDialog(QDialog):
         # Add Full-Width Stacked Layout
         add_section("📅 Temporal Grouping", "Double-click any row to filter the Activity Log to that specific time period.", self.tbl_rep_group)
         add_section("📁 Data by Category", "Distribution of storage and file counts across major file categories.", self.tbl_rep_cat)
+        
+        add_section("🗂️ Extensions by Category", "Detailed breakdown of file formats within each category.", self.tbl_rep_ext_by_cat)
+        add_section("📊 Most Common File Sizes", "Groups files by their exact byte size to find massively duplicated or identical files.", self.tbl_rep_common_sizes)
+        
         add_section("📄 Top 50 Extensions", "Most dominant file formats matching your current filters.", self.tbl_rep_ext)
         add_section("🏷️ Custom Tag Utilization", "File metrics grouped by your user-defined tags.", self.tbl_rep_tag)
         add_section("🐘 Top 20 Largest Files", "Heaviest outliers in the current dataset (Double click to locate).", self.tbl_rep_largest)
@@ -3674,123 +3640,252 @@ class TimelineDiaryDialog(QDialog):
             self.tabs.setCurrentIndex(1) # Instantly switch to Activity Log
             
     def generate_deep_report(self):
-        # --- AUTO-PATCH: Fix Stale or Missing Categories in Database ---
-        # This instantly fixes the issue where archives were scanned as 'Others', left blank, or saved as singular 'Archive'
-        with sqlite3.connect(self.db_path) as conn:
-            conn.execute("PRAGMA journal_mode=WAL;")
-            # Covers extensions both with and without dots just to be perfectly safe
-            conn.execute("UPDATE virtual_fs SET category = 'Archives' WHERE LOWER(extension) IN ('.zip', '.rar', '.7z', '.tar', '.gz', 'zip', 'rar', '7z', 'tar', 'gz')")
-            conn.execute("UPDATE virtual_fs SET category = 'Archives' WHERE category = 'Archive'")
-            conn.commit()
+        try:
+            # --- AUTO-PATCH: Fix Stale or Missing Categories in Database ---
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute("PRAGMA journal_mode=WAL;")
+                conn.execute("UPDATE virtual_fs SET category = 'Archives' WHERE LOWER(extension) IN ('.zip', '.rar', '.7z', '.tar', '.gz', 'zip', 'rar', '7z', 'tar', 'gz')")
+                conn.execute("UPDATE virtual_fs SET category = 'Archives' WHERE category = 'Archive'")
+                conn.commit()
 
-        # --- SETUP FILTERS ---
-        f_year = self.cb_rep_from_year.currentText()
-        t_year = self.cb_rep_to_year.currentText()
-        month = self.cb_rep_month.currentText()
-        dow = self.cb_rep_dow.currentText()
-        groupby = self.cb_rep_groupby.currentText()
+            # --- SETUP FILTERS ---
+            f_year = self.cb_rep_from_year.currentText()
+            t_year = self.cb_rep_to_year.currentText()
+            month = self.cb_rep_month.currentText()
+            dow = self.cb_rep_dow.currentText()
+            groupby = self.cb_rep_groupby.currentText()
 
-        col = "creation_date" if getattr(self, 'date_mode_cre', None) and self.date_mode_cre.isChecked() else "modified"
+            col = "creation_date" if getattr(self, 'date_mode_cre', None) and self.date_mode_cre.isChecked() else "modified"
 
-        where_clauses = ["is_folder=0", "in_trash=0", f"{col} IS NOT NULL", f"{col} != ''"]
-        params = []
+            where_clauses = ["is_folder=0", "in_trash=0", f"{col} IS NOT NULL", f"{col} != ''"]
+            params = []
 
-        if f_year and f_year != "All":
-            where_clauses.append(f"SUBSTR({col}, 1, 4) >= ?"); params.append(f_year)
-        if t_year and t_year != "All":
-            where_clauses.append(f"SUBSTR({col}, 1, 4) <= ?"); params.append(t_year)
-        if month != "All":
-            where_clauses.append(f"SUBSTR({col}, 6, 2) = ?"); params.append(month[:2])
+            if f_year and f_year != "All":
+                where_clauses.append(f"SUBSTR({col}, 1, 4) >= ?"); params.append(f_year)
+            if t_year and t_year != "All":
+                where_clauses.append(f"SUBSTR({col}, 1, 4) <= ?"); params.append(t_year)
+            if month != "All":
+                where_clauses.append(f"SUBSTR({col}, 6, 2) = ?"); params.append(month[:2])
 
-        dow_map = {"Sunday": "0", "Monday": "1", "Tuesday": "2", "Wednesday": "3", "Thursday": "4", "Friday": "5", "Saturday": "6"}
-        if dow != "All":
-            where_clauses.append(f"strftime('%w', {col}) = ?"); params.append(dow_map[dow])
+            dow_map = {"Sunday": "0", "Monday": "1", "Tuesday": "2", "Wednesday": "3", "Thursday": "4", "Friday": "5", "Saturday": "6"}
+            if dow != "All":
+                where_clauses.append(f"strftime('%w', {col}) = ?"); params.append(dow_map[dow])
 
-        base_where = " AND ".join(where_clauses)
+            base_where = " AND ".join(where_clauses)
+            self.rep_base_where = base_where
+            self.rep_base_params = tuple(params)
+            self.rep_date_col = col
 
-        self.rep_base_where = base_where
-        self.rep_base_params = tuple(params)
-        self.rep_date_col = col
+            prog = QProgressDialog("Generating Deep Report Analytics...", "Cancel", 0, 100, self)
+            prog.setWindowModality(Qt.WindowModal)
+            prog.show(); QApplication.processEvents()
 
-        prog = QProgressDialog("Generating Deep Report Analytics...", "Cancel", 0, 100, self)
-        prog.setWindowModality(Qt.WindowModal)
-        prog.show(); QApplication.processEvents()
+            with sqlite3.connect(self.db_path) as conn:
+                cur = conn.cursor()
 
-        with sqlite3.connect(self.db_path) as conn:
-            cur = conn.cursor()
+                # 1. Overview
+                prog.setLabelText("Calculating Overview..."); prog.setValue(10); QApplication.processEvents()
+                cur.execute(f"SELECT COUNT(id), SUM(size), AVG(size), MAX(size), MIN(size) FROM virtual_fs WHERE {base_where}", params)
+                tot_count, tot_size, avg_size, max_size, min_size = cur.fetchone()
 
-            # 1. Overview
-            prog.setLabelText("Calculating Overview..."); prog.setValue(10); QApplication.processEvents()
-            cur.execute(f"SELECT COUNT(id), SUM(size), AVG(size), MAX(size), MIN(size) FROM virtual_fs WHERE {base_where}", params)
-            tot_count, tot_size, avg_size, max_size, min_size = cur.fetchone()
+                if not tot_count:
+                    self.rep_lbl_overview.setText("<b>Overview:</b> No data found for the selected filters.")
+                    self.render_report_charts([], []) # Clear charts
+                    prog.close()
+                    return
 
-            if not tot_count:
-                self.rep_lbl_overview.setText("<b>Overview:</b> No data found for the selected filters.")
-                prog.close(); return
+                self.rep_lbl_overview.setText(f"<b>Overview:</b> <b>Total Files:</b> {tot_count:,} &nbsp;|&nbsp; <b>Total Size:</b> {human_size(tot_size)} &nbsp;|&nbsp; <b>Avg Size:</b> {human_size(avg_size)} &nbsp;|&nbsp; <b>Max Size:</b> {human_size(max_size)} &nbsp;|&nbsp; <b>Min Size:</b> {human_size(min_size)}")
 
-            self.rep_lbl_overview.setText(f"<b>Overview:</b> <b>Total Files:</b> {tot_count:,} &nbsp;|&nbsp; <b>Total Size:</b> {human_size(tot_size)} &nbsp;|&nbsp; <b>Avg Size:</b> {human_size(avg_size)} &nbsp;|&nbsp; <b>Max Size:</b> {human_size(max_size)} &nbsp;|&nbsp; <b>Min Size:</b> {human_size(min_size)}")
+                # 2. Group By Engine
+                prog.setLabelText("Grouping Data..."); prog.setValue(20); QApplication.processEvents()
+                if groupby == "Day": gb_sql = f"SUBSTR({col}, 1, 10)"
+                elif groupby == "Month": gb_sql = f"SUBSTR({col}, 1, 7)"
+                elif groupby == "Year": gb_sql = f"SUBSTR({col}, 1, 4)"
+                elif groupby == "Week": gb_sql = f"strftime('%W', {col})"
+                elif groupby == "Day of Week": gb_sql = f"strftime('%w', {col})"
 
-            # 2. Group By Engine
-            prog.setLabelText("Grouping Data..."); prog.setValue(20); QApplication.processEvents()
-            if groupby == "Day": gb_sql = f"SUBSTR({col}, 1, 10)"
-            elif groupby == "Month": gb_sql = f"SUBSTR({col}, 1, 7)"
-            elif groupby == "Year": gb_sql = f"SUBSTR({col}, 1, 4)"
-            elif groupby == "Week": gb_sql = f"strftime('%W', {col})"
-            elif groupby == "Day of Week": gb_sql = f"strftime('%w', {col})"
+                cur.execute(f"SELECT {gb_sql}, COUNT(id), SUM(size) FROM virtual_fs WHERE {base_where} GROUP BY {gb_sql} ORDER BY {gb_sql}", params)
+                grp_data = cur.fetchall()
+                self._fill_report_table(self.tbl_rep_group, grp_data, format_size=True, map_dow=(groupby=="Day of Week"))
 
-            cur.execute(f"SELECT {gb_sql}, COUNT(id), SUM(size) FROM virtual_fs WHERE {base_where} GROUP BY {gb_sql} ORDER BY {gb_sql}", params)
-            grp_data = cur.fetchall()
-            self._fill_report_table(self.tbl_rep_group, grp_data, format_size=True, map_dow=(groupby=="Day of Week"))
-
-            # 3. Categories (Enforce Custom Order & Guarantee All Categories Exist)
-            prog.setLabelText("Analyzing Categories..."); prog.setValue(40); QApplication.processEvents()
-            cur.execute(f"SELECT category, COUNT(id), SUM(size) FROM virtual_fs WHERE {base_where} GROUP BY category", params)
-            cat_data_raw = cur.fetchall()
-            
-            # Convert raw SQL to dictionary
-            db_cat_dict = {r[0] if r[0] else "Others": (r[1], r[2]) for r in cat_data_raw}
-            
-            # Strict Template ensures they are injected in this exact order
-            cat_order = list(FILE_CATEGORIES.keys()) + ["Others"]
-            cat_data = []
-            for c in cat_order:
-                count, size = db_cat_dict.get(c, (0, 0))
-                cat_data.append((c, count, size))
+                # 3. Categories (Dynamic to new massive list)
+                prog.setLabelText("Analyzing Categories..."); prog.setValue(40); QApplication.processEvents()
+                cur.execute(f"SELECT category, COUNT(id), SUM(size) FROM virtual_fs WHERE {base_where} GROUP BY category", params)
+                cat_data_raw = cur.fetchall()
                 
-            # Pass cat_order so the table permanently enforces this sort mathematically
-            self._fill_report_table(self.tbl_rep_cat, cat_data, format_size=True, custom_order_list=cat_order)
+                db_cat_dict = {r[0] if r[0] else "Others": (r[1], r[2]) for r in cat_data_raw}
+                cat_order = list(FILE_CATEGORIES.keys()) + ["Others"]
+                cat_data = []
+                for c in cat_order:
+                    count, size = db_cat_dict.get(c, (0, 0))
+                    cat_data.append((c, count, size))
+                    
+                self._fill_report_table(self.tbl_rep_cat, cat_data, format_size=True, custom_order_list=cat_order)
+                
+                # 4. Extensions
+                prog.setLabelText("Analyzing Extensions..."); prog.setValue(60); QApplication.processEvents()
+                cur.execute(f"SELECT extension, COUNT(id), SUM(size) FROM virtual_fs WHERE {base_where} GROUP BY extension ORDER BY SUM(size) DESC LIMIT 50", params)
+                self._fill_report_table(self.tbl_rep_ext, cur.fetchall(), format_size=True)
+
+                # 5. Tags
+                prog.setLabelText("Analyzing Tags..."); prog.setValue(70); QApplication.processEvents()
+                cur.execute(f"SELECT custom_tags, COUNT(id), SUM(size), AVG(size) FROM virtual_fs WHERE {base_where} AND custom_tags IS NOT NULL AND custom_tags != '' GROUP BY custom_tags ORDER BY SUM(size) DESC LIMIT 50", params)
+                tag_data = cur.fetchall()
+                self.tbl_rep_tag.setSortingEnabled(False)
+                self.tbl_rep_tag.setRowCount(0)
+                for r, row_data in enumerate(tag_data):
+                    self.tbl_rep_tag.insertRow(r)
+                    self.tbl_rep_tag.setItem(r, 0, QTableWidgetItem(str(row_data[0])))
+                    self.tbl_rep_tag.setItem(r, 1, SizeTableWidgetItem(row_data[1] or 0)) 
+                    self.tbl_rep_tag.setItem(r, 2, SizeTableWidgetItem(row_data[2] or 0))
+                    self.tbl_rep_tag.setItem(r, 3, SizeTableWidgetItem(row_data[3] or 0))
+                self.tbl_rep_tag.setSortingEnabled(True)
+
+                # 6. Extremes
+                prog.setLabelText("Finding Extremes..."); prog.setValue(80); QApplication.processEvents()
+                cur.execute(f"SELECT name, size, extension, id FROM virtual_fs WHERE {base_where} ORDER BY size DESC LIMIT 20", params)
+                self._fill_report_table(self.tbl_rep_largest, cur.fetchall(), is_files=True)
+
+                cur.execute(f"SELECT name, size, extension, id FROM virtual_fs WHERE {base_where} AND size > 0 ORDER BY size ASC LIMIT 20", params)
+                self._fill_report_table(self.tbl_rep_smallest, cur.fetchall(), is_files=True)
+                
+                # 7. Extensions By Category
+                prog.setLabelText("Analyzing Extensions by Category..."); prog.setValue(84); QApplication.processEvents()
+                cur.execute(f"SELECT category, extension, COUNT(id), SUM(size) FROM virtual_fs WHERE {base_where} AND is_folder=0 GROUP BY category, extension ORDER BY category ASC, COUNT(id) DESC", params)
+                ext_cat_data = cur.fetchall()
+                
+                self.tbl_rep_ext_by_cat.setSortingEnabled(False)
+                self.tbl_rep_ext_by_cat.setRowCount(0)
+                for r, row_data in enumerate(ext_cat_data):
+                    self.tbl_rep_ext_by_cat.insertRow(r)
+                    cat_val = str(row_data[0]) if row_data[0] else "Others"
+                    ext_val = str(row_data[1]) if row_data[1] else "None"
+                    
+                    self.tbl_rep_ext_by_cat.setItem(r, 0, QTableWidgetItem(cat_val))
+                    self.tbl_rep_ext_by_cat.setItem(r, 1, QTableWidgetItem(ext_val))
+                    
+                    cnt_item = NumericTableItem(f"{row_data[2]:,}"); cnt_item.setData(Qt.UserRole, row_data[2])
+                    self.tbl_rep_ext_by_cat.setItem(r, 2, cnt_item)
+                    
+                    self.tbl_rep_ext_by_cat.setItem(r, 3, SizeTableWidgetItem(row_data[3] or 0))
+                self.tbl_rep_ext_by_cat.setSortingEnabled(True)
+
+                # 8. Most Common File Sizes
+                prog.setLabelText("Analyzing Common File Sizes..."); prog.setValue(88); QApplication.processEvents()
+                cur.execute(f"SELECT size, COUNT(id), SUM(size) FROM virtual_fs WHERE {base_where} AND is_folder=0 AND size > 0 GROUP BY size ORDER BY COUNT(id) DESC LIMIT 50", params)
+                common_sizes_data = cur.fetchall()
+                
+                self.tbl_rep_common_sizes.setSortingEnabled(False)
+                self.tbl_rep_common_sizes.setRowCount(0)
+                for r, row_data in enumerate(common_sizes_data):
+                    self.tbl_rep_common_sizes.insertRow(r)
+                    self.tbl_rep_common_sizes.setItem(r, 0, SizeTableWidgetItem(row_data[0] or 0))
+                    
+                    cnt_item = NumericTableItem(f"{row_data[1]:,}"); cnt_item.setData(Qt.UserRole, row_data[1])
+                    self.tbl_rep_common_sizes.setItem(r, 1, cnt_item)
+                    
+                    self.tbl_rep_common_sizes.setItem(r, 2, SizeTableWidgetItem(row_data[2] or 0))
+                self.tbl_rep_common_sizes.setSortingEnabled(True)
+                
+            prog.setLabelText("Rendering Charts..."); prog.setValue(95); QApplication.processEvents()
+            self.render_report_charts(grp_data, cat_data)
+
+            prog.setValue(100); prog.close()
             
-            # 4. Extensions
-            prog.setLabelText("Analyzing Extensions..."); prog.setValue(60); QApplication.processEvents()
-            cur.execute(f"SELECT extension, COUNT(id), SUM(size) FROM virtual_fs WHERE {base_where} GROUP BY extension ORDER BY SUM(size) DESC LIMIT 50", params)
-            self._fill_report_table(self.tbl_rep_ext, cur.fetchall(), format_size=True)
+        except Exception as e:
+            if 'prog' in locals(): prog.close()
+            QMessageBox.critical(self, "Deep Report Crash", f"Failed to generate report:\n{e}")
 
-            # 5. Tags
-            prog.setLabelText("Analyzing Tags..."); prog.setValue(70); QApplication.processEvents()
-            cur.execute(f"SELECT custom_tags, COUNT(id), SUM(size), AVG(size) FROM virtual_fs WHERE {base_where} AND custom_tags IS NOT NULL AND custom_tags != '' GROUP BY custom_tags ORDER BY SUM(size) DESC LIMIT 50", params)
-            tag_data = cur.fetchall()
-            self.tbl_rep_tag.setSortingEnabled(False) # Safe insert
-            self.tbl_rep_tag.setRowCount(0)
-            for r, row_data in enumerate(tag_data):
-                self.tbl_rep_tag.insertRow(r)
-                self.tbl_rep_tag.setItem(r, 0, QTableWidgetItem(str(row_data[0])))
-                self.tbl_rep_tag.setItem(r, 1, SizeTableWidgetItem(row_data[1] or 0)) # Use SizeTableWidgetItem for correct number sorting
-                self.tbl_rep_tag.setItem(r, 2, SizeTableWidgetItem(row_data[2] or 0))
-                self.tbl_rep_tag.setItem(r, 3, SizeTableWidgetItem(row_data[3] or 0))
-            self.tbl_rep_tag.setSortingEnabled(True)
-
-            # 6. Extremes (Largest/Smallest - Top 20)
-            prog.setLabelText("Finding Extremes..."); prog.setValue(80); QApplication.processEvents()
-            cur.execute(f"SELECT name, size, extension, id FROM virtual_fs WHERE {base_where} ORDER BY size DESC LIMIT 20", params)
-            self._fill_report_table(self.tbl_rep_largest, cur.fetchall(), is_files=True)
-
-            cur.execute(f"SELECT name, size, extension, id FROM virtual_fs WHERE {base_where} AND size > 0 ORDER BY size ASC LIMIT 20", params)
-            self._fill_report_table(self.tbl_rep_smallest, cur.fetchall(), is_files=True)
+    def render_report_charts(self, grp_data, cat_data):
+        try:
+            self.fig_rep.clear()
             
-        prog.setLabelText("Rendering Charts..."); prog.setValue(90); QApplication.processEvents()
-        self.render_report_charts(grp_data, cat_data)
+            ax_pie = self.fig_rep.add_subplot(211)
+            ax_pie.set_facecolor('#0d1117')
+            
+            ax_line = self.fig_rep.add_subplot(212)
+            ax_line.set_facecolor('#0d1117')
 
-        prog.setValue(100); prog.close()
+            txt_color = '#c9d1d9'
+            
+            # --- 1. NEAT PIE CHART (Slices < 1% are hidden) ---
+            if cat_data:
+                total_sz = sum((r[2] or 0) for r in cat_data)
+                threshold = total_sz * 0.01  # 1% threshold
+                
+                # Filter out empty slices and tiny clutter
+                filtered_data = [r for r in cat_data if (r[2] or 0) >= threshold and (r[2] or 0) > 0]
+                
+                if filtered_data:
+                    labels = [r[0] for r in filtered_data]
+                    sizes = [r[2] for r in filtered_data]
+                    
+                    # Safely map to the global color palette
+                    colors = [GLOBAL_CAT_COLORS.get(lbl, "#30363d") for lbl in labels]
+                    
+                    wedges, texts, autotexts = ax_pie.pie(
+                        sizes, labels=labels, autopct='%1.1f%%', 
+                        colors=colors, startangle=140, pctdistance=0.85,
+                        wedgeprops={'edgecolor': '#0d1117', 'linewidth': 2.0}
+                    )
+                    
+                    for text in texts:
+                        text.set_color(txt_color)
+                        text.set_fontsize(10)
+                    for autotext in autotexts:
+                        autotext.set_color('white')
+                        autotext.set_fontsize(9)
+                        autotext.set_fontweight('bold')
+                        
+                    ax_pie.set_title("Category Distribution by Total Size (Slices <1% Hidden)", color=txt_color, fontsize=13, fontweight='bold', pad=20)
+                else:
+                    ax_pie.text(0.5, 0.5, "Data volumes are too small to render a pie chart.", color='#8b949e', ha='center', va='center')
+                    ax_pie.axis('off')
+            else:
+                ax_pie.text(0.5, 0.5, "No Category Data Available", color='#8b949e', ha='center', va='center')
+                ax_pie.axis('off')
+
+            # --- 2. LINE CHART (Smart Size/Count Fallback) ---
+            if grp_data:
+                x_vals = [str(r[0]) for r in grp_data][-30:] 
+                
+                total_grp_sz = sum((r[2] or 0) for r in grp_data)
+                
+                # If sizes are 0, dynamically switch to charting File Count instead so the chart isn't empty!
+                if total_grp_sz > 0:
+                    y_vals = [(r[2] or 0) / (1024 * 1024) for r in grp_data][-30:]
+                    y_label = "Data Volume (MB)"
+                else:
+                    y_vals = [(r[1] or 0) for r in grp_data][-30:]
+                    y_label = "File Count"
+
+                ax_line.plot(x_vals, y_vals, marker='o', color='#58a6ff', linewidth=2)
+                ax_line.fill_between(x_vals, y_vals, color='#58a6ff', alpha=0.2)
+                ax_line.set_title(f"{y_label} Grouping (Ctrl+Scroll to Zoom)", color=txt_color, fontsize=12, fontweight='bold', pad=12)
+                ax_line.tick_params(axis='x', rotation=45, colors=txt_color, labelsize=8)
+                ax_line.tick_params(axis='y', colors='#8b949e', labelsize=8)
+                ax_line.grid(True, linestyle='--', alpha=0.2, color='#ffffff')
+                
+                for spine in ['top', 'right']: ax_line.spines[spine].set_visible(False)
+                for spine in ['bottom', 'left']: ax_line.spines[spine].set_color('#30363d')
+            else:
+                ax_line.text(0.5, 0.5, "No Grouping Data Available", color='#8b949e', ha='center', va='center')
+                ax_line.axis('off')
+
+            self.fig_rep.tight_layout(pad=3.0)
+            
+            # Force UI to instantly paint the canvas
+            self.canvas_rep.draw()
+            self.canvas_rep.update()
+            
+        except Exception as e:
+            print(f"Error rendering report charts: {e}")
+            self.fig_rep.clear()
+            ax = self.fig_rep.add_subplot(111)
+            ax.set_facecolor('#0d1117')
+            ax.text(0.5, 0.5, f"Chart Rendering Error:\n{e}", color='#f85149', ha='center', va='center')
+            ax.axis('off')
+            self.canvas_rep.draw()
 
     def _fill_report_table(self, table, data, format_size=False, is_files=False, map_dow=False, custom_order_list=None):
         table.setSortingEnabled(False) # Suspend sorting during insert
@@ -3825,51 +3920,6 @@ class TimelineDiaryDialog(QDialog):
                 table.setItem(r, 2, SizeTableWidgetItem(row_data[2] or 0)) 
 
         table.setSortingEnabled(True) # Re-enable sorting (Will now sort logically!)
-
-    def render_report_charts(self, grp_data, cat_data):
-        self.fig_rep.clear()
-        ax_pie = self.fig_rep.add_subplot(211); ax_pie.set_facecolor('#0d1117')
-        ax_line = self.fig_rep.add_subplot(212); ax_line.set_facecolor('#0d1117')
-
-        # 1. Pie Chart (All Categories, Mapped Colors)
-        if cat_data:
-            # Filter out 0 size for the physical pie wedges so it doesn't error out, 
-            # but maintain the color map for the legend.
-            labels = [r[0] for r in cat_data if (r[2] or 0) > 0]
-            sizes = [r[2] or 0 for r in cat_data if (r[2] or 0) > 0]
-            
-            c_map = GLOBAL_CAT_COLORS
-            colors = [c_map.get(lbl, "#30363d") for lbl in labels]
-            
-            if sizes:
-                ax_pie.pie(sizes, labels=labels, autopct='%1.1f%%', colors=colors, textprops={'color': "white", 'fontsize': 9})
-                ax_pie.set_title("Category Distribution by Total Size (Ctrl+Scroll to Zoom)", color='#c9d1d9', fontsize=12, fontweight='bold', pad=15)
-            else:
-                ax_pie.text(0.5, 0.5, "Categories exist but have 0 bytes of data.", color='#8b949e', ha='center', va='center')
-                ax_pie.axis('off')
-        else:
-            ax_pie.text(0.5, 0.5, "No Category Data Available", color='#8b949e', ha='center', va='center')
-            ax_pie.axis('off')
-
-        # 2. Line Chart (Data Volume Grouping)
-        if grp_data:
-            x_vals = [str(r[0]) for r in grp_data][-30:] 
-            y_vals = [(r[2] or 0)/1024/1024 for r in grp_data][-30:]
-            ax_line.plot(x_vals, y_vals, marker='o', color='#58a6ff', linewidth=2)
-            ax_line.fill_between(x_vals, y_vals, color='#58a6ff', alpha=0.2)
-            ax_line.set_title("Data Volume Grouping (MB) (Ctrl+Scroll to Zoom)", color='#c9d1d9', fontsize=12, fontweight='bold', pad=12)
-            ax_line.tick_params(axis='x', rotation=45, colors='#c9d1d9', labelsize=8)
-            ax_line.tick_params(axis='y', colors='#8b949e', labelsize=8)
-            ax_line.grid(True, linestyle='--', alpha=0.2, color='#ffffff')
-        else:
-            ax_line.text(0.5, 0.5, "No Grouping Data Available", color='#8b949e', ha='center', va='center')
-            ax_line.axis('off')
-
-        for spine in ['top', 'right']: ax_line.spines[spine].set_visible(False)
-        for spine in ['bottom', 'left']: ax_line.spines[spine].set_color('#30363d')
-
-        self.fig_rep.tight_layout(pad=3.0)
-        self.canvas_rep.draw()
 
     def handle_report_drilldown(self, row, col):
         sender = self.sender()
@@ -3907,6 +3957,23 @@ class TimelineDiaryDialog(QDialog):
             elif sender in (self.tbl_rep_largest, self.tbl_rep_smallest):
                 db_id = sender.item(row, 3).text()
                 drill_query += " AND id = ?"; drill_params.append(db_id)
+
+            # --- NEW: Drilldown logic for the 2 new tables ---
+            elif sender == self.tbl_rep_ext_by_cat:
+                cat_val = sender.item(row, 0).text()
+                ext_val = sender.item(row, 1).text()
+                
+                if cat_val == "Others": drill_query += " AND (category IS NULL OR category = 'Others' OR category = '')"
+                else: drill_query += " AND category = ?"; drill_params.append(cat_val)
+                
+                if ext_val == "None": drill_query += " AND (extension IS NULL OR extension = '')"
+                else: drill_query += " AND extension = ?"; drill_params.append(ext_val)
+
+            elif sender == self.tbl_rep_common_sizes:
+                size_item = sender.item(row, 0)
+                if hasattr(size_item, 'size_bytes'):
+                    exact_size = size_item.size_bytes
+                    drill_query += " AND size = ?"; drill_params.append(exact_size)
 
             # Route to the main search execution which will populate the Activity Log!
             self.execute_search(drill_query, tuple(drill_params), update_highlights=False)
@@ -6541,7 +6608,7 @@ class vmanVirtualManager(QMainWindow):
         # 1. Strip the old style to prevent layout/margin caching
         QApplication.instance().setStyleSheet("")
         
-        # 2. Apply the new style globally to the ENTIRE app, so all dialogs (Timeline, Jobs) update instantly
+        # 2. Apply the new style globally
         css = THEMES.get(theme_name, THEMES["Dark"])
         QApplication.instance().setStyleSheet(css)
         
@@ -6553,6 +6620,9 @@ class vmanVirtualManager(QMainWindow):
         self.update()
         
         self.update_statistics()
+        
+        # --- FIX: Force the sidebar to redraw so the text turns Black in Light Mode! ---
+        self.refresh_tree() 
         
         # Update Search Window Theme instantly if it is open
         if hasattr(self, 'search_instance') and self.search_instance:
@@ -6627,8 +6697,115 @@ class vmanVirtualManager(QMainWindow):
         compiled_root = QTreeWidgetItem(self.folder_tree, ["Switch Database..."]); compiled_root.setIcon(0, self.style().standardIcon(QStyle.SP_DriveHDIcon)); compiled_root.setExpanded(True)
         if self.active_db_path != str(DB_FILE):
             node = QTreeWidgetItem(compiled_root, ["⬅ Return to Main DB"]); node.setData(0, Qt.UserRole, "db://main"); node.setIcon(0, self.style().standardIcon(QStyle.SP_ArrowBack))
+            
+        # --- DB MAKEUP MODE UI, SORTING & HIGHLIGHTING ---
+        self.db_makeup_mode = self.settings.value("db_makeup_mode", True, type=bool)
+        color_scheme = self.settings.value("db_color_scheme", "Default")
+        sort_mode = self.settings.value("db_sort_mode", "Alphabetical")
+        
+        is_dark = getattr(self, 'is_dark_mode', True)
+        base_txt_c = "#161b22" if not is_dark else "#c9d1d9"
+        active_accent = "#0969da" if not is_dark else "#58a6ff" # Blue highlight for the Active DB
+        opacity = "0.15" 
+        
+        # 1. Parse and extract sorting metadata for all databases
+        db_items = []
         for view_db in VIEWS_DIR.glob("*.db"):
-            node = QTreeWidgetItem(compiled_root, [view_db.stem]); node.setData(0, Qt.UserRole, f"db://{view_db.name}"); node.setIcon(0, self.style().standardIcon(QStyle.SP_DriveFDIcon))
+            display_name = view_db.stem
+            clean_name = display_name
+            date_val = "00000000"
+            date_str = ""
+            
+            if clean_name.startswith("[") and "]" in clean_name:
+                end_idx = clean_name.find("]")
+                d_val = clean_name[1:end_idx]
+                if len(d_val) == 8 and d_val.isdigit():
+                    date_val = d_val
+                    date_str = f"{d_val[:4]}-{d_val[4:6]}-{d_val[6:]}"
+                clean_name = clean_name[end_idx+1:]
+                if clean_name.startswith("_"): clean_name = clean_name[1:]
+                
+            is_hash = False
+            if clean_name.lower().startswith("hash_"):
+                is_hash = True; clean_name = clean_name[5:]
+                
+            is_pen = is_ssd = is_hdd = False
+            cat_rank = 3 # Default (Uncategorized)
+            if clean_name.lower().startswith("pen-"): is_pen = True; cat_rank = 0; clean_name = clean_name[4:]
+            elif clean_name.lower().startswith("ssd-") or clean_name.lower().startswith("sdd-"): is_ssd = True; cat_rank = 1; clean_name = clean_name[4:]
+            elif clean_name.lower().startswith("hdd-"): is_hdd = True; cat_rank = 2; clean_name = clean_name[4:]
+            
+            clean_name = clean_name.lstrip('-_ ')
+            if not clean_name: clean_name = display_name
+            
+            db_items.append({
+                'path': view_db, 'orig': display_name, 'clean': clean_name, 'date_val': date_val, 'date_str': date_str,
+                'is_hash': is_hash, 'is_pen': is_pen, 'is_ssd': is_ssd, 'is_hdd': is_hdd, 'cat_rank': cat_rank
+            })
+            
+        # 2. Sort the database list based on chosen mode
+        if sort_mode == "Category":
+            db_items.sort(key=lambda x: (x['cat_rank'], x['clean'].lower()))
+        elif sort_mode == "Date":
+            db_items.sort(key=lambda x: (x['date_val'], x['clean'].lower()), reverse=True) # Newest First
+        else: # Alphabetical
+            db_items.sort(key=lambda x: x['clean'].lower())
+            
+        # 3. Render the sorted tree
+        active_db_res = str(Path(self.active_db_path).resolve()) if self.active_db_path else ""
+        
+        for item in db_items:
+            view_db = item['path']
+            is_active = (str(view_db.resolve()) == active_db_res)
+            
+            node = QTreeWidgetItem(compiled_root)
+            node.setData(0, Qt.UserRole, f"db://{view_db.name}")
+            
+            if self.db_makeup_mode:
+                container = QWidget()
+                container.setAttribute(Qt.WA_TransparentForMouseEvents) 
+                lay = QHBoxLayout(container)
+                lay.setContentsMargins(0, 0, 0, 0); lay.setSpacing(6)
+                
+                icon_lbl = QLabel()
+                icon_lbl.setPixmap(self.style().standardIcon(QStyle.SP_DriveFDIcon).pixmap(16, 16))
+                lay.addWidget(icon_lbl)
+                
+                bg_col = "transparent"
+                if color_scheme == "RGB (Blue/Green/Red)":
+                    if item['is_pen']: bg_col = f"rgba(65, 105, 225, {opacity})"
+                    elif item['is_ssd']: bg_col = f"rgba(50, 205, 50, {opacity})"
+                    elif item['is_hdd']: bg_col = f"rgba(220, 20, 60, {opacity})"
+                else:
+                    if item['is_pen']: bg_col = f"rgba(255, 105, 180, {opacity})"
+                    elif item['is_ssd']: bg_col = f"rgba(0, 191, 255, {opacity})"
+                    elif item['is_hdd']: bg_col = f"rgba(255, 215, 0, {opacity})"
+                
+                border = "1px solid #b8860b" if item['is_hash'] else "0px solid transparent"
+                txt_c = active_accent if is_active else base_txt_c
+                weight = "900" if is_active else "normal"
+                
+                # OVERRIDE: Give the Active Database a strong glowing blue border to make it obvious!
+                if is_active: border = f"2px solid {active_accent}"
+                
+                text_lbl = QLabel(item['clean'])
+                text_lbl.setStyleSheet(f"background-color: {bg_col}; border: {border}; color: {txt_c}; font-weight: {weight}; border-radius: 4px; padding: 2px 4px;")
+                
+                lay.addWidget(text_lbl)
+                lay.addStretch()
+                
+                node.setText(0, item['clean'])
+                node.setForeground(0, QBrush(Qt.transparent)) 
+                
+                if item['date_str']: node.setToolTip(0, f"Database Date: {item['date_str']}")
+                self.folder_tree.setItemWidget(node, 0, container)
+            else:
+                node.setText(0, item['orig'])
+                node.setIcon(0, self.style().standardIcon(QStyle.SP_DriveFDIcon))
+                # Highlight active DB even if Makeup is turned off
+                if is_active:
+                    node.setForeground(0, QBrush(QColor(active_accent)))
+                    font = node.font(0); font.setBold(True); node.setFont(0, font)
 
     def refresh_all(self):
         self.refresh_tree()
@@ -7027,25 +7204,25 @@ class vmanVirtualManager(QMainWindow):
                 cur = conn.cursor()
                 with open(csv_path, 'w', newline='', encoding='utf-8') as f:
                     writer = csv.writer(f)
-                    # NEW: Comprehensive Audit Headers
                     writer.writerow(["Type", "File/Folder Name", "Virtual Path", "Physical OS Path", "Size (Bytes)", "Extension", "Modified Date", "SHA-256 Hash", "Custom Tags", "Color Tag", "Secondary Name"])
                     
+                    def sanitize(name): return re.sub(r'[\\/*?:"<>|]', '_', str(name))
+                    
                     for typ, path_val, db_id in sel_items:
-                        if db_id == -1: continue
-                        
-                        if typ == "file":
-                            cur.execute("SELECT name, parent_path, real_path, size, extension, modified, sha256, custom_tags, color_tag, secondary_name FROM virtual_fs WHERE id=?", (db_id,))
-                            r = cur.fetchone()
+                        if db_id == -1 and typ == "folder" and "://" in path_val:
+                            smart_files = resolve_smart_folder(cur, path_val, sanitize)
+                            for rel_path, f_id, rp, sz in smart_files:
+                                r = cur.execute("SELECT name, parent_path, real_path, size, extension, modified, sha256, custom_tags, color_tag, secondary_name FROM virtual_fs WHERE id=?", (f_id,)).fetchone()
+                                if r: writer.writerow(["File", r[0], f"/{rel_path}", r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9]])
+                        elif db_id == -1: continue
+                        elif typ == "file":
+                            r = cur.execute("SELECT name, parent_path, real_path, size, extension, modified, sha256, custom_tags, color_tag, secondary_name FROM virtual_fs WHERE id=?", (db_id,)).fetchone()
                             if r: writer.writerow(["File", r[0], r[1] + r[0], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9]])
                         else:
-                            # Log the folder itself
-                            cur.execute("SELECT name, parent_path, modified, custom_tags, color_tag, secondary_name FROM virtual_fs WHERE id=?", (db_id,))
-                            r = cur.fetchone()
+                            r = cur.execute("SELECT name, parent_path, modified, custom_tags, color_tag, secondary_name FROM virtual_fs WHERE id=?", (db_id,)).fetchone()
                             if r: writer.writerow(["Folder", r[0], r[1] + r[0] + "/", "N/A (Virtual)", 0, "", r[2], "", r[3], r[4], r[5]])
                             
-                            # Expand and log ALL contents of the selected folder for a full audit
-                            cur.execute("SELECT name, parent_path, real_path, size, extension, modified, sha256, custom_tags, color_tag, secondary_name FROM virtual_fs WHERE parent_path LIKE ? AND is_folder=0", (f"{path_val}%",))
-                            for r in cur.fetchall():
+                            for r in cur.execute("SELECT name, parent_path, real_path, size, extension, modified, sha256, custom_tags, color_tag, secondary_name FROM virtual_fs WHERE parent_path LIKE ? AND is_folder=0", (f"{path_val}%",)).fetchall():
                                 writer.writerow(["File", r[0], r[1] + r[0], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9]])
                                 
             QMessageBox.information(self, "Success", "Rich Database Manifest exported successfully.")
@@ -7072,97 +7249,101 @@ class vmanVirtualManager(QMainWindow):
     def context_menu(self, pos, is_grid=False):
         menu = QMenu(self)
 
-        # 1. Selection & General
         menu.addAction("☑ Select All (Ctrl+A)", self.cmd_select_all)
         
-        # Determine state variables
-        sel_items = [i for i in self._get_selected_items() if i[2] != -1]
+        all_sel_items = self._get_selected_items()
+        real_sel_items = [i for i in all_sel_items if i[2] != -1]
         is_trash = self.current_prefix.startswith("trash://")
 
-        if sel_items:
+        if all_sel_items:
             menu.addSeparator()
-            if sel_items[0][0] == "file":
+            if len(all_sel_items) == 1 and all_sel_items[0][0] == "file":
                 menu.addAction("🎞 Open (Ctrl+O)", self.open_selected_vman)
+
+        # --- NEW: Add the Calculate Size option for Smart Views ---
+        if self._is_smart_path(self.current_prefix):
+            menu.addSeparator()
+            menu.addAction("📊 Calculate Sizes & Files (This View)", self.calculate_smart_folder_sizes)
         
         if is_trash:
             menu.addSeparator()
             menu.addAction("🔥 Empty Trash", self.empty_trash)
 
-        # 2. File/Folder Creation & Import (Only if not smart/trash)
         if not self._is_smart_path(self.current_prefix) and not is_trash:
             menu.addSeparator()
             create_menu = menu.addMenu("✨ Create / Import")
             create_menu.addAction("📂 Create Virtual Folder (Ctrl+Shift+N)", self.create_folder)
             create_menu.addAction("📥 Import Real Files", self.import_real_files)
             create_menu.addAction("📁 Import Real Folder", self.import_real_folder)
-            
             menu.addAction("🖼️ Generate Thumbnails (Current Folder)", self.generate_thumbnails_current_view)
             menu.addAction("🧹 Clean Orphaned Thumbnails", self.clean_orphaned_thumbnails)
 
-        # 3. Operations on Selected Items
-        if sel_items:
+        # --- EXPORT & CLIPBOARD (Available for EVERYTHING, including Smart Views!) ---
+        if all_sel_items:
             menu.addSeparator()
             
-            # --- OPEN / VIEW ---
-            if len(sel_items) == 1:
-                open_menu = menu.addMenu("🚀 Open / Navigate")
-                if sel_items[0][0] == "file":
-                    open_menu.addAction("🚀 Open Native System App", lambda: self.open_local_file_system(sel_items[0][2]))
-                    open_menu.addAction("📂 Show in OS Explorer", lambda: self.open_file_location(sel_items[0][2]))
-                    open_menu.addAction("🎞 Open in vman Viewer (Ctrl+O)", self.open_selected_vman)
-                
-                open_menu.addAction("📋 Copy Virtual Path", lambda: self.copy_vpath_to_clipboard(sel_items[0][2], sel_items[0][0]))
-                
-            # --- CLIPBOARD ---
-            menu.addAction("Copy (Ctrl+C)", self.cmd_copy)
-            menu.addAction("Cut (Ctrl+X)", self.cmd_cut)
+            # --- NEW: SEND TO DATABASE ---
+            send_to_menu = menu.addMenu("📤 Send To Database...")
+            db_list = list(VIEWS_DIR.glob("*.db"))
+            # Don't let user send to the currently active DB!
+            db_list = [db for db in db_list if str(db.resolve()) != str(Path(self.active_db_path).resolve())]
             
-            # --- EDIT / MODIFY ---
+            if not db_list:
+                act = send_to_menu.addAction("No other databases available")
+                act.setEnabled(False)
+            else:
+                for db_file in db_list:
+                    send_to_menu.addAction(db_file.stem, lambda checked=False, tgt=db_file: self.send_to_database(tgt, all_sel_items))
+            # -----------------------------
+            
+            export_menu = menu.addMenu("📤 Export & Extract")
+            export_menu.addAction(f"💾 Materialize {len(all_sel_items)} Items to OS", lambda: self.materialize_to_os(all_sel_items))
+            export_menu.addAction("📦 Create Dummy (Sparse) Replica...", lambda: self.export_dummy_replica(all_sel_items))
+            export_menu.addAction("📄 Create Zero-Byte Replica...", lambda: self.export_zero_byte_replica(all_sel_items))
+            export_menu.addAction("🗜️ Export to ZIP...", lambda: self.export_to_zip(all_sel_items))
+            export_menu.addAction("📊 Export View to CSV", lambda: self.export_csv(all_sel_items))
+            
+            menu.addAction("⚙️ Compile to Isolated DB", lambda: self.compile_current_view(all_sel_items))
+            
+            menu.addSeparator()
+            menu.addAction("Copy (Ctrl+C)", self.cmd_copy)
+            # Cut is restricted because removing smart queries dynamically is dangerous
+            if real_sel_items and len(real_sel_items) == len(all_sel_items):
+                menu.addAction("Cut (Ctrl+X)", self.cmd_cut)
+
+        # --- EDIT / PROPERTIES / DELETE (Restricted to REAL items only) ---
+        if real_sel_items:
+            menu.addSeparator()
             edit_menu = menu.addMenu("✏️ Edit & Modify")
             edit_menu.addAction("Rename (F2)", self.cmd_rename)
-            edit_menu.addAction("🧹 Clean '[copy]' Prefix", lambda: self.cmd_remove_copy_prefix(sel_items))
+            edit_menu.addAction("🧹 Clean '[copy]' Prefix", lambda: self.cmd_remove_copy_prefix(real_sel_items))
             
-            if len(sel_items) == 1:
+            if len(real_sel_items) == 1:
                 edit_menu.addAction("🏷 Set Secondary Name", self.cmd_set_secondary_name)
-                res = self.db.conn.cursor().execute("SELECT is_hidden, is_favorite FROM virtual_fs WHERE id=?", (sel_items[0][2],)).fetchone()
+                res = self.db.conn.cursor().execute("SELECT is_hidden, is_favorite FROM virtual_fs WHERE id=?", (real_sel_items[0][2],)).fetchone()
                 if res:
-                    edit_menu.addAction("👁️ Unhide" if res[0] else "🙈 Hide", lambda: self.toggle_item_hidden(sel_items[0][2], not res[0]))
-                    edit_menu.addAction("💔 Remove Favorite" if res[1] else "⭐ Add Favorite", lambda: self.toggle_item_fav(sel_items[0][2], not res[1]))
+                    edit_menu.addAction("👁️ Unhide" if res[0] else "🙈 Hide", lambda: self.toggle_item_hidden(real_sel_items[0][2], not res[0]))
+                    edit_menu.addAction("💔 Remove Favorite" if res[1] else "⭐ Add Favorite", lambda: self.toggle_item_fav(real_sel_items[0][2], not res[1]))
             
-            # --- TAGS ---
             tag_menu = menu.addMenu("🏷 Tags & Labels")
             color_menu = tag_menu.addMenu("🎨 Set Color Tag")
             for color in ["None", "Red", "Orange", "Gold", "Green", "Cyan", "Blue", "Purple", "Pink"]: 
-                color_menu.addAction(color, lambda checked=False, c=color: self.bulk_tag_items(c, sel_items))
-            tag_menu.addAction("📝 Bulk Add Custom Tags...", lambda: self.bulk_add_custom_tags(sel_items))
+                color_menu.addAction(color, lambda checked=False, c=color: self.bulk_tag_items(c, real_sel_items))
+            tag_menu.addAction("📝 Bulk Add Custom Tags...", lambda: self.bulk_add_custom_tags(real_sel_items))
 
-            # --- SYSTEM & MAPPING ---
             sys_menu = menu.addMenu("⚙️ System & Mapping")
-            sys_menu.addAction(f"🧬 Compute SHA-256 for {len(sel_items)} Item(s)", lambda: self.bulk_compute_hash_selected(sel_items))
-            
-            if len(sel_items) == 1:
-                if sel_items[0][0] == "folder":
-                    sys_menu.addAction("🔗 Map THIS Folder to Physical OS", lambda: self.cmd_map_folder(sel_items[0]))
-                sys_menu.addAction("🗺️ Map Parent Drive/Mount (Auto-Detect)", lambda: self.cmd_map_parent_drive(sel_items[0]))
+            sys_menu.addAction(f"🧬 Compute SHA-256 for {len(real_sel_items)} Item(s)", lambda: self.bulk_compute_hash_selected(real_sel_items))
+            if len(real_sel_items) == 1:
+                if real_sel_items[0][0] == "folder":
+                    sys_menu.addAction("🔗 Map THIS Folder to Physical OS", lambda: self.cmd_map_folder(real_sel_items[0]))
+                sys_menu.addAction("🗺️ Map Parent Drive/Mount (Auto-Detect)", lambda: self.cmd_map_parent_drive(real_sel_items[0]))
                 
-            # --- EXPORT ---
-            export_menu = menu.addMenu("📤 Export & Extract")
-            export_menu.addAction(f"💾 Materialize {len(sel_items)} Items to OS", lambda: self.materialize_to_os(sel_items))
-            export_menu.addAction(f"📤 Export {len(sel_items)} Items to OS Location...", self.export_virtual_to_os)
-            export_menu.addAction("📦 Create Dummy (Sparse) Replica of Selected...", lambda: self.export_dummy_replica(sel_items))
-            export_menu.addAction("📄 Create Zero-Byte Replica of Selected...", lambda: self.export_zero_byte_replica(sel_items))
-            export_menu.addAction("🗜️ Export Selected to ZIP...", lambda: self.export_to_zip(sel_items))
-            export_menu.addAction("📊 Export View to CSV", lambda: self.export_csv(sel_items))
-            
-            # --- PROPERTIES ---
-            if len(sel_items) == 1:
-                menu.addAction("ℹ️ Properties", lambda: self.show_properties(sel_items[0][0], sel_items[0][1], sel_items[0][2]))
+            if len(real_sel_items) == 1:
+                menu.addAction("ℹ️ Properties", lambda: self.show_properties(real_sel_items[0][0], real_sel_items[0][1], real_sel_items[0][2]))
             else:
-                menu.addAction("ℹ️ Multi-Item Properties", lambda: self.show_multi_properties(sel_items))
+                menu.addAction("ℹ️ Multi-Item Properties", lambda: self.show_multi_properties(real_sel_items))
 
             menu.addSeparator()
-
-            # --- DELETE & TRASH ---
             del_menu = menu.addMenu("🗑️ Delete Options")
             if is_trash:
                 del_menu.addAction("♻️ Restore from Trash", self.restore_from_trash)
@@ -7170,25 +7351,21 @@ class vmanVirtualManager(QMainWindow):
             else:
                 del_menu.addAction("🗑️ Move to Trash (Delete)", self.cmd_delete)
                 del_menu.addAction("🧨 Permanent Delete (Shift+Del)", self.cmd_delete_permanent)
-            
             del_menu.addSeparator()
-            del_menu.addAction("💀 Delete PHYSICAL OS Items", lambda: self.cmd_delete_physical(sel_items))
+            del_menu.addAction("💀 Delete PHYSICAL OS Items", lambda: self.cmd_delete_physical(real_sel_items))
 
-        # 4. View / Global Actions (If no selection)
+        # View / Global Actions (If no selection)
         menu.addSeparator()
-        if not sel_items: 
-            menu.addAction("📤 Materialize Entire View to OS", self.export_virtual_to_os)
-        
-        menu.addAction("⚙️ Compile View to Isolated DB", self.compile_current_view)
+        if not all_sel_items: 
+            menu.addAction("📤 Materialize Entire View to OS", lambda: self.materialize_to_os(None))
+            menu.addAction("⚙️ Compile View to Isolated DB", lambda: self.compile_current_view(None))
 
-        # --- WINDOW VIEWS ---
         menu.addSeparator()
         view_menu = menu.addMenu("🖥️ Window Views")
         view_menu.addAction("📝 Toggle Console", lambda: self.log_dock.setVisible(not self.log_dock.isVisible()))
         view_menu.addAction("🗂️ Toggle Data Engine View", lambda: self.tree_dock.setVisible(not self.tree_dock.isVisible()))
         view_menu.addAction("📊 Toggle Inspector", lambda: self.right_dock.setVisible(not self.right_dock.isVisible()))
         
-        # 5. Paste Action (Always available if conditions met)
         act_paste = QAction("📋 Paste (Ctrl+V)", self)
         act_paste.triggered.connect(self.cmd_paste)
         act_paste.setEnabled(bool(self.v_clipboard["items"]) and not self._is_smart_path(self.current_prefix))
@@ -7240,8 +7417,9 @@ class vmanVirtualManager(QMainWindow):
             QMessageBox.warning(self, "Copy Error", str(e))
 
     def cmd_copy(self):
-        items = self._get_selected_items()
+        items = self._get_selected_items() # Uses ALL items
         if items: self.v_clipboard = {"action": "copy", "items": items}; self.status.showMessage(f"Copied {len(items)} items virtually.", 3000)
+        
     def cmd_cut(self):
         items = self._get_selected_items()
         if items: self.v_clipboard = {"action": "cut", "items": items}; self.status.showMessage(f"Cut {len(items)} items virtually.", 3000)
@@ -7402,37 +7580,98 @@ class vmanVirtualManager(QMainWindow):
     def execute_internal_drop(self, dest_path, is_copy):
         if not self._current_drag_items or dest_path.startswith("trash://") or self._is_smart_path(dest_path): return
         
-        # HELPER TO MANAGE [copy] PREFIX
         def get_copy_name(name):
             clean_name = name
-            while clean_name.startswith("[copy]"):
-                clean_name = clean_name[6:]
+            while clean_name.startswith("[copy]"): clean_name = clean_name[6:]
             return f"[copy]{clean_name}"
 
+        def sanitize(name): return re.sub(r'[\\/*?:"<>|]', '_', str(name))
+
+        # --- FIX: Show initializing dialog BEFORE counting to prevent white screen ---
+        prog = QProgressDialog(f"Initializing transfer...", "Cancel", 0, 0, self)
+        prog.setWindowTitle("Virtual Transfer")
+        prog.setWindowModality(Qt.WindowModal)
+        prog.setMinimumDuration(0)
+        prog.show()
+        QApplication.processEvents(); QThread.msleep(50); QApplication.processEvents()
+
+        # Pre-calculate progress
+        total_items = 0
         with sqlite3.connect(self.db.path) as conn:
             cur = conn.cursor()
             for typ, path, db_id in self._current_drag_items:
-                if db_id == -1: continue 
-                if typ == "file":
-                    if is_copy:
-                        row = cur.execute("SELECT name, is_folder, real_path, size, extension, modified, color_tag, is_hidden, category, year, month, custom_tags FROM virtual_fs WHERE id = ?", (db_id,)).fetchone()
-                        if row: 
-                            new_name = get_copy_name(row[0])
-                            cur.execute("INSERT INTO virtual_fs (parent_path, name, is_folder, real_path, size, extension, modified, color_tag, is_hidden, category, year, month, custom_tags) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (dest_path, new_name, *row[1:]))
-                    else: cur.execute("UPDATE virtual_fs SET parent_path = ? WHERE id = ?", (dest_path, db_id))
-                else:
-                    row = cur.execute("SELECT name FROM virtual_fs WHERE id = ?", (db_id,)).fetchone()
-                    if not row: continue
-                    if is_copy:
-                        new_base_name = get_copy_name(row[0])
-                        cur.execute("INSERT INTO virtual_fs (parent_path, name, is_folder) VALUES (?, ?, 1)", (dest_path, new_base_name))
-                        for r in cur.execute("SELECT name, is_folder, real_path, size, extension, modified, color_tag, is_hidden, parent_path, category, year, month, custom_tags FROM virtual_fs WHERE parent_path LIKE ?", (f"{path}%",)).fetchall(): 
-                            cur.execute("INSERT INTO virtual_fs (parent_path, name, is_folder, real_path, size, extension, modified, color_tag, is_hidden, category, year, month, custom_tags) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (f"{dest_path}{new_base_name}/" + r[8][len(path):], *r[:8], r[9], r[10], r[11], r[12]))
+                if db_id == -1 and typ == "folder" and "://" in path:
+                    total_items += len(resolve_smart_folder(cur, path, sanitize))
+                elif db_id != -1:
+                    if typ == "file": total_items += 1
+                    else: total_items += cur.execute("SELECT COUNT(id) FROM virtual_fs WHERE parent_path LIKE ? AND is_folder=0", (f"{path}%",)).fetchone()[0]
+        
+        if total_items == 0: total_items = 1
+        
+        # Update progress bar to real limits
+        prog.setMaximum(total_items)
+        prog.setLabelText(f"{'Copying' if is_copy else 'Moving'} {total_items} items...")
+        QApplication.processEvents()
+
+        processed = 0
+        with sqlite3.connect(self.db.path) as conn:
+            cur = conn.cursor()
+            for typ, path, db_id in self._current_drag_items:
+                if prog.wasCanceled(): break
+                             
+                if db_id == -1 and typ == "folder" and "://" in path:
+                    if not is_copy: continue # Cannot cut dynamic Smart Views
+                    base_f = get_copy_name(sanitize(path.strip('/').split('/')[-1])) if path.strip('/').replace('://', '') else ""
+                    smart_files = resolve_smart_folder(cur, path, sanitize)
+                    created_folders = set()
+                    
+                    for rel_path, f_id, rp, sz in smart_files:
+                        row = cur.execute("SELECT name, is_folder, real_path, size, extension, modified, color_tag, is_hidden, category, year, month, custom_tags, creation_date, hash_verified FROM virtual_fs WHERE id=?", (f_id,)).fetchone()
+                        if not row: continue
+                        
+                        full_rel = f"{base_f}/{rel_path}" if base_f else rel_path
+                        parts = full_rel.split('/')
+                        f_name = parts[-1]
+                        parent_dirs = parts[:-1]
+                        
+                        curr_parent = dest_path
+                        for part in parent_dirs:
+                            if curr_parent + part + "/" not in created_folders:
+                                cur.execute("INSERT OR IGNORE INTO virtual_fs (parent_path, name, is_folder, modified) VALUES (?, ?, 1, ?)", (curr_parent, part, now_ts()))
+                                created_folders.add(curr_parent + part + "/")
+                            curr_parent += part + "/"
+                            
+                        cur.execute("INSERT INTO virtual_fs (parent_path, name, is_folder, real_path, size, extension, modified, color_tag, is_hidden, category, year, month, custom_tags, creation_date, hash_verified) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (curr_parent, f_name, *row[1:]))
+                        processed += 1; 
+                        if processed % 50 == 0: prog.setValue(processed); QApplication.processEvents()
+                
+                elif db_id != -1:
+                    if typ == "file":
+                        if is_copy:
+                            row = cur.execute("SELECT name, is_folder, real_path, size, extension, modified, color_tag, is_hidden, category, year, month, custom_tags, creation_date, hash_verified FROM virtual_fs WHERE id = ?", (db_id,)).fetchone()
+                            if row: 
+                                new_name = get_copy_name(row[0])
+                                cur.execute("INSERT INTO virtual_fs (parent_path, name, is_folder, real_path, size, extension, modified, color_tag, is_hidden, category, year, month, custom_tags, creation_date, hash_verified) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (dest_path, new_name, *row[1:]))
+                        else: cur.execute("UPDATE virtual_fs SET parent_path = ? WHERE id = ?", (dest_path, db_id))
+                        processed += 1; 
+                        if processed % 50 == 0: prog.setValue(processed); QApplication.processEvents()
                     else:
-                        cur.execute("UPDATE virtual_fs SET parent_path = ? WHERE id = ?", (dest_path, db_id))
-                        cur.execute("UPDATE virtual_fs SET parent_path = ? || SUBSTR(parent_path, LENGTH(?) + 1) WHERE parent_path LIKE ?", (f"{dest_path}{row[0]}/", path, f"{path}%"))
+                        row = cur.execute("SELECT name FROM virtual_fs WHERE id = ?", (db_id,)).fetchone()
+                        if not row: continue
+                        if is_copy:
+                            new_base_name = get_copy_name(row[0])
+                            cur.execute("INSERT INTO virtual_fs (parent_path, name, is_folder, modified) VALUES (?, ?, 1, ?)", (dest_path, new_base_name, now_ts()))
+                            for r in cur.execute("SELECT name, is_folder, real_path, size, extension, modified, color_tag, is_hidden, parent_path, category, year, month, custom_tags, creation_date, hash_verified FROM virtual_fs WHERE parent_path LIKE ?", (f"{path}%",)).fetchall(): 
+                                cur.execute("INSERT INTO virtual_fs (parent_path, name, is_folder, real_path, size, extension, modified, color_tag, is_hidden, category, year, month, custom_tags, creation_date, hash_verified) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (f"{dest_path}{new_base_name}/" + r[8][len(path):], *r[:8], r[9], r[10], r[11], r[12], r[13], r[14]))
+                                processed += 1
+                                if processed % 50 == 0: prog.setValue(processed); QApplication.processEvents()
+                        else:
+                            cur.execute("UPDATE virtual_fs SET parent_path = ? WHERE id = ?", (dest_path, db_id))
+                            cur.execute("UPDATE virtual_fs SET parent_path = ? || SUBSTR(parent_path, LENGTH(?) + 1) WHERE parent_path LIKE ?", (f"{dest_path}{row[0]}/", path, f"{path}%"))
             conn.commit()
-        self._current_drag_items = []; self.clear_cache(); self.refresh_all(); self.sys_log(f"Internal Drag/Drop executed to '{dest_path}'")
+        
+        prog.setValue(max(1, total_items)); prog.close()
+        self._current_drag_items = []; self.clear_cache(); self.refresh_all(); self.sys_log(f"Internal Transfer executed to '{dest_path}'")
 
     def create_folder(self):
         if self.current_prefix.startswith("trash://") or self.current_prefix.startswith("fav://") or self._is_smart_path(self.current_prefix): return
@@ -7493,42 +7732,35 @@ class vmanVirtualManager(QMainWindow):
         self._register_worker(self.import_thread)
         self.import_thread.start()
         
-    def compile_current_view(self):
+    def compile_current_view(self, sel_items=None):
+        if not sel_items:
+            sel_items = self._get_selected_items()
+            if not sel_items:
+                sel_items = [("folder", self.current_prefix, -1)]
+
         name, ok = QInputDialog.getText(self, "Compile DB View", "Enter name for new separate database (e.g., 'Project_Backup'):")
         if not ok or not name.strip(): return
         target_path = VIEWS_DIR / f"{name.strip().replace(' ', '_')}.db"
-        query = ""; params = ()
-        matched_proto = next((p for p in SMART_PROTOCOLS if self.current_prefix.startswith(p)), None)
-        
-        if self.current_prefix.startswith("y_m_f://"):
-            parts = [p for p in self.current_prefix.replace("y_m_f://", "").split("/") if p]
-            if len(parts) >= 3:
-                with sqlite3.connect(self.db.path) as conn:
-                    cur = conn.cursor()
-                    folder_age, temp_tracker = {}, {}
-                    for pp, y, m, c in cur.execute("SELECT parent_path, year, month, COUNT(id) FROM virtual_fs WHERE is_folder=0 AND in_trash=0 AND year!='' AND month!='' GROUP BY parent_path, year, month").fetchall():
-                        if pp not in temp_tracker or c > temp_tracker[pp]: temp_tracker[pp], folder_age[pp] = c, (y, m)
-                    matched_pp = next((pp for pp, age in folder_age.items() if age == (parts[0], parts[1]) and (pp.strip("/").split("/")[-1] if pp.strip("/") else "Root_Files") == parts[2]), None)
-                    if matched_pp: query = "SELECT * FROM virtual_fs WHERE parent_path LIKE ? AND is_folder=0 AND in_trash=0"; params = (f"{matched_pp}%",)
-                    else: return QMessageBox.warning(self, "Compile Error", "Folder matching failed.")
-            else: return QMessageBox.warning(self, "Compile Error", "You must navigate deeply into a folder to compile it from the Year/Month view.")
-        elif matched_proto:
-            cols = SMART_PROTOCOLS[matched_proto]
-            parts = [p for p in self.current_prefix.replace(matched_proto, "").split("/") if p]
-            where = ["is_folder=0", "in_trash=0"] + [f"{cols[i]}=?" for i in range(len(parts))]
-            query = f"SELECT * FROM virtual_fs WHERE {' AND '.join(where)}"; params = tuple(parts)
-        else:
-            query = "SELECT * FROM virtual_fs WHERE parent_path LIKE ? AND in_trash=0"; params = (f"{self.current_prefix}%",)
 
-        self.compile_dlg = QProgressDialog("Compiling standalone database...", "Cancel", 0, 100, self); self.compile_dlg.setWindowModality(Qt.WindowModal); self.compile_dlg.show()
-        self.compiler = CompilerThread(str(self.db.path), str(target_path), self.current_prefix, query, params, self)
-        self.compiler.progress.connect(lambda c, t, msg: (self.compile_dlg.setValue(c), self.compile_dlg.setLabelText(msg)))
+        self.compile_dlg = QProgressDialog("Compiling standalone database...", "Cancel", 0, 100, self)
+        self.compile_dlg.setWindowModality(Qt.WindowModal)
+        self.compile_dlg.setFixedSize(600, 160)
+        label = self.compile_dlg.findChild(QLabel)
+        if label: label.setWordWrap(True)
+        self.compile_dlg.show()
+        
+        self.compiler = CompilerThread(str(self.db.path), str(target_path), sel_items, self)
+        self.compiler.progress.connect(lambda c, t, msg: (self.compile_dlg.setValue(int((c/max(1,t))*100)), self.compile_dlg.setLabelText(msg)))
         self.compile_dlg.canceled.connect(self.compiler.cancel)
         def on_compile_finished(db_res):
-            self.compile_dlg.close(); QMessageBox.information(self, "Success", f"DB compiled to:\n{db_res}"); self.refresh_tree(); self.sys_log(f"Compiled Isolated DB: {db_res}")
+            self.compile_dlg.close()
+            QMessageBox.information(self, "Success", f"DB compiled to:\n{db_res}")
+            self.refresh_tree()
+            self.sys_log(f"Compiled Isolated DB: {db_res}")
         self.compiler.finished.connect(on_compile_finished)
         self.compiler.error.connect(lambda e: (self.compile_dlg.close(), QMessageBox.critical(self, "Compile Error", e)))
-        self._register_worker(self.compiler); self.compiler.start()
+        self._register_worker(self.compiler)
+        self.compiler.start()
 
     def update_statistics(self):        
         stats = self.db.get_stats(self.current_prefix if not self._is_smart_path(self.current_prefix) else "")
@@ -7675,14 +7907,62 @@ class vmanVirtualManager(QMainWindow):
 
     def on_tree_context_menu(self, pos):
         item = self.folder_tree.itemAt(pos)
-        if not item: return
+        menu = QMenu(self)
+        
+        # --- MASTER MAKEUP TOGGLE ---
+        act_makeup = menu.addAction("🎨 Toggle DB Name Makeup")
+        act_makeup.setCheckable(True)
+        act_makeup.setChecked(getattr(self, 'db_makeup_mode', True))
+        
+        def toggle_db_makeup(checked):
+            self.settings.setValue("db_makeup_mode", checked)
+            self.db_makeup_mode = checked
+            self.refresh_tree()
+            
+        act_makeup.toggled.connect(toggle_db_makeup)
+        
+        # --- COLOR SCHEME TOGGLE ---
+        scheme_menu = menu.addMenu("🌈 Drive Color Scheme")
+        act_def_color = scheme_menu.addAction("Default (Pink/Cyan/Yellow)")
+        act_def_color.setCheckable(True)
+        act_def_color.setChecked(self.settings.value("db_color_scheme", "Default") == "Default")
+        act_def_color.triggered.connect(lambda: (self.settings.setValue("db_color_scheme", "Default"), self.refresh_tree()))
+        
+        act_rgb_color = scheme_menu.addAction("RGB (Blue/Green/Red)")
+        act_rgb_color.setCheckable(True)
+        act_rgb_color.setChecked(self.settings.value("db_color_scheme", "Default") == "RGB (Blue/Green/Red)")
+        act_rgb_color.triggered.connect(lambda: (self.settings.setValue("db_color_scheme", "RGB (Blue/Green/Red)"), self.refresh_tree()))
+        
+        # --- NEW: SORT DATABASES MENU ---
+        sort_menu = menu.addMenu("🔤 Sort Databases By...")
+        
+        act_sort_alpha = sort_menu.addAction("Alphabetical (A-Z)")
+        act_sort_alpha.setCheckable(True)
+        act_sort_alpha.setChecked(self.settings.value("db_sort_mode", "Alphabetical") == "Alphabetical")
+        act_sort_alpha.triggered.connect(lambda: (self.settings.setValue("db_sort_mode", "Alphabetical"), self.refresh_tree()))
+        
+        act_sort_cat = sort_menu.addAction("Category (PEN, SSD, HDD)")
+        act_sort_cat.setCheckable(True)
+        act_sort_cat.setChecked(self.settings.value("db_sort_mode", "Alphabetical") == "Category")
+        act_sort_cat.triggered.connect(lambda: (self.settings.setValue("db_sort_mode", "Category"), self.refresh_tree()))
+        
+        act_sort_date = sort_menu.addAction("Date (Newest First)")
+        act_sort_date.setCheckable(True)
+        act_sort_date.setChecked(self.settings.value("db_sort_mode", "Alphabetical") == "Date")
+        act_sort_date.triggered.connect(lambda: (self.settings.setValue("db_sort_mode", "Date"), self.refresh_tree()))
+        
+        menu.addSeparator()
+        
+        if not item: 
+            menu.exec(self.folder_tree.viewport().mapToGlobal(pos))
+            return
+            
         path = item.data(0, Qt.UserRole)
         
         if path and path.startswith("db://") and path != "db://main":
             db_name = path.replace("db://", "")
             db_file = VIEWS_DIR / db_name
             
-            menu = QMenu(self)
             act_rename = menu.addAction("✏️ Rename Database")
             act_delete = menu.addAction("🗑️ Delete Database")
             act_merge = menu.addAction("📥 Merge into Active Database")
@@ -7695,70 +7975,43 @@ class vmanVirtualManager(QMainWindow):
                 new_name, ok = QInputDialog.getText(self, "Rename Database", "New name (without .db):", QLineEdit.Normal, db_file.stem)
                 if ok and new_name.strip():
                     new_file = VIEWS_DIR / f"{new_name.strip().replace(' ', '_')}.db"
-                    if new_file.exists():
-                        QMessageBox.warning(self, "Error", "A database with this name already exists.")
-                        return
-                    
+                    if new_file.exists(): return QMessageBox.warning(self, "Error", "A database with this name already exists.")
                     try:
                         if self.active_db_path == str(db_file):
-                            self.db.close()
-                            db_file.rename(new_file)
-                            self.active_db_path = str(new_file)
-                            self.db = vmanDB(Path(self.active_db_path))
+                            self.db.close(); db_file.rename(new_file)
+                            self.active_db_path = str(new_file); self.db = vmanDB(Path(self.active_db_path))
                             self.status.showMessage(f"Renamed active database to {new_file.name}")
-                        else:
-                            db_file.rename(new_file)
-                            
-                        self.refresh_tree()
-                        self.sys_log(f"Renamed database '{db_name}' to '{new_file.name}'")
-                    except Exception as e:
-                        QMessageBox.critical(self, "Error", f"Failed to rename: {e}")
-                        
+                        else: db_file.rename(new_file)
+                        self.refresh_tree(); self.sys_log(f"Renamed database '{db_name}' to '{new_file.name}'")
+                    except Exception as e: QMessageBox.critical(self, "Error", f"Failed to rename: {e}")
             elif action == act_delete:
                 if QMessageBox.question(self, "Delete Database", f"Are you sure you want to permanently delete '{db_name}'?\nThis cannot be undone.", QMessageBox.Yes | QMessageBox.No) == QMessageBox.Yes:
                     try:
                         if self.active_db_path == str(db_file):
-                            self.db.close()
-                            self.active_db_path = str(DB_FILE)
-                            self.db = vmanDB(Path(self.active_db_path))
+                            self.db.close(); self.active_db_path = str(DB_FILE); self.db = vmanDB(Path(self.active_db_path))
                             self.status.showMessage("Reconnected to Main System DB. Active isolated DB was deleted.")
                             self.nav_to_path("/")
-                            
-                        if db_file.exists():
-                            os.remove(db_file)
-                            
-                        self.refresh_tree()
-                        self.sys_log(f"Deleted database '{db_name}'")
-                    except Exception as e:
-                        QMessageBox.critical(self, "Error", f"Failed to delete: {e}")
-            
+                        if db_file.exists(): os.remove(db_file)
+                        self.refresh_tree(); self.sys_log(f"Deleted database '{db_name}'")
+                    except Exception as e: QMessageBox.critical(self, "Error", f"Failed to delete: {e}")
             elif action == act_merge:
-                if QMessageBox.question(self, "Merge Database", f"Copy all missing files and folders from '{db_name}' into the current database?\n(Your target database will NOT be deleted).", QMessageBox.Yes | QMessageBox.No) == QMessageBox.Yes:
+                if QMessageBox.question(self, "Merge Database", f"Copy all missing files and folders from '{db_name}' into the current database?", QMessageBox.Yes | QMessageBox.No) == QMessageBox.Yes:
                     try:
                         self.db.conn.commit()
                         cur = self.db.conn.cursor()
                         try:
                             cur.execute(f"ATTACH DATABASE '{db_file}' AS source_db")
                             cols = "parent_path, name, is_folder, real_path, size, extension, modified, color_tag, secondary_name, is_hidden, in_trash, is_favorite, sha256, category, year, month, custom_tags, hash_verified, creation_date"
-                            
-                            # Safely inserts anything where the path + name doesn't already exist
-                            cur.execute(f"""
-                                INSERT INTO virtual_fs ({cols})
-                                SELECT {cols} FROM source_db.virtual_fs 
-                                WHERE source_db.virtual_fs.parent_path || source_db.virtual_fs.name NOT IN (SELECT parent_path || name FROM virtual_fs)
-                            """)
+                            cur.execute(f"INSERT INTO virtual_fs ({cols}) SELECT {cols} FROM source_db.virtual_fs WHERE source_db.virtual_fs.parent_path || source_db.virtual_fs.name NOT IN (SELECT parent_path || name FROM virtual_fs)")
                             self.db.conn.commit()
-                        finally:
-                            cur.execute("DETACH DATABASE source_db")
-                            
+                        finally: cur.execute("DETACH DATABASE source_db")
                         QMessageBox.information(self, "Merge Complete", "Database merged successfully. No original files were deleted.")
-                        self.clear_cache()
-                        self.refresh_all()
-                        self.sys_log(f"Merged isolated database '{db_name}' into active database.")
-                    except Exception as e:
-                        QMessageBox.critical(self, "Merge Error", f"Failed to merge database:\n{e}")
+                        self.clear_cache(); self.refresh_all(); self.sys_log(f"Merged isolated database '{db_name}' into active database.")
+                    except Exception as e: QMessageBox.critical(self, "Merge Error", f"Failed to merge database:\n{e}")
             elif action == act_compare:
                 DriveComparatorDialog(self.active_db_path, str(db_file), self).exec()
+        else:
+            menu.exec(self.folder_tree.viewport().mapToGlobal(pos))
 
     def toggle_hidden_files(self):
         self.show_hidden = not self.show_hidden
@@ -8011,6 +8264,67 @@ class vmanVirtualManager(QMainWindow):
         self.search_instance.show()
         self.search_instance.raise_()
         self.search_instance.activateWindow()
+        
+    def calculate_smart_folder_sizes(self):
+        if not self._is_smart_path(self.current_prefix): return
+        
+        prog = QProgressDialog("Calculating smart folder sizes...", "Cancel", 0, self.file_table.model().rowCount(), self)
+        prog.setWindowModality(Qt.WindowModal)
+        prog.setMinimumDuration(0) # Force immediate display
+        prog.show()
+        
+        # --- FIX: Force OS to paint the window before CPU locks up ---
+        QApplication.processEvents(); QThread.msleep(50); QApplication.processEvents()
+        
+        with sqlite3.connect(self.db.path) as conn:
+            cur = conn.cursor()
+            for r in range(self.file_table.model().rowCount()):
+                if prog.wasCanceled(): break
+                data = self.file_table.model().data(self.file_table.model().index(r, 1), Qt.UserRole)
+                if not data or data[0] != "folder" or data[2] != -1: continue
+                
+                v_path = data[1]
+                smart_files = resolve_smart_folder(cur, v_path, lambda x: x)
+                total_files = len(smart_files)
+                total_size = sum((sz or 0) for _, _, _, sz in smart_files)
+                
+                row_dict = self.file_table.model().all_rows[r]
+                row_dict["display"][3] = human_size(total_size)
+                row_dict["display"][5] = f"Virtual Folder ({total_files})"
+                
+                row_dict["sort_keys"][3] = (0, total_size)
+                row_dict["sort_keys"][5] = (0, total_files)
+                
+                prog.setValue(r + 1)
+                
+        self.file_table.viewport().update()
+        self.file_grid.viewport().update()
+        prog.close()   
+
+    def send_to_database(self, target_db_path, items):
+        if not items: return
+        
+        self.compile_dlg = QProgressDialog(f"Sending items to {target_db_path.stem}...", "Cancel", 0, 100, self)
+        self.compile_dlg.setWindowModality(Qt.WindowModal)
+        self.compile_dlg.setFixedSize(600, 160)
+        self.compile_dlg.setMinimumDuration(0)
+        self.compile_dlg.show()
+        
+        # Force OS Paint
+        QApplication.processEvents(); QThread.msleep(50); QApplication.processEvents()
+        
+        self.compiler = CompilerThread(str(self.db.path), str(target_db_path), items, append_mode=True, parent=self)
+        self.compiler.progress.connect(lambda c, t, msg: (self.compile_dlg.setValue(int((c/max(1,t))*100)), self.compile_dlg.setLabelText(msg)))
+        self.compile_dlg.canceled.connect(self.compiler.cancel)
+        def on_compile_finished(db_res):
+            self.compile_dlg.close()
+            QMessageBox.information(self, "Success", f"Files successfully sent to:\n{Path(db_res).name}")
+            self.sys_log(f"Appended items to Database: {Path(db_res).name}")
+        self.compiler.finished.connect(on_compile_finished)
+        self.compiler.error.connect(lambda e: (self.compile_dlg.close(), QMessageBox.critical(self, "Error", e)))
+        self._register_worker(self.compiler)
+        self.compiler.start()            
+        
         
 if __name__ == "__main__":
     app = QApplication(sys.argv)
