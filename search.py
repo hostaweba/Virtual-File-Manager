@@ -8,18 +8,23 @@ import datetime
 import math
 import hashlib
 import csv
+import re
+import time
 from collections import defaultdict
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QDate, QThread, Signal, QSize, QFileInfo, QSettings
-from PySide6.QtGui import QAction, QFont, QIcon, QColor, QBrush, QTextCursor, QCursor
+# Silence harmless Qt Font & PNG profile warnings
+os.environ["QT_LOGGING_RULES"] = "qt.qpa.fonts.warning=false;qt.gui.imageio.warning=false"
+
+from PySide6.QtCore import Qt, QDate, QTime, QDateTime, QThread, Signal, QSize, QFileInfo, QSettings
+from PySide6.QtGui import QAction, QFont, QIcon, QColor, QBrush, QTextCursor, QCursor, QShortcut, QKeySequence
 from PySide6.QtWidgets import (QMainWindow, QVBoxLayout, QHBoxLayout, QGridLayout, 
                                QLabel, QPushButton, QWidget, QLineEdit, QComboBox, 
-                               QCheckBox, QDoubleSpinBox, QDateEdit, QTableWidget, 
-                               QTableWidgetItem, QHeaderView, QMessageBox, QMenu, 
+                               QCheckBox, QDoubleSpinBox, QSpinBox, QDateEdit, QTimeEdit, QTableWidget, 
+                               QTableWidgetItem, QHeaderView, QMessageBox, QMenu, QDateTimeEdit,
                                QApplication, QProgressBar, QProgressDialog, QStyle, QFrame, 
                                QFormLayout, QDialog, QFileIconProvider, QSizePolicy, 
-                               QScrollArea, QPlainTextEdit, QTabWidget, QButtonGroup, QRadioButton, QFileDialog, QColorDialog, QInputDialog)
+                               QScrollArea, QPlainTextEdit, QTabWidget, QButtonGroup, QRadioButton, QFileDialog, QColorDialog, QInputDialog, QGroupBox)
 from themes import THEMES
 
 try:
@@ -33,143 +38,840 @@ except Exception:
     MATPLOTLIB_AVAILABLE = False
 
 
-# --- Color Customization Dialog ---
+CAT_MAP = {
+    'Images': ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.jfif', '.svg', '.tiff', '.ico'],
+    'Videos': ['.mp4', '.mkv', '.avi', '.mov', '.wmv', '.flv', '.webm', '.m4v', '.mpg', '.mpeg'],
+    'Audio': ['.mp3', '.wav', '.aac', '.flac', '.ogg', '.m4a', '.opus', '.wma', '.alac'],
+    'Documents': ['.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx', '.txt', '.rtf', '.csv', '.md'],
+    'Code': ['.py', '.js', '.html', '.css', '.java', '.cpp', '.c', '.cs', '.php', '.sh', '.bat', '.cmd', '.exe', '.json', '.xml', '.yaml'],
+    'Archives': ['.zip', '.rar', '.7z', '.tar', '.gz', '.bz2', '.xz', '.iso']
+}
+EXT_TO_CAT = {}
+for cat, exts in CAT_MAP.items():
+    for ext in exts:
+        EXT_TO_CAT[ext] = cat
+
+
+class ExtFilterDialog(QDialog):
+    def __init__(self, exts, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Filter Found Extensions")
+        self.resize(550, 650)
+        
+        # --- Native Light/Dark Theme Enforcer ---
+        is_dark = True
+        if parent and hasattr(parent, 'main_app') and hasattr(parent.main_app, 'theme_combo'):
+            is_dark = parent.main_app.theme_combo.currentText() == "Dark"
+        else:
+            is_dark = QApplication.palette().window().color().lightness() < 128
+            
+        bg_col = "#161b22" if is_dark else "#f6f8fa"
+        lbl_col = "#c9d1d9" if is_dark else "#24292f"
+        input_bg = "#0d1117" if is_dark else "#ffffff"
+        brd_col = "#30363d" if is_dark else "#d0d7de"
+        
+        # FIX: Removed the global "QWidget" selector so checkbox ticks render properly!
+        self.setStyleSheet(f"""
+            QDialog {{ background-color: {bg_col}; color: {lbl_col}; }}
+            QLabel, QCheckBox {{ color: {lbl_col}; }}
+            QLineEdit, QComboBox {{ background-color: {input_bg}; color: {lbl_col}; border: 1px solid {brd_col}; border-radius: 4px; padding: 4px; }}
+            QGroupBox {{ border: 1px solid {brd_col}; border-radius: 6px; margin-top: 15px; padding-top: 15px; color: {lbl_col}; font-weight: bold; }}
+            QGroupBox::title {{ subcontrol-origin: margin; left: 10px; top: 0px; color: {lbl_col}; }}
+            QScrollArea, #scrollContainer {{ background-color: {bg_col}; border: 1px solid {brd_col}; }}
+        """)
+        
+        self.settings = QSettings("VirtualMan", "ExtPresets")
+        layout = QVBoxLayout(self)
+        
+        preset_group = QGroupBox("💾 Filter Presets")
+        p_lay = QHBoxLayout(preset_group)
+        self.combo_presets = QComboBox()
+        self.update_presets_combo()
+        btn_load = QPushButton("Load"); btn_load.clicked.connect(self.load_preset)
+        btn_save = QPushButton("Save"); btn_save.clicked.connect(self.save_preset)
+        btn_del = QPushButton("Delete"); btn_del.clicked.connect(self.delete_preset)
+        p_lay.addWidget(self.combo_presets, stretch=1); p_lay.addWidget(btn_load); p_lay.addWidget(btn_save); p_lay.addWidget(btn_del)
+        layout.addWidget(preset_group)
+        
+        paste_group = QGroupBox("📋 Bulk Untick")
+        pst_lay = QHBoxLayout(paste_group)
+        self.txt_paste = QLineEdit(); self.txt_paste.setPlaceholderText("Paste exts to untick (e.g. .jpg, .dll)")
+        btn_untick = QPushButton("Untick Pasted")
+        btn_untick.clicked.connect(self.untick_pasted)
+        pst_lay.addWidget(self.txt_paste, stretch=1); pst_lay.addWidget(btn_untick)
+        layout.addWidget(paste_group)
+        
+        layout.addWidget(QLabel("<b>Uncheck extensions to hide them from the final results:</b>"))
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        container = QWidget()
+        container.setObjectName("scrollContainer") # Targets the specific background cleanly
+        grid = QGridLayout(container)
+        self.checkboxes = {}
+        
+        row, col = 0, 0
+        for ext in sorted(exts):
+            disp = ext if ext else "[Folders / No Ext]"
+            cb = QCheckBox(disp); cb.setChecked(True)
+            self.checkboxes[ext] = cb
+            grid.addWidget(cb, row, col)
+            col += 1
+            if col > 2: 
+                col = 0
+                row += 1
+                
+        scroll.setWidget(container)
+        layout.addWidget(scroll, stretch=1)
+        
+        btn_box_top = QHBoxLayout()
+        btn_sel_all = QPushButton("Select All"); btn_sel_all.clicked.connect(lambda: self.toggle_all(True))
+        btn_desel_all = QPushButton("Deselect All"); btn_desel_all.clicked.connect(lambda: self.toggle_all(False))
+        btn_copy = QPushButton("Copy Shown Exts")
+        btn_copy.clicked.connect(lambda: QApplication.clipboard().setText(", ".join([e for e in exts if e])))
+        btn_box_top.addWidget(btn_sel_all); btn_box_top.addWidget(btn_desel_all); btn_box_top.addWidget(btn_copy)
+        layout.addLayout(btn_box_top)
+        
+        btn_ok = QPushButton("Apply Filters & Render")
+        btn_ok.setStyleSheet("background-color: #2ea043; color: white; font-weight: bold; padding: 12px; border-radius: 6px;")
+        btn_ok.clicked.connect(self.accept)
+        layout.addWidget(btn_ok)
+        
+    def update_presets_combo(self):
+        self.combo_presets.clear()
+        presets = self.settings.value("presets", {})
+        if presets: self.combo_presets.addItems(list(presets.keys()))
+        
+    def save_preset(self):
+        name, ok = QInputDialog.getText(self, "Save Preset", "Enter Preset Name:")
+        if ok and name.strip():
+            allowed = list(self.get_allowed())
+            presets = self.settings.value("presets", {})
+            if not isinstance(presets, dict): presets = {}
+            presets[name.strip()] = allowed
+            self.settings.setValue("presets", presets)
+            self.update_presets_combo()
+            self.combo_presets.setCurrentText(name.strip())
+            
+    def load_preset(self):
+        name = self.combo_presets.currentText()
+        if not name: return
+        presets = self.settings.value("presets", {})
+        if name in presets:
+            allowed = set(presets[name])
+            for ext, cb in self.checkboxes.items():
+                cb.setChecked(ext in allowed)
+                
+    def delete_preset(self):
+        name = self.combo_presets.currentText()
+        if not name: return
+        presets = self.settings.value("presets", {})
+        if name in presets:
+            del presets[name]
+            self.settings.setValue("presets", presets)
+            self.update_presets_combo()
+                
+    def untick_pasted(self):
+        text = self.txt_paste.text()
+        if not text: return
+        exts_to_untick = [e.strip().lower() for e in text.split(',') if e.strip()]
+        for e in exts_to_untick:
+            if not e.startswith('.') and e != "[folders / no ext]": e = '.' + e
+            if e in self.checkboxes:
+                self.checkboxes[e].setChecked(False)
+
+    def toggle_all(self, state):
+        for cb in self.checkboxes.values(): cb.setChecked(state)
+        
+    def get_allowed(self):
+        return set(ext for ext, cb in self.checkboxes.items() if cb.isChecked())
+
+
+# --- Advanced Forensic Timestamp Corrector Engine ---
+class TimestampCorrectorDialog(QDialog):
+    def __init__(self, selected_items, db_path, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("🕰️ Forensic Programmable Timestamp Corrector")
+        self.resize(1200, 750)
+        self.setWindowModality(Qt.NonModal) 
+        if parent and hasattr(parent, 'styleSheet'): self.setStyleSheet(parent.styleSheet())
+        self.db_path = db_path
+        self.selected_items = selected_items
+        
+        layout = QVBoxLayout(self)
+        
+        guide_txt = (
+            "<b style='color:#e3b341; font-size:14px;'>Ultimate Extraction Commands & Syntax Guide:</b><br>"
+            "Match fragmented dates across <i>millions of folders and filenames</i> simultaneously. Unmatched components (e.g., Year) keep the file's original data!<br>"
+            "• <b style='color:#58a6ff;'>YYYY, YY</b>: Year | <b style='color:#58a6ff;'>MMM</b>: Month Name (Jan, February, may) | <b style='color:#58a6ff;'>MM, M</b>: Numeric Month | <b style='color:#58a6ff;'>DD, D</b>: Day | <b style='color:#58a6ff;'>HH, mm, ss</b>: Time<br>"
+            "• <b style='color:#e3b341;'>*</b>: Skip any characters/folders | <b style='color:#e3b341;'>&lt;dir&gt;</b>: Skip exactly one folder<br>"
+            "• <b style='color:#e3b341;'>?TOKEN?</b>: Fuzzy optional wrappers (e.g., ?YYYYMMDD? finds a block anywhere)<br><br>"
+            "<i>Path & Folder Examples:</i><br>"
+            "  1. <code>*/video YYYY M/D.*</code> → Extracts from: <span style='color:#8b949e;'>/video <b>2023 03</b>/<b>01</b>.mp4</span><br>"
+            "  2. <code>*/YY/MMM/* D.*</code> → Extracts from: <span style='color:#8b949e;'>/docs/<b>23</b>/<b>February</b>/my files <b>20</b>.py</span><br>"
+            "  3. <code>*/YYYY.M_D/*</code> → Extracts from: <span style='color:#8b949e;'>/spiderman <b>2023.8_2</b>/sp.mp4</span><br>"
+            "  4. <code>*DMMM*YYYY*</code> → Extracts from: <span style='color:#8b949e;'>/data/<b>29may</b>_<b>2025</b>/photo.jpg</span><br>"
+        )
+        lbl_guide = QLabel(guide_txt); lbl_guide.setTextFormat(Qt.RichText); layout.addWidget(lbl_guide)
+        
+        conf_lay = QGridLayout()
+        
+        self.txt_patterns = QPlainTextEdit()
+        self.txt_patterns.setPlainText("*/video YYYY M/D.*\n*/YY/MMM/* D.*\n*/YYYY.M_D/*\n*DMMM*YYYY*\n*MMM*D,*YYYY*\n*MM.YYYY*\n*?YYYYMMDD?*")
+        self.txt_patterns.setFixedHeight(110)
+        self.txt_patterns.setStyleSheet("color: #e3b341; font-family: Consolas; font-weight: bold; font-size: 14px; background-color: #0d1117; padding: 5px;")
+        
+        self.combo_modify_target = QComboBox()
+        self.combo_modify_target.addItems(["Modified Date (Default)", "Created Date", "Both (Modified & Created)"])
+        self.combo_modify_target.setStyleSheet("font-weight: bold; padding: 5px; font-size: 13px;")
+        
+        conf_lay.addWidget(QLabel("<b>Custom Regex Patterns:</b><br>(Scans Path + Filename)"), 0, 0)
+        conf_lay.addWidget(self.txt_patterns, 0, 1)
+        conf_lay.addWidget(QLabel("<b>Target OS Property:</b>"), 1, 0)
+        conf_lay.addWidget(self.combo_modify_target, 1, 1)
+        layout.addLayout(conf_lay)
+        
+        scan_lay = QHBoxLayout()
+        btn_load_manual = QPushButton("📋 Load Files (Manual / Context Edit Mode)")
+        btn_load_manual.setStyleSheet("padding: 8px;")
+        btn_load_manual.clicked.connect(self.load_manual_files)
+        
+        btn_scan = QPushButton("🔍 Auto-Scan & Suggest from Patterns")
+        btn_scan.setStyleSheet("background-color: #1f6feb; color: white; font-weight: bold; padding: 8px;")
+        btn_scan.clicked.connect(self.scan_files)
+        
+        scan_lay.addWidget(btn_load_manual); scan_lay.addWidget(btn_scan)
+        layout.addLayout(scan_lay)
+        
+        self.progress = QProgressBar(); self.progress.setVisible(False)
+        self.progress.setFixedHeight(15); self.progress.setAlignment(Qt.AlignCenter)
+        layout.addWidget(self.progress)
+        
+        self.table = QTableWidget(0, 5)
+        self.table.setHorizontalHeaderLabels(["Filename", "Original Date", "Select Correct Date", "Match Pattern", "Full Physical Path"])
+        self.table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.setColumnWidth(0, 250); self.table.setColumnWidth(1, 140); self.table.setColumnWidth(2, 180)
+        self.table.setColumnWidth(3, 160)
+        self.table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self.show_context_menu)
+        layout.addWidget(self.table)
+        
+        btn_box = QHBoxLayout()
+        self.btn_apply_db = QPushButton("💾 Modify Database Only")
+        self.btn_apply_db.setStyleSheet("background-color: #8957e5; color: white; font-weight: bold; padding: 10px;")
+        self.btn_apply_db.clicked.connect(lambda: self.apply_fixes("db"))
+        
+        self.btn_apply_os = QPushButton("📂 Modify Physical File Only")
+        self.btn_apply_os.setStyleSheet("background-color: #d29922; color: white; font-weight: bold; padding: 10px;")
+        self.btn_apply_os.clicked.connect(lambda: self.apply_fixes("os"))
+        
+        self.btn_apply_both = QPushButton("🚀 Modify Both (DB + Physical)")
+        self.btn_apply_both.setStyleSheet("background-color: #2ea043; color: white; font-weight: bold; padding: 10px;")
+        self.btn_apply_both.clicked.connect(lambda: self.apply_fixes("both"))
+        
+        for b in [self.btn_apply_db, self.btn_apply_os, self.btn_apply_both]:
+            b.setEnabled(False); btn_box.addWidget(b)
+        layout.addLayout(btn_box)
+        
+    def _parse_custom_syntax(self, raw_pat):
+        p = raw_pat.strip()
+        if not p: return None
+        
+        # 1. Protect specific syntax symbols
+        p = p.replace('.', r'\.')
+        p = p.replace('*', r'.*?') # Wildcard
+        p = p.replace('<dir>', r'[^/\\]+[/\\]+') # Folder skip
+        p = p.replace('<ext>', r'\.[^./\\]+') # Ext skip
+        p = p.replace('<file>', r'[^/\\]+') # Generic File Name Skip
+        
+        # 2. Swap tokens for safe placeholders (prevents overlapping replacement bugs & re.sub crashes)
+        p = re.sub(r'(?<![A-Za-z])YYYY(?![A-Za-z])', '@@Y4@@', p)
+        p = re.sub(r'(?<![A-Za-z])YY(?![A-Za-z])', '@@Y2@@', p)
+        p = re.sub(r'(?<![A-Za-z])MMM(?![A-Za-z])', '@@M3@@', p)
+        p = re.sub(r'(?<![A-Za-z])MM(?![A-Za-z])', '@@M2@@', p)
+        p = re.sub(r'(?<![A-Za-z])M(?![A-Za-z])', '@@M1@@', p)
+        p = re.sub(r'(?<![A-Za-z])DD(?![A-Za-z])', '@@D2@@', p)
+        p = re.sub(r'(?<![A-Za-z])D(?![A-Za-z])', '@@D1@@', p)
+        p = re.sub(r'(?<![A-Za-z])HH(?![A-Za-z])', '@@H2@@', p)
+        p = re.sub(r'(?<![A-Za-z])mm(?![A-Za-z])', '@@m2@@', p)
+        p = re.sub(r'(?<![A-Za-z])ss(?![A-Za-z])', '@@s2@@', p)
+        
+        # 3. Handle Fuzzy Optionals
+        p = re.sub(r'\?(.*?)\?', lambda m: f"(?:{m.group(1)})?", p) 
+        
+        # 4. Inject Crash-Proof Python Regex Groups (safely injecting literal \d using .replace)
+        p = p.replace('@@Y4@@', r'(?P<Y>\d{4})')
+        p = p.replace('@@Y2@@', r'(?P<y>\d{2})')
+        p = p.replace('@@M3@@', r'(?P<M_name>jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)')
+        p = p.replace('@@M2@@', r'(?P<M>0[1-9]|1[0-2]|\d{2})')
+        p = p.replace('@@M1@@', r'(?P<M_s>[1-9]|1[0-2]|\d{1,2})')
+        p = p.replace('@@D2@@', r'(?P<D>0[1-9]|[12]\d|3[01]|\d{2})')
+        p = p.replace('@@D1@@', r'(?P<D_s>[1-9]|[12]\d|3[01]|\d{1,2})')
+        p = p.replace('@@H2@@', r'(?P<h>[0-1]\d|2[0-3]|\d{2})')
+        p = p.replace('@@m2@@', r'(?P<m_m>[0-5]\d|\d{2})')
+        p = p.replace('@@s2@@', r'(?P<s>[0-5]\d|\d{2})')
+        
+        try: return re.compile(p, re.IGNORECASE)
+        except Exception: return None
+
+    def load_manual_files(self):
+        self.table.setRowCount(0)
+        self.items_to_fix = []
+        for i, item in enumerate(self.selected_items):
+            self.add_item_to_table(i, item, None, "Manual Mode")
+
+    def scan_files(self):
+        self.table.setRowCount(0)
+        self.items_to_fix = []
+        patterns_text = self.txt_patterns.toPlainText().split('\n')
+        
+        regex_list = []
+        for line in patterns_text:
+            if not line.strip(): continue
+            comp = self._parse_custom_syntax(line)
+            if comp: regex_list.append((line.strip(), comp))
+            
+        if not regex_list: return QMessageBox.warning(self, "No Patterns", "Could not compile valid extraction patterns.")
+            
+        self.progress.setVisible(True)
+        self.progress.setMaximum(len(self.selected_items))
+        QApplication.processEvents()
+        
+        MONTH_MAP = {'jan': 1, 'feb': 2, 'mar': 3, 'apr': 4, 'may': 5, 'jun': 6, 'jul': 7, 'aug': 8, 'sep': 9, 'oct': 10, 'nov': 11, 'dec': 12}
+        
+        row_idx = 0
+        for i, item in enumerate(self.selected_items):
+            match_found = False; best_dt = None; best_pat = ""
+            
+            # Use original date metadata as a fallback if the pattern only extracts partial info (like Month/Day)
+            try: orig_dt = datetime.datetime.strptime(str(item['mod']), "%Y-%m-%d %H:%M:%S")
+            except: orig_dt = datetime.datetime.now()
+            
+            # Combine path and filename for the ultimate fragmented scan target
+            full_target = item['real_path'] if item['real_path'] else item['name']
+            
+            for pat_str, regex in regex_list:
+                m = regex.search(full_target)
+                if m:
+                    gd = m.groupdict()
+                    
+                    y_str = gd.get('Y') or ('20' + gd['y'] if gd.get('y') else None)
+                    m_str = gd.get('M') or gd.get('M_s')
+                    d_str = gd.get('D') or gd.get('D_s')
+                    
+                    y_val = int(y_str) if y_str else orig_dt.year
+                    
+                    if gd.get('M_name'):
+                        m_prefix = gd['M_name'][:3].lower()
+                        m_val = MONTH_MAP.get(m_prefix, 1)
+                    else:
+                        m_val = int(m_str) if m_str else (orig_dt.month if not y_str else 1)
+                        
+                    d_val = int(d_str) if d_str else (orig_dt.day if not y_str and not m_str else 1)
+                    
+                    h_val = int(gd.get('h') or orig_dt.hour)
+                    mm_val = int(gd.get('m_m') or orig_dt.minute)
+                    s_val = int(gd.get('s') or orig_dt.second)
+                    
+                    try:
+                        best_dt = datetime.datetime(y_val, m_val, d_val, h_val, mm_val, s_val)
+                        best_pat = pat_str
+                        match_found = True; break
+                    except: pass
+                if match_found: break
+                        
+            if match_found:
+                self.add_item_to_table(row_idx, item, best_dt, best_pat)
+                row_idx += 1
+            if i % 10 == 0:
+                self.progress.setValue(i); QApplication.processEvents()
+                
+        self.progress.setVisible(False)
+        if row_idx == 0: QMessageBox.information(self, "No Matches", "No dates extracted using patterns. Use Manual Load.")
+
+    def add_item_to_table(self, row_idx, item, extracted_dt, pat_str):
+        self.table.insertRow(row_idx)
+        self.table.setItem(row_idx, 0, QTableWidgetItem(item['name']))
+        
+        t_prop = self.combo_modify_target.currentText()
+        if "Created" in t_prop and 'creation_date' in item:
+            disp_date = item['creation_date']
+        else:
+            disp_date = item['mod']
+            
+        self.table.setItem(row_idx, 1, QTableWidgetItem(str(disp_date)))
+        
+        dt_edit = QDateTimeEdit()
+        dt_edit.setDisplayFormat("yyyy-MM-dd HH:mm:ss")
+        dt_edit.setCalendarPopup(True)
+        dt_edit.setStyleSheet("background-color: #0d1117; color: #58a6ff; font-weight: bold; border: 1px solid #3fb950; padding: 2px;")
+        
+        if extracted_dt: dt_edit.setDateTime(extracted_dt)
+        else:
+            try: dt_edit.setDateTime(QDateTime.fromString(str(disp_date), "yyyy-MM-dd HH:mm:ss"))
+            except: dt_edit.setDateTime(QDateTime.currentDateTime())
+            
+        self.table.setCellWidget(row_idx, 2, dt_edit)
+        self.table.setItem(row_idx, 3, QTableWidgetItem(pat_str))
+        
+        path_item = QTableWidgetItem(str(item['real_path']))
+        path_item.setData(Qt.UserRole, {'id': item['id'], 'old_date': str(item['mod']), 'tags': item.get('tags', '')})
+        self.table.setItem(row_idx, 4, path_item)
+        
+        self.items_to_fix.append({'id': item['id'], 'real_path': item['real_path'], 'old_date': str(item['mod']), 'tags': item.get('tags', ''), 'dt_widget': dt_edit})
+        for b in [self.btn_apply_db, self.btn_apply_os, self.btn_apply_both]: b.setEnabled(True)
+
+    def show_context_menu(self, pos):
+        row = self.table.rowAt(pos.y())
+        if row < 0: return
+        menu = QMenu(self)
+        
+        m_full = menu.addMenu("📅 Extract Full Date")
+        m_full.addAction("From Filename").triggered.connect(lambda: self.extract_part("full", "name"))
+        m_full.addAction("From Full Path").triggered.connect(lambda: self.extract_part("full", "path"))
+        menu.addSeparator()
+        
+        m_mix = menu.addMenu("🧩 Mix & Match Extraction")
+        m_mix.addAction("Year from Path + Month/Day from File").triggered.connect(lambda: self.extract_mixed("Y_path_MD_file"))
+        m_mix.addAction("Year/Month from Path + Day from File").triggered.connect(lambda: self.extract_mixed("YM_path_D_file"))
+        m_mix.addAction("Date from File + Time from Path").triggered.connect(lambda: self.extract_mixed("D_file_T_path"))
+        menu.addSeparator()
+        
+        m_yr = menu.addMenu("📆 Extract Year")
+        m_yr.addAction("From Filename").triggered.connect(lambda: self.extract_part("year", "name"))
+        m_yr.addAction("From Full Path").triggered.connect(lambda: self.extract_part("year", "path"))
+        
+        m_mo = menu.addMenu("🗓 Extract Month")
+        m_mo.addAction("From Filename").triggered.connect(lambda: self.extract_part("month", "name"))
+        m_mo.addAction("From Full Path").triggered.connect(lambda: self.extract_part("month", "path"))
+        
+        m_dy = menu.addMenu("📆 Extract Day")
+        m_dy.addAction("From Filename").triggered.connect(lambda: self.extract_part("day", "name"))
+        m_dy.addAction("From Full Path").triggered.connect(lambda: self.extract_part("day", "path"))
+        
+        m_tm = menu.addMenu("⏱ Extract Time")
+        m_tm.addAction("From Filename").triggered.connect(lambda: self.extract_part("time", "name"))
+        m_tm.addAction("From Full Path").triggered.connect(lambda: self.extract_part("time", "path"))
+        
+        menu.exec(self.table.viewport().mapToGlobal(pos))
+        
+    def extract_part(self, part, source):
+        selected_rows = self.table.selectionModel().selectedRows()
+        if not selected_rows: return
+        
+        rx_yr = re.compile(r'(?<!\d)(19[7-9]\d|20[0-2]\d)(?!\d)')
+        rx_mo = re.compile(r'(?:^|[-_./\s])(0[1-9]|1[0-2])(?:[-_./\s]|$)')
+        rx_dy = re.compile(r'(?:^|[-_./\s])(0[1-9]|[12]\d|3[01])(?:[-_./\s]|$)')
+        rx_tm = re.compile(r'(?<!\d)([0-1]\d|2[0-3])[:_-]?([0-5]\d)(?:[:_-]?([0-5]\d))?(?!\d)')
+        rx_full = re.compile(r'(?P<Y>19[7-9]\d|20[0-2]\d)[-_./\s]?(?P<M>0[1-9]|1[0-2])[-_./\s]?(?P<D>0[1-9]|[12]\d|3[01])')
+        
+        count = 0
+        for idx in selected_rows:
+            r = idx.row()
+            dt_widget = self.items_to_fix[r]['dt_widget']
+            cur_dt = dt_widget.dateTime()
+            text = self.table.item(r, 0).text() if source == "name" else self.table.item(r, 4).text()
+            
+            if part == "year":
+                m = rx_yr.search(text)
+                if m: cur_dt.setDate(QDate(int(m.group(1)), cur_dt.date().month(), cur_dt.date().day())); count+=1
+            elif part == "month":
+                m = rx_mo.search(text)
+                if m: cur_dt.setDate(QDate(cur_dt.date().year(), int(m.group(1)), cur_dt.date().day())); count+=1
+            elif part == "day":
+                m = rx_dy.search(text)
+                if m: cur_dt.setDate(QDate(cur_dt.date().year(), cur_dt.date().month(), int(m.group(1)))); count+=1
+            elif part == "time":
+                m = rx_tm.search(text)
+                if m: cur_dt.setTime(QTime(int(m.group(1)), int(m.group(2)), int(m.group(3) or 0))); count+=1
+            elif part == "full":
+                m = rx_full.search(text)
+                if m: cur_dt.setDate(QDate(int(m.group('Y')), int(m.group('M')), int(m.group('D')))); count+=1
+                
+            dt_widget.setDateTime(cur_dt)
+            
+        if count == 0: QMessageBox.information(self, "No Match", f"Could not find valid {part} data in {source}.")
+
+    def extract_mixed(self, mix_type):
+        selected_rows = self.table.selectionModel().selectedRows()
+        if not selected_rows: return
+        
+        rx_yr = re.compile(r'(?<!\d)(19[7-9]\d|20[0-2]\d)(?!\d)')
+        rx_mo = re.compile(r'(?:^|[-_./\s])(0[1-9]|1[0-2])(?:[-_./\s]|$)')
+        rx_dy = re.compile(r'(?:^|[-_./\s])(0[1-9]|[12]\d|3[01])(?:[-_./\s]|$)')
+        rx_tm = re.compile(r'(?<!\d)([0-1]\d|2[0-3])[:_-]?([0-5]\d)(?:[:_-]?([0-5]\d))?(?!\d)')
+        
+        count = 0
+        for idx in selected_rows:
+            r = idx.row()
+            dt_widget = self.items_to_fix[r]['dt_widget']
+            cur_dt = dt_widget.dateTime()
+            
+            name = self.table.item(r, 0).text()
+            path = self.table.item(r, 4).text()
+            
+            if mix_type == "Y_path_MD_file":
+                m_y = rx_yr.search(path); m_m = rx_mo.search(name); m_d = rx_dy.search(name)
+                if m_y and m_m and m_d:
+                    cur_dt.setDate(QDate(int(m_y.group(1)), int(m_m.group(1)), int(m_d.group(1))))
+                    count+=1
+            elif mix_type == "YM_path_D_file":
+                m_y = rx_yr.search(path); m_m = rx_mo.search(path); m_d = rx_dy.search(name)
+                if m_y and m_m and m_d:
+                    cur_dt.setDate(QDate(int(m_y.group(1)), int(m_m.group(1)), int(m_d.group(1))))
+                    count+=1
+            elif mix_type == "D_file_T_path":
+                m_d = rx_dy.search(name); m_t = rx_tm.search(path)
+                if m_d and m_t:
+                    cur_dt.setDate(QDate(cur_dt.date().year(), cur_dt.date().month(), int(m_d.group(1))))
+                    cur_dt.setTime(QTime(int(m_t.group(1)), int(m_t.group(2)), int(m_t.group(3) or 0)))
+                    count+=1
+                    
+            dt_widget.setDateTime(cur_dt)
+        if count == 0: QMessageBox.information(self, "No Match", "Could not satisfy the mixed pattern criteria.")
+
+    def apply_fixes(self, mode):
+        rows = self.table.rowCount()
+        if rows == 0: return
+        
+        self.progress.setVisible(True)
+        self.progress.setMaximum(rows)
+        QApplication.processEvents()
+        
+        success_count = 0; error_log = []
+        target_prop = self.combo_modify_target.currentText()
+        
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cur = conn.cursor()
+            
+            for row in range(rows):
+                dt_widget = self.table.cellWidget(row, 2)
+                new_date = dt_widget.dateTime().toString("yyyy-MM-dd HH:mm:ss")
+                meta = self.table.item(row, 4).data(Qt.UserRole)
+                real_path = self.table.item(row, 4).text()
+                
+                try:
+                    dt_obj = datetime.datetime.strptime(new_date, "%Y-%m-%d %H:%M:%S")
+                    ts = dt_obj.timestamp()
+                    
+                    if mode in ["os", "both"]:
+                        if os.path.exists(real_path):
+                            stat = os.stat(real_path)
+                            atime = stat.st_atime
+                            mtime = ts if "Modified Date" in target_prop or "Both" in target_prop else stat.st_mtime
+                            
+                            # 1. Update Access and Modified Dates
+                            os.utime(real_path, (atime, mtime))
+                            
+                            # 2. Native Windows API for Created Date
+                            if sys.platform == "win32" and ("Created Date" in target_prop or "Both" in target_prop):
+                                import ctypes
+                                from ctypes import wintypes
+                                
+                                wintime = int((ts + 11644473600) * 10000000)
+                                class FILETIME(ctypes.Structure):
+                                    _fields_ = [("dwLowDateTime", wintypes.DWORD), ("dwHighDateTime", wintypes.DWORD)]
+                                
+                                filetime = FILETIME(wintime & 0xFFFFFFFF, wintime >> 32)
+                                # OPEN_EXISTING=3, FILE_FLAG_BACKUP_SEMANTICS=0x02000000 (Required for Folders)
+                                handle = ctypes.windll.kernel32.CreateFileW(
+                                    real_path, 0x40000000, 0, None, 3, 0x02000000, None)
+                                
+                                if handle != -1:
+                                    ctypes.windll.kernel32.SetFileTime(handle, ctypes.byref(filetime), None, None)
+                                    ctypes.windll.kernel32.CloseHandle(handle)
+                                    
+                            # macOS Creation Date fallback
+                            elif sys.platform == "darwin" and ("Created Date" in target_prop or "Both" in target_prop):
+                                date_str = datetime.datetime.fromtimestamp(ts).strftime('%m/%d/%Y %H:%M:%S')
+                                subprocess.run(['SetFile', '-d', date_str, real_path])
+                        else:
+                            error_log.append(f"Physical file missing: {meta['id']}")
+                            continue
+                            
+                    if mode in ["db", "both"]:
+                        new_tag = f"ts_revert:{meta['old_date']}"
+                        ft = f"{meta['tags']},{new_tag}" if meta['tags'] else new_tag
+                        if "Both" in target_prop:
+                            cur.execute("UPDATE virtual_fs SET modified=?, creation_date=?, custom_tags=? WHERE id=?", (new_date, new_date, ft, meta['id']))
+                        elif "Created Date" in target_prop:
+                            cur.execute("UPDATE virtual_fs SET creation_date=?, custom_tags=? WHERE id=?", (new_date, ft, meta['id']))
+                        else:
+                            cur.execute("UPDATE virtual_fs SET modified=?, custom_tags=? WHERE id=?", (new_date, ft, meta['id']))
+                        
+                    success_count += 1
+                except Exception as ex:
+                    error_log.append(f"Row {row+1} Error: {ex}")
+                    
+                if row % 10 == 0:
+                    self.progress.setValue(row)
+                    QApplication.processEvents()
+                    
+            if mode in ["db", "both"]: conn.commit()
+            conn.close()
+            
+            self.progress.setVisible(False)
+            msg = f"Successfully modified {success_count} item(s)."
+            if error_log:
+                msg += f"\n\nEncountered {len(error_log)} errors. See console."
+                for e in error_log: print(e)
+            QMessageBox.information(self, "Operation Complete", msg)
+            self.accept()
+        except Exception as e:
+            self.progress.setVisible(False)
+            QMessageBox.critical(self, "Fatal Error", f"Failed to apply modifications:\n{e}")
+
+# ... (MapColorConfigDialog identical to previous) ...
 class MapColorConfigDialog(QDialog):
-    def __init__(self, parent=None):
+    def __init__(self, current_results, parent=None):
         super().__init__(parent)
         self.setWindowTitle("⚙️ Customize Map Colors")
-        self.resize(400, 650)
-        if parent and hasattr(parent, 'styleSheet'): self.setStyleSheet(parent.styleSheet())
+        self.resize(450, 700)
+        
+        # --- Native Light/Dark Theme Enforcer ---
+        is_dark = True
+        if parent and hasattr(parent, 'main_app') and hasattr(parent.main_app, 'theme_combo'):
+            is_dark = parent.main_app.theme_combo.currentText() == "Dark"
+        else:
+            is_dark = QApplication.palette().window().color().lightness() < 128
+            
+        bg_col = "#161b22" if is_dark else "#f6f8fa"
+        lbl_col = "#c9d1d9" if is_dark else "#24292f"
+        brd_col = "#30363d" if is_dark else "#d0d7de"
+        
+        self.setStyleSheet(f"""
+            QDialog {{ background-color: {bg_col}; color: {lbl_col}; }}
+            QLabel {{ color: {lbl_col}; font-size: 13px; }}
+            QScrollArea, #scrollContainer {{ background-color: {bg_col}; border: none; }}
+            QPushButton {{ color: {lbl_col}; background-color: {bg_col}; border: 1px solid {brd_col}; border-radius: 4px; padding: 4px; }}
+            QPushButton:hover {{ background-color: {'#30363d' if is_dark else '#e1e4e8'}; }}
+        """)
         
         self.settings = QSettings("vmanOS", "HeatmapColors")
         self.custom_colors = self.settings.value("custom_colors", {})
         if not isinstance(self.custom_colors, dict): self.custom_colors = {}
         
-        layout = QVBoxLayout(self)
-        
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QScrollArea.NoFrame)
-        container = QWidget()
-        self.form = QFormLayout(container)
-        
-        self.color_btns = {}
-        
-        # Custom Gradient for Intensity Mode
-        self.form.addRow(QLabel("<b style='color:#58a6ff; font-size:14px;'>Custom Intensity Gradient</b>"), QLabel(""))
-        self.add_color_row("Low Intensity (Empty/Min):", "Gradient_Low", self.custom_colors.get("Gradient_Low", "#21262d"))
-        self.add_color_row("High Intensity (Peak):", "Gradient_High", self.custom_colors.get("Gradient_High", "#f85149"))
-        self.form.addRow(QLabel(" "), QLabel(" "))
-        
-        # Categories
-        self.form.addRow(QLabel("<b style='color:#58a6ff; font-size:14px;'>Category Colors</b>"), QLabel(""))
-        cats = ["Images", "Videos", "Audio", "Documents", "Code", "Archives", "Others"]
-        default_cat_colors = {"Images": "#a371f7", "Videos": "#f85149", "Audio": "#ff7b72", "Documents": "#d2a8ff", "Code": "#79c0ff", "Archives": "#e3b341", "Others": "#8b949e"}
-        
-        for c in cats:
-            key = f"Category_{c}"
-            cur_color = self.custom_colors.get(key, default_cat_colors.get(c, "#8b949e"))
-            self.add_color_row(c, key, cur_color)
-            
-        # Extensions & Tags (Load existing)
-        self.form.addRow(QLabel(" "), QLabel(" "))
-        self.form.addRow(QLabel("<b style='color:#58a6ff; font-size:14px;'>Extension Colors</b>"), QLabel(""))
-        for k, v in self.custom_colors.items():
-            if k.startswith("Extension_"): self.add_color_row(k.replace("Extension_", "Ext: "), k, v)
-            
-        btn_add_ext = QPushButton("+ Add Extension Color")
-        btn_add_ext.clicked.connect(lambda: self.add_new_mapping("Extension"))
-        self.form.addRow("", btn_add_ext)
-        
-        self.form.addRow(QLabel(" "), QLabel(" "))
-        self.form.addRow(QLabel("<b style='color:#58a6ff; font-size:14px;'>Tag Colors</b>"), QLabel(""))
-        for k, v in self.custom_colors.items():
-            if k.startswith("Tag_"): self.add_color_row(k.replace("Tag_", "Tag: "), k, v)
-            
-        btn_add_tag = QPushButton("+ Add Tag Color")
-        btn_add_tag.clicked.connect(lambda: self.add_new_mapping("Tag"))
-        self.form.addRow("", btn_add_tag)
-            
-        layout.addWidget(scroll)
-        scroll.setWidget(container)
+        self.found_exts = set(); self.found_tags = set()
+        for r in current_results:
+            if r[3]: self.found_exts.add(r[3].lower().strip('.'))
+            if r[8]:
+                for t in r[8].split(','):
+                    if t.strip(): self.found_tags.add(t.strip().lower())
+                    
+        for k in self.custom_colors.keys():
+            if k.startswith("Extension_"): self.found_exts.add(k.replace("Extension_", ""))
+            elif k.startswith("Tag_"): self.found_tags.add(k.replace("Tag_", ""))
+
+        self.main_layout = QVBoxLayout(self)
+        self.scroll = QScrollArea(); self.scroll.setWidgetResizable(True); self.scroll.setFrameShape(QScrollArea.NoFrame)
+        self.container = QWidget()
+        self.container.setObjectName("scrollContainer")
+        self.container_layout = QVBoxLayout(self.container)
+        self.container_layout.setAlignment(Qt.AlignTop)
+        self.scroll.setWidget(self.container); self.main_layout.addWidget(self.scroll)
         
         btn_box = QHBoxLayout()
         btn_save = QPushButton("Save & Apply")
-        btn_save.setStyleSheet("background-color: #2ea043; color: white; font-weight: bold; padding: 8px; border-radius: 4px;")
+        btn_save.setStyleSheet("background-color: #2ea043; color: white; font-weight: bold; padding: 8px; border-radius: 4px; border: none;")
         btn_save.clicked.connect(self.save_and_close)
-        btn_box.addStretch()
-        btn_box.addWidget(btn_save)
-        layout.addLayout(btn_box)
+        btn_box.addStretch(); btn_box.addWidget(btn_save)
+        self.main_layout.addLayout(btn_box)
         
-    def add_color_row(self, display_name, key, color_hex):
-        btn = QPushButton()
-        btn.setCursor(Qt.PointingHandCursor)
-        btn.setStyleSheet(f"background-color: {color_hex}; border: 1px solid #30363d; border-radius: 4px; min-width: 60px; min-height: 25px;")
-        btn.clicked.connect(lambda checked=False, k=key, b=btn: self.pick_color(k, b))
-        self.color_btns[key] = color_hex
-        self.form.addRow(display_name, btn)
+        self.color_btns = {}
+        self.refresh_ui()
 
-    def add_new_mapping(self, prefix):
-        name, ok = QInputDialog.getText(self, f"Add {prefix}", f"Enter {prefix} name (e.g. {'jpg' if prefix=='Extension' else 'work'}):")
-        if ok and name.strip():
-            key = f"{prefix}_{name.strip().lower()}"
-            if key not in self.color_btns:
-                color = QColorDialog.getColor(Qt.white, self, "Select Color")
-                if color.isValid():
-                    self.add_color_row(f"{prefix[:3]}: {name.strip().lower()}", key, color.name())
+    def refresh_ui(self):
+        while self.container_layout.count():
+            child = self.container_layout.takeAt(0)
+            if child.widget(): child.widget().deleteLater()
+            
+        self.color_btns = {}
+        self.container_layout.addWidget(QLabel("<b style='color:#58a6ff; font-size:14px;'>Custom Intensity Gradient</b>"))
+        self.add_row("Low Intensity (Min):", "Gradient_Low", self.custom_colors.get("Gradient_Low", "#21262d"), False)
+        self.add_row("High Intensity (Peak):", "Gradient_High", self.custom_colors.get("Gradient_High", "#f85149"), False)
+        self.container_layout.addWidget(QLabel(" "))
         
+        self.container_layout.addWidget(QLabel("<b style='color:#58a6ff; font-size:14px;'>Category Colors</b>"))
+        cats = ["Images", "Videos", "Audio", "Documents", "Code", "Archives", "Others"]
+        default_cat_colors = {"Images": "#a371f7", "Videos": "#f85149", "Audio": "#ff7b72", "Documents": "#d2a8ff", "Code": "#79c0ff", "Archives": "#e3b341", "Others": "#8b949e"}
+        for c in cats:
+            key = f"Category_{c}"
+            self.add_row(c, key, self.custom_colors.get(key, default_cat_colors.get(c, "#8b949e")), False)
+            
+        self.container_layout.addWidget(QLabel(" "))
+        self.container_layout.addWidget(QLabel("<b style='color:#58a6ff; font-size:14px;'>Extension Colors</b>"))
+        ext_keys = sorted([k for k in self.custom_colors.keys() if k.startswith("Extension_")])
+        for k in ext_keys:
+            self.add_row(k.replace("Extension_", "Ext: "), k, self.custom_colors[k], True, "Extension")
+            
+        btn_add_ext = QPushButton("+ Add Extension Color")
+        btn_add_ext.clicked.connect(lambda: self.add_new_mapping("Extension", sorted(list(self.found_exts))))
+        self.container_layout.addWidget(btn_add_ext)
+        
+        self.container_layout.addWidget(QLabel(" "))
+        self.container_layout.addWidget(QLabel("<b style='color:#58a6ff; font-size:14px;'>Tag Colors</b>"))
+        tag_keys = sorted([k for k in self.custom_colors.keys() if k.startswith("Tag_")])
+        for k in tag_keys:
+            self.add_row(k.replace("Tag_", "Tag: "), k, self.custom_colors[k], True, "Tag")
+            
+        btn_add_tag = QPushButton("+ Add Tag Color")
+        btn_add_tag.clicked.connect(lambda: self.add_new_mapping("Tag", sorted(list(self.found_tags))))
+        self.container_layout.addWidget(btn_add_tag)
+
+    def add_row(self, display_name, key, color_hex, is_editable, prefix=""):
+        row_w = QWidget(); lay = QHBoxLayout(row_w); lay.setContentsMargins(0, 2, 0, 2)
+        lbl = QLabel(display_name); lbl.setMinimumWidth(130); lay.addWidget(lbl)
+        
+        btn_color = QPushButton(); btn_color.setCursor(Qt.PointingHandCursor)
+        btn_color.setStyleSheet(f"background-color: {color_hex}; border: 1px solid #30363d; border-radius: 4px; min-width: 60px; min-height: 25px;")
+        self.color_btns[key] = color_hex
+        btn_color.clicked.connect(lambda checked=False, k=key, b=btn_color: self.pick_color(k, b))
+        lay.addWidget(btn_color)
+        
+        if is_editable:
+            raw_name = key.replace(f"{prefix}_", "")
+            btn_edit = QPushButton("✏️"); btn_edit.setToolTip("Rename"); btn_edit.setFixedWidth(30)
+            btn_edit.clicked.connect(lambda checked=False, k=key, p=prefix, old=raw_name: self.rename_mapping(k, p, old))
+            lay.addWidget(btn_edit)
+            btn_del = QPushButton("❌"); btn_del.setToolTip("Remove"); btn_del.setFixedWidth(30)
+            btn_del.clicked.connect(lambda checked=False, k=key: self.delete_mapping(k))
+            lay.addWidget(btn_del)
+        self.container_layout.addWidget(row_w)
+
     def pick_color(self, key, btn):
         color = QColorDialog.getColor(QColor(self.color_btns[key]), self, "Select Color")
         if color.isValid():
-            self.color_btns[key] = color.name()
+            self.color_btns[key] = color.name(); self.custom_colors[key] = color.name()
             btn.setStyleSheet(f"background-color: {color.name()}; border: 1px solid #30363d; border-radius: 4px; min-width: 60px; min-height: 25px;")
             
+    def add_new_mapping(self, prefix, items_list):
+        name, ok = QInputDialog.getItem(self, f"Add {prefix}", f"Select or type a new {prefix}:", items_list, 0, True)
+        if ok and name.strip():
+            clean_name = name.strip().lower()
+            key = f"{prefix}_{clean_name}"
+            if key not in self.custom_colors:
+                color = QColorDialog.getColor(Qt.white, self, f"Select Color for {clean_name}")
+                if color.isValid():
+                    self.custom_colors[key] = color.name()
+                    self.refresh_ui()
+
+    def rename_mapping(self, key, prefix, old_name):
+        new_name, ok = QInputDialog.getText(self, f"Rename {prefix}", f"Rename '{old_name}' to:", QLineEdit.Normal, old_name)
+        if ok and new_name.strip():
+            clean_name = new_name.strip().lower()
+            new_key = f"{prefix}_{clean_name}"
+            if new_key != key:
+                self.custom_colors[new_key] = self.custom_colors.get(key, "#ffffff")
+                if key in self.custom_colors: del self.custom_colors[key]
+                self.refresh_ui()
+
+    def delete_mapping(self, key):
+        ans = QMessageBox.question(self, "Remove", f"Are you sure you want to remove this color mapping?", QMessageBox.Yes | QMessageBox.No)
+        if ans == QMessageBox.Yes:
+            if key in self.custom_colors: del self.custom_colors[key]
+            self.refresh_ui()
+
     def save_and_close(self):
-        for k, v in self.color_btns.items():
-            self.custom_colors[k] = v
+        for k, v in self.color_btns.items(): self.custom_colors[k] = v
         self.settings.setValue("custom_colors", self.custom_colors)
         self.accept()
 
 
+# --- Beautiful Massive Dataset Dialog ---
 class RowLimitDialogSearch(QDialog):
     def __init__(self, total_rows, parent=None):
         super().__init__(parent)
         self.total_rows = total_rows
-        self.setWindowTitle("Massive Dataset Found")
-        self.resize(450, 250)
-        if parent and hasattr(parent, 'styleSheet'): self.setStyleSheet(parent.styleSheet())
+        self.setWindowTitle("⚠️ Massive Dataset Found")
+        self.resize(500, 380)
+        
+        # --- Light/Dark Dynamic Adaptation ---
+        is_dark = True
+        if parent and hasattr(parent, 'main_app') and hasattr(parent.main_app, 'theme_combo'):
+            is_dark = parent.main_app.theme_combo.currentText() == "Dark"
+        else:
+            is_dark = QApplication.palette().window().color().lightness() < 128
+            
+        bg_col = "#161b22" if is_dark else "#f6f8fa"
+        lbl_col = "#c9d1d9" if is_dark else "#24292f"
+        txt_col = "#8b949e" if is_dark else "#57606a" # FIX: Adapts the subtext to the theme
+        
+        self.setStyleSheet(f"""
+            QDialog {{ background-color: {bg_col}; color: {lbl_col}; }}
+            QLabel, QCheckBox, QRadioButton {{ color: {lbl_col}; }}
+        """)
         
         layout = QVBoxLayout(self)
-        lbl = QLabel(f"<b>Found {total_rows:,} matching records.</b><br><br>Loading huge amounts of rows into the UI grid will consume RAM and reduce performance. How many rows would you like to render in the table?<br><br><span style='color:#e3b341;'><i>(Note: Maps and Analytics process 100% of the data instantly if Fast Mode is OFF).</i></span>")
+        
+        # Applied the dynamic text color here
+        lbl = QLabel(f"<div style='text-align:center;'><b style='font-size:16px; color:#58a6ff;'>Found {total_rows:,} matching records.</b><br><br><span style='color:{txt_col};'>Loading massive amounts of rows into the UI grid consumes RAM. Visual Maps and Charts will process 100% of the data regardless. How would you like to render the Table?</span></div>")
         lbl.setWordWrap(True)
         layout.addWidget(lbl)
         
         self.radio_group = QButtonGroup(self)
         self.rb_rec = QRadioButton(f"Recommended (First {min(1000, total_rows)} rows)")
         self.rb_rec.setChecked(True)
-        self.rb_first_half = QRadioButton(f"First Half ({total_rows // 2} rows)")
-        self.rb_last_half = QRadioButton(f"Last Half ({total_rows - (total_rows // 2)} rows)")
-        self.rb_all = QRadioButton(f"All Rows ({total_rows}) - ⚠️ May cause UI stutter")
+        self.rb_parts = QRadioButton("Break into Parts")
+        self.rb_custom = QRadioButton("Custom Range")
+        self.rb_all = QRadioButton(f"All Rows ({total_rows}) - ⚠️ May stutter")
+        self.rb_all.setStyleSheet("color: #d29922;") # Adjusted for better contrast on both themes
         self.rb_none = QRadioButton("0 Rows (Maximum Speed - Maps & Charts Only)")
         
-        for i, rb in enumerate([self.rb_rec, self.rb_first_half, self.rb_last_half, self.rb_all, self.rb_none]):
+        for i, rb in enumerate([self.rb_rec, self.rb_parts, self.rb_custom, self.rb_all, self.rb_none]):
             self.radio_group.addButton(rb, i)
             layout.addWidget(rb)
             
+        custom_grp = QWidget()
+        custom_lay = QGridLayout(custom_grp)
+        custom_lay.setContentsMargins(25, 0, 0, 0)
+        
+        lbl_p = QLabel("Divide into chunks of:"); lbl_p.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.spin_parts = QSpinBox(); self.spin_parts.setRange(2, 100); self.spin_parts.setValue(5)
+        self.spin_parts.setFixedWidth(80)
+        custom_lay.addWidget(lbl_p, 0, 0)
+        custom_lay.addWidget(self.spin_parts, 0, 1)
+        
+        lbl_f = QLabel("From Row:"); lbl_f.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.spin_from = QSpinBox(); self.spin_from.setRange(1, total_rows); self.spin_from.setValue(1)
+        self.spin_from.setFixedWidth(80)
+        
+        lbl_t = QLabel("To Row:"); lbl_t.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.spin_to = QSpinBox(); self.spin_to.setRange(1, total_rows); self.spin_to.setValue(min(5000, total_rows))
+        self.spin_to.setFixedWidth(80)
+        
+        custom_lay.addWidget(lbl_f, 1, 0); custom_lay.addWidget(self.spin_from, 1, 1)
+        custom_lay.addWidget(lbl_t, 1, 2); custom_lay.addWidget(self.spin_to, 1, 3)
+        layout.addWidget(custom_grp)
+        
+        self.chk_lazy = QCheckBox("Enable Lazy Walk (Smoothly load more rows as you scroll)")
+        self.chk_lazy.setChecked(True)
+        self.chk_lazy.setStyleSheet("margin-top: 10px; color: #3fb950; font-weight: bold;")
+        layout.addWidget(self.chk_lazy)
+        
         btn_box = QHBoxLayout()
+        btn_cancel = QPushButton("Abort Search")
+        btn_cancel.setStyleSheet("background-color: #f85149; color: white; font-weight: bold; padding: 10px; border-radius: 4px;")
+        btn_cancel.clicked.connect(self.reject)
+        
         btn_ok = QPushButton("Render Data")
-        btn_ok.setStyleSheet("background-color: #2ea043; color: white; font-weight: bold; padding: 8px; border-radius: 4px;")
+        btn_ok.setStyleSheet("background-color: #2ea043; color: white; font-weight: bold; padding: 10px; border-radius: 4px;")
         btn_ok.clicked.connect(self.accept)
+        
+        btn_box.addWidget(btn_cancel)
         btn_box.addWidget(btn_ok)
         layout.addLayout(btn_box)
 
     def get_values(self):
         idx = self.radio_group.checkedId()
-        if idx == 0: return 0, min(1000, self.total_rows)
-        elif idx == 1: return 0, self.total_rows // 2
-        elif idx == 2: return self.total_rows // 2, self.total_rows
-        elif idx == 3: return 0, self.total_rows
-        elif idx == 4: return 0, 0
+        lazy = self.chk_lazy.isChecked()
+        if idx == 0: return 0, min(1000, self.total_rows), lazy
+        elif idx == 1: 
+            chunk = max(1, self.total_rows // self.spin_parts.value())
+            return 0, chunk, lazy
+        elif idx == 2: return max(0, self.spin_from.value() - 1), self.spin_to.value(), lazy
+        elif idx == 3: return 0, self.total_rows, lazy
+        elif idx == 4: return 0, 0, False
 
 
 class NumericTableItem(QTableWidgetItem):
@@ -211,10 +913,12 @@ class SearchWorker(QThread):
                 if "category" in cols: selects.append("category")
                 else: selects.append("'Others' as category")
                 
-                # --- NEW: Safely query SHA-256 ---
                 if "sha256" in cols: selects.append("sha256")
                 elif "hash" in cols: selects.append("hash as sha256")
                 else: selects.append("'' as sha256")
+                
+                if "creation_date" in cols: selects.append("creation_date")
+                else: selects.append("modified as creation_date")
                 
                 query = f"SELECT {', '.join(selects)} FROM virtual_fs WHERE 1=1"
                 sql_params = []
@@ -230,9 +934,12 @@ class SearchWorker(QThread):
                         
                 if self.p['path']: query += " AND parent_path LIKE ?"; sql_params.append(f"%{self.p['path']}%")
                 
-                if self.p.get('category', 'All') != "All":
-                    query += " AND category = ?"
-                    sql_params.append(self.p['category'])
+                if self.p.get('tags'):
+                    for tg in self.p['tags']:
+                        query += " AND custom_tags LIKE ?"
+                        sql_params.append(f"%{tg}%")
+                
+                target_cat = self.p.get('category', 'All')
                 
                 if self.p.get('ex_names'):
                     for ex_n in self.p['ex_names']:
@@ -240,44 +947,111 @@ class SearchWorker(QThread):
                         sql_params.append(f"%{ex_n}%")
                     
                 cur.execute(query, sql_params)
-                raw_results = cur.fetchall()
                 
-                total = len(raw_results)
+                scanned = 0
                 last_dir = "" 
                 
-                for idx, row_data in enumerate(raw_results):
-                    if not self.is_running:
-                        self.results_ready.emit(all_results)
-                        self.finished_search.emit(True)
-                        return
-                        
-                    # UPDATE to 12 items:
-                    db_id, name, p_path, is_fldr, size, ext, modified, real_path, tags, color_tag, category_val, sha256_val = row_data
+                time_s_str = self.p['time_start']
+                time_e_str = self.p['time_end']
+                
+                # FIX: Properly map the day string to integer indexes (0=Monday, 6=Sunday)
+                days_map = {"Monday": 0, "Tuesday": 1, "Wednesday": 2, "Thursday": 3, "Friday": 4, "Saturday": 5, "Sunday": 6}
+                day_start_idx = days_map.get(self.p['day_start'], 0)
+                day_end_idx = days_map.get(self.p['day_end'], 6)
+                use_day_range = self.p['use_day_range']
+                
+                lvl_min = self.p['lvl_min']
+                lvl_max = self.p['lvl_max']
+                
+                seen_patterns = set()
+                
+                while True:
+                    if not self.is_running: break
+                    chunk = cur.fetchmany(10000)
+                    if not chunk: break
                     
-                    if self.p.get('verbose', False) and p_path != last_dir:
-                        self.telemetry_update.emit(p_path)
-                        last_dir = p_path
+                    for row_data in chunk:
+                        db_id, name, p_path, is_fldr, size, ext, modified, real_path, tags, color_tag, category_val, sha256_val, creation_date = row_data
                         
-                    ext_val = str(ext).lower() if ext else ""
-                    size_val = size or 0
-                    
-                    is_match = True
-                    if self.p['exts'] and ext_val not in self.p['exts']: is_match = False
-                    elif self.p['ex_exts'] and ext_val in self.p['ex_exts']: is_match = False
-                    elif not is_fldr and not (self.p['sz_min'] <= size_val <= self.p['sz_max']): is_match = False
-                    elif self.p['use_date'] and modified:
-                        try:
-                            mod_date = QDate.fromString(modified.split()[0], "yyyy-MM-dd")
-                            if mod_date < self.p['date_start'] or mod_date > self.p['date_end']: is_match = False
-                        except: pass
+                        ext_val = str(ext).lower() if ext else ""
+                        size_val = size or 0
                         
-                    if is_match:
-                        # UPDATE to 12 items:
-                        all_results.append((db_id, name, p_path, ext_val, size_val, modified, is_fldr, real_path, tags, color_tag, category_val, sha256_val))
+                        cat_val = EXT_TO_CAT.get(ext_val, category_val)
+                        if target_cat != "All" and cat_val != target_cat: continue
+                            
+                        lvl = max(0, str(p_path).strip('/').count('/'))
+                        if not (lvl_min <= lvl <= lvl_max): continue
                         
-                    if idx % 800 == 0 or idx == total - 1:
-                        if total > 0: self.progress_update.emit(int((idx / total) * 100))
+                        if self.p.get('verbose', False) and p_path != last_dir:
+                            self.telemetry_update.emit(p_path)
+                            last_dir = p_path
                         
+                        is_match = True
+                        if self.p['exts'] and ext_val not in self.p['exts']: is_match = False
+                        elif self.p['ex_exts'] and ext_val in self.p['ex_exts']: is_match = False
+                        elif not is_fldr and not (self.p['sz_min'] <= size_val <= self.p['sz_max']): is_match = False
+                        
+                        target_dt_str = str(creation_date) if self.p['date_type'] == "Created Date" else str(modified)
+                        
+                        if self.p['use_date']:
+                            if not target_dt_str or len(target_dt_str) < 10:
+                                is_match = False
+                            else:
+                                try:
+                                    y, m, d = map(int, target_dt_str[:10].split('-'))
+                                    dt_obj = QDate(y, m, d)
+                                    if dt_obj < self.p['date_start'] or dt_obj > self.p['date_end']: 
+                                        is_match = False
+                                except: 
+                                    is_match = False
+
+                        # FIX: Day Range Logic accurately bounds the week
+                        if is_match and use_day_range and target_dt_str and len(target_dt_str) >= 10:
+                            try:
+                                y, m, d = map(int, target_dt_str[:10].split('-'))
+                                d_idx = datetime.date(y, m, d).weekday() # 0 is Monday
+                                if day_start_idx <= day_end_idx:
+                                    if not (day_start_idx <= d_idx <= day_end_idx): is_match = False
+                                else:
+                                    # Handles wraparound ranges like Friday (4) to Monday (0)
+                                    if not (d_idx >= day_start_idx or d_idx <= day_end_idx): is_match = False
+                            except:
+                                is_match = False
+                                
+                        if is_match and self.p['use_time'] and target_dt_str and len(target_dt_str) >= 16:
+                            try:
+                                t_part = target_dt_str[11:16]
+                                if time_s_str <= time_e_str:
+                                    if not (time_s_str <= t_part <= time_e_str): is_match = False
+                                else:
+                                    if not (t_part >= time_s_str or t_part <= time_e_str): is_match = False
+                            except: pass
+                            
+                        # High-Speed Unique Pattern Logic (4-chars match prefix/suffix)
+                        if is_match and self.p['unique_patterns'] and not is_fldr:
+                            base_name = str(name).rsplit('.', 1)[0].lower() if '.' in str(name) else str(name).lower()
+                            if len(base_name) >= 4:
+                                pref = base_name[:4] + "_" + ext_val
+                                suff = base_name[-4:] + "_" + ext_val
+                                if pref in seen_patterns or suff in seen_patterns:
+                                    is_match = False
+                                else:
+                                    seen_patterns.add(pref)
+                                    seen_patterns.add(suff)
+                            else:
+                                pat = base_name + "_" + ext_val
+                                if pat in seen_patterns:
+                                    is_match = False
+                                else:
+                                    seen_patterns.add(pat)
+
+                        if is_match:
+                            all_results.append((db_id, name, p_path, ext_val, size_val, target_dt_str, is_fldr, real_path, tags, color_tag, cat_val, sha256_val))
+                            
+                        scanned += 1
+                        if scanned % 1500 == 0:
+                            self.progress_update.emit(min(99, int((scanned / max(1, scanned+10000)) * 100)))
+                            
         except Exception as e:
             print(f"Search Error: {e}")
             
@@ -292,25 +1066,42 @@ class AdvancedSearchWindow(QMainWindow):
         self.active_db = active_db
         self.main_app = parent
         self.is_searching = False
+        self.is_rendering = False
         self._abort_render = False 
         
-        # Load Persistent Settings
         self.settings = QSettings("VirtualMan", "AdvancedSearchUI")
         self.show_icons = self.settings.value("show_icons", True, type=bool)
-        
         self.verbose_telemetry = self.settings.value("verbose_telemetry", False, type=bool) 
         self.fast_mode = self.settings.value("fast_mode", False, type=bool)
         
         self.map_color_mode = self.settings.value("map_color_mode", "Intensity (Count)")
         self.map_gradient = self.settings.value("map_gradient", "Excel (Green-Yellow-Red)")
         self.map_layout_mode = self.settings.value("map_layout_mode", "True Calendar Standard (3x4 Grids)")
+        
+        self.time_color_mode = self.settings.value("time_color_mode", "Intensity (Count)")
+        self.time_layout_mode = self.settings.value("time_layout_mode", "Compact Matrix")
+        self.time_show_lines = self.settings.value("time_show_lines", False, type=bool)
+        
         self.map_sort_order = self.settings.value("map_sort_order", "Top to Bottom (Newest First)")
         self.map_tile_size = self.settings.value("map_tile_size", "Large (1.2x)") 
         self.map_custom_scale = float(self.settings.value("map_custom_scale", 1.2))
-        self.map_top_margin = float(self.settings.value("map_top_margin", 78.0)) # Default changed to 78.0
+        self.map_top_margin = float(self.settings.value("map_top_margin", 78.0)) 
+        
+        self.map_highlight_color = self.settings.value("map_highlight_color", "#b8860b")
+        self.map_highlight_size = float(self.settings.value("map_highlight_size", 2.0))
+        self.map_highlight_field = self.settings.value("map_highlight_field", "Name or Path")
+        self.map_highlight_type = self.settings.value("map_highlight_type", "Files & Folders")
+        self.map_show_dates = self.settings.value("map_show_dates", True, type=bool)
+        self.dup_bg_mode = self.settings.value("dup_bg_mode", "Muted Blue Intensity")
+        self._show_highlight_dialog = False
+        
+        self.table_view_mode = "Files & Folders"
         
         self.current_results = []
         self.matrix_cache = defaultdict(lambda: defaultdict(list))
+        self.time_matrix_cache = defaultdict(lambda: defaultdict(list))
+        self.inherited_tags = {}
+        self.duplicate_map = {}
         self.max_hits = 1
         
         self.VMAN_COLORS = {
@@ -325,8 +1116,8 @@ class AdvancedSearchWindow(QMainWindow):
         self.icon_cache = {}
         self.icon_provider = QFileIconProvider()
         
-        self.setWindowTitle("Search It!")
-        self.resize(1050, 650)
+        self.setWindowTitle("🔍 VMan Search Engine")
+        self.resize(1250, 850)
         self.setAttribute(Qt.WA_DeleteOnClose, False)
         
         central = QWidget()
@@ -335,32 +1126,49 @@ class AdvancedSearchWindow(QMainWindow):
         main_layout.setSpacing(8)
         main_layout.setContentsMargins(10, 10, 10, 10)
 
-        # --- TOP AREA (GLASS BUTTONS) ---
+        # --- TOP WRAPPER ---
+        self.top_wrap = QWidget()
+        top_wrap_lay = QVBoxLayout(self.top_wrap)
+        top_wrap_lay.setContentsMargins(0, 0, 0, 0)
+        top_wrap_lay.setSpacing(5)
+
+        # --- TOP AREA (SYMBOLIC GLASS BUTTONS) ---
         top_bar = QHBoxLayout()
         self.txt_name = QLineEdit()
-        self.txt_name.setPlaceholderText("Search file or folder name...")
-        self.txt_name.setStyleSheet("font-size: 15px; padding: 10px;")
+        self.txt_name.setPlaceholderText("Search file or folder name (Alt+S)...")
+        self.txt_name.setFixedHeight(40)
+        self.txt_name.setStyleSheet("font-size: 15px; padding: 0px 10px;")
         
-        self.btn_scope = QPushButton("Location & Target")
-        self.btn_type = QPushButton("File Types")
-        self.btn_metrics = QPushButton("Attributes & Time")
+        self.btn_scope = QPushButton("🎯")
+        self.btn_type = QPushButton("📂")
+        self.btn_metrics = QPushButton("⚙️")
+        self.btn_reset = QPushButton("⟲")
         
-        for btn in [self.btn_scope, self.btn_type, self.btn_metrics]:
-            btn.setCheckable(True)
-            btn.toggled.connect(self.update_filter_visibility)
+        self.btn_scope.setToolTip("Target Scope & Tags")
+        self.btn_type.setToolTip("File Types & Categories")
+        self.btn_metrics.setToolTip("Attributes & Time")
+        self.btn_reset.setToolTip("Reset All Filters")
+        self.btn_reset.clicked.connect(self.reset_filters)
+        
+        for btn in [self.btn_scope, self.btn_type, self.btn_metrics, self.btn_reset]:
+            btn.setFixedSize(40, 40)
+            if btn != self.btn_reset:
+                btn.setCheckable(True)
+                btn.toggled.connect(self.update_filter_visibility)
 
         self.btn_search = QPushButton("⚡ SEARCH")
-        self.btn_search.setFixedWidth(150)
+        self.btn_search.setFixedSize(110, 40)
         self.btn_search.clicked.connect(self.handle_button_action)
 
         top_bar.addWidget(self.txt_name, stretch=1)
         top_bar.addWidget(self.btn_scope)
         top_bar.addWidget(self.btn_type)
         top_bar.addWidget(self.btn_metrics)
+        top_bar.addWidget(self.btn_reset)
         top_bar.addWidget(self.btn_search)
-        main_layout.addLayout(top_bar)
+        top_wrap_lay.addLayout(top_bar)
 
-        # --- DYNAMIC HORIZONTAL FILTER CARDS ---
+        # --- DYNAMIC FILTER CARDS ---
         self.filters_container = QWidget()
         self.filters_container.setVisible(False) 
         filters_h_layout = QHBoxLayout(self.filters_container)
@@ -373,114 +1181,143 @@ class AdvancedSearchWindow(QMainWindow):
         self.combo_match = QComboBox(); self.combo_match.addItems(["Contains", "Exact", "Starts With", "Ends With"])
         self.combo_look_for = QComboBox(); self.combo_look_for.addItems(["Files & Folders", "Files Only", "Folders Only"])
         self.txt_path = QLineEdit(); self.txt_path.setPlaceholderText("e.g. /Documents/")
-        f1.addRow("Match Mode:", self.combo_match); f1.addRow("Data Type:", self.combo_look_for); f1.addRow("Virtual Path:", self.txt_path)
+        self.txt_search_tags = QLineEdit(); self.txt_search_tags.setPlaceholderText("e.g. holiday, work")
+        self.chk_unique = QCheckBox("Show Unique Name Patterns Only")
+        f1.addRow("Match Mode:", self.combo_match); f1.addRow("Data Type:", self.combo_look_for)
+        f1.addRow("Virtual Path:", self.txt_path); f1.addRow("Search Tags:", self.txt_search_tags)
+        f1.addRow("", self.chk_unique)
         filters_h_layout.addWidget(self.card_scope)
 
         self.card_type = QFrame(); self.card_type.setObjectName("FilterCard"); self.card_type.setVisible(False)
         self.card_type.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         f2 = QFormLayout(self.card_type); f2.setContentsMargins(15, 15, 15, 15); f2.setVerticalSpacing(10)
+        self.combo_category = QComboBox()
+        self.combo_category.addItems(["All", "Images", "Videos", "Audio", "Documents", "Code", "Archives", "Others"])
         self.txt_ext = QLineEdit(); self.txt_ext.setPlaceholderText(".jpg, .pdf")
         self.txt_exclude_ext = QLineEdit(); self.txt_exclude_ext.setPlaceholderText(".tmp, .bak")
         self.txt_exclude_name = QLineEdit(); self.txt_exclude_name.setPlaceholderText("e.g. backup, temp")
-        f2.addRow("Include Ext:", self.txt_ext); f2.addRow("Exclude Ext:", self.txt_exclude_ext); f2.addRow("Skip Names:", self.txt_exclude_name)
+        
+        lvl_lay = QHBoxLayout()
+        self.spin_lvl_min = QSpinBox(); self.spin_lvl_min.setRange(0, 999)
+        self.spin_lvl_max = QSpinBox(); self.spin_lvl_max.setRange(0, 999); self.spin_lvl_max.setValue(999)
+        to_lbl_lvl = QLabel("to"); to_lbl_lvl.setAlignment(Qt.AlignCenter)
+        lvl_lay.addWidget(self.spin_lvl_min); lvl_lay.addWidget(to_lbl_lvl); lvl_lay.addWidget(self.spin_lvl_max)
+        
+        f2.addRow("Category:", self.combo_category); f2.addRow("Include Ext:", self.txt_ext)
+        f2.addRow("Exclude Ext:", self.txt_exclude_ext); f2.addRow("Skip Names:", self.txt_exclude_name)
+        f2.addRow("Level Range:", lvl_lay)
         filters_h_layout.addWidget(self.card_type)
 
         self.card_metrics = QFrame(); self.card_metrics.setObjectName("FilterCard"); self.card_metrics.setVisible(False)
-        self.card_metrics.setFixedWidth(420) 
-        f3 = QFormLayout(self.card_metrics); f3.setContentsMargins(15, 15, 15, 15); f3.setVerticalSpacing(10)
+        self.card_metrics.setFixedWidth(400) 
+        f3 = QFormLayout(self.card_metrics); f3.setContentsMargins(15, 15, 15, 15); f3.setVerticalSpacing(8)
+
+        size_lay = QHBoxLayout(); size_lay.setContentsMargins(0,0,0,0)
+        self.spin_size_min = QDoubleSpinBox(); self.spin_size_min.setRange(0, 999999); self.spin_size_min.setDecimals(1); self.spin_size_min.setButtonSymbols(QDoubleSpinBox.NoButtons)
+        self.spin_size_max = QDoubleSpinBox(); self.spin_size_max.setRange(0, 999999); self.spin_size_max.setValue(999999); self.spin_size_max.setDecimals(1); self.spin_size_max.setButtonSymbols(QDoubleSpinBox.NoButtons)
+        self.combo_sz_unit = QComboBox(); self.combo_sz_unit.addItems(["MB", "B", "KB", "GB"]); self.combo_sz_unit.setFixedWidth(50)
+        to_lbl1 = QLabel("to"); to_lbl1.setAlignment(Qt.AlignCenter)
+        size_lay.addWidget(self.spin_size_min); size_lay.addWidget(to_lbl1); size_lay.addWidget(self.spin_size_max); size_lay.addWidget(self.combo_sz_unit)
+
+        self.combo_date_type = QComboBox(); self.combo_date_type.addItems(["Modified Date", "Created Date"])
         
-        self.combo_category = QComboBox()
-        self.combo_category.addItems(["All", "Images", "Videos", "Audio", "Documents", "Code", "Archives", "Others"])
-        f3.addRow("Category:", self.combo_category)
-
-        size_lay = QHBoxLayout()
-        self.spin_size_min = QDoubleSpinBox(); self.spin_size_min.setRange(0, 999999); self.spin_size_min.setDecimals(2); self.spin_size_min.setButtonSymbols(QDoubleSpinBox.NoButtons)
-        self.spin_size_max = QDoubleSpinBox(); self.spin_size_max.setRange(0, 999999); self.spin_size_max.setValue(999999); self.spin_size_max.setDecimals(2); self.spin_size_max.setButtonSymbols(QDoubleSpinBox.NoButtons)
-        self.combo_sz_unit = QComboBox(); self.combo_sz_unit.addItems(["MB", "B", "KB", "GB"])
-        self.combo_sz_unit.setFixedWidth(55)
-        size_lay.addWidget(self.spin_size_min); size_lay.addWidget(QLabel("to")); size_lay.addWidget(self.spin_size_max); size_lay.addWidget(self.combo_sz_unit)
-
-        date_lay = QHBoxLayout()
+        date_lay = QHBoxLayout(); date_lay.setContentsMargins(0,0,0,0)
         self.chk_use_date = QCheckBox("")
         self.date_start = QDateEdit(QDate.currentDate().addYears(-1)); self.date_start.setCalendarPopup(True); self.date_start.setEnabled(False)
         self.date_end = QDateEdit(QDate.currentDate()); self.date_end.setCalendarPopup(True); self.date_end.setEnabled(False)
         self.chk_use_date.toggled.connect(self.date_start.setEnabled); self.chk_use_date.toggled.connect(self.date_end.setEnabled)
-        date_lay.addWidget(self.chk_use_date); date_lay.addWidget(self.date_start); date_lay.addWidget(QLabel("to")); date_lay.addWidget(self.date_end)
+        to_lbl2 = QLabel("to"); to_lbl2.setAlignment(Qt.AlignCenter)
+        date_lay.addWidget(self.chk_use_date); date_lay.addWidget(self.date_start); date_lay.addWidget(to_lbl2); date_lay.addWidget(self.date_end)
         
-        f3.addRow("File Size:", size_lay); f3.addRow("Modified:", date_lay)
+        time_lay = QHBoxLayout(); time_lay.setContentsMargins(0,0,0,0)
+        self.chk_use_time = QCheckBox("")
+        self.time_start = QTimeEdit(QTime(0, 0)); self.time_start.setEnabled(False)
+        self.time_end = QTimeEdit(QTime(23, 59)); self.time_end.setEnabled(False)
+        self.chk_use_time.toggled.connect(self.time_start.setEnabled); self.chk_use_time.toggled.connect(self.time_end.setEnabled)
+        to_lbl3 = QLabel("to"); to_lbl3.setAlignment(Qt.AlignCenter)
+        time_lay.addWidget(self.chk_use_time); time_lay.addWidget(self.time_start); time_lay.addWidget(to_lbl3); time_lay.addWidget(self.time_end)
+        
+        day_lay = QHBoxLayout(); day_lay.setContentsMargins(0,0,0,0)
+        self.chk_day_range = QCheckBox("")
+        self.combo_day_start = QComboBox()
+        self.combo_day_end = QComboBox()
+        days_list = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+        self.combo_day_start.addItems(days_list)
+        self.combo_day_end.addItems(days_list)
+        self.combo_day_end.setCurrentIndex(6)
+        self.combo_day_start.setEnabled(False); self.combo_day_end.setEnabled(False)
+        self.chk_day_range.toggled.connect(self.combo_day_start.setEnabled)
+        self.chk_day_range.toggled.connect(self.combo_day_end.setEnabled)
+        to_lbl4 = QLabel("to"); to_lbl4.setAlignment(Qt.AlignCenter)
+        day_lay.addWidget(self.chk_day_range); day_lay.addWidget(self.combo_day_start); day_lay.addWidget(to_lbl4); day_lay.addWidget(self.combo_day_end)
+        
+        f3.addRow("File Size:", size_lay)
+        f3.addRow("Date Type:", self.combo_date_type)
+        f3.addRow("Date Range:", date_lay)
+        f3.addRow("Time Range:", time_lay)
+        f3.addRow("Day Range:", day_lay)
         filters_h_layout.addWidget(self.card_metrics)
-        main_layout.addWidget(self.filters_container)
+        top_wrap_lay.addWidget(self.filters_container)
 
-        for box in [self.txt_name, self.txt_path, self.txt_ext, self.txt_exclude_ext, self.txt_exclude_name]:
+        main_layout.addWidget(self.top_wrap)
+
+        for box in [self.txt_name, self.txt_path, self.txt_search_tags, self.txt_ext, self.txt_exclude_ext, self.txt_exclude_name]:
             box.returnPressed.connect(self.handle_button_action)
 
         self.progress = QProgressBar(); self.progress.setVisible(False)
-        self.progress.setFixedHeight(18) 
-        self.progress.setTextVisible(True) 
-        self.progress.setAlignment(Qt.AlignCenter)
-        self.progress.setStyleSheet("""
-            QProgressBar { border: 1px solid #30363d; border-radius: 4px; background-color: #0d1117; color: white; font-weight: bold; }
-            QProgressBar::chunk { background-color: #1f6feb; border-radius: 3px; }
-        """)
+        self.progress.setFixedHeight(18); self.progress.setTextVisible(True); self.progress.setAlignment(Qt.AlignCenter)
         main_layout.addWidget(self.progress)
         
         self.lbl_status = QLabel("Ready."); self.lbl_status.setStyleSheet("color: #8b949e; font-style: italic; padding-left: 5px;")
+        self.lbl_status.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.lbl_status.customContextMenuRequested.connect(self.show_top_context_menu)
         main_layout.addWidget(self.lbl_status)
 
         self.tabs = QTabWidget()
-        self.tabs.setStyleSheet("""
-            QTabBar::tab { background: #161b22; color: #8b949e; padding: 10px 15px; border: 1px solid #30363d; border-top-left-radius: 4px; border-top-right-radius: 4px; }
-            QTabBar::tab:selected { background: #0d1117; color: #58a6ff; font-weight: bold; border-bottom: 2px solid #58a6ff; }
-            QTabWidget::pane { border: 1px solid #30363d; top: -1px; border-radius: 8px; border-top-left-radius: 0px; }
-        """)
         
         # --- TAB 1: RESULTS TABLE ---
-        tab1_container = QWidget()
-        tab1_layout = QVBoxLayout(tab1_container)
-        tab1_layout.setContentsMargins(0, 0, 0, 0)
-        tab1_layout.setSpacing(5)
-        
-        self.local_filter_input = QLineEdit()
-        self.local_filter_input.setPlaceholderText(" Quick Filter: Type to instantly filter current results by Name or Virtual Path...")
+        tab1_container = QWidget(); tab1_layout = QVBoxLayout(tab1_container); tab1_layout.setContentsMargins(0, 0, 0, 0); tab1_layout.setSpacing(5)
+        quick_lay = QHBoxLayout()
+        self.local_filter_input = QLineEdit(); self.local_filter_input.setPlaceholderText("🔍 Quick Filter (Alt+F): Name or Path...")
         self.local_filter_input.textChanged.connect(self.apply_local_filter)
-        tab1_layout.addWidget(self.local_filter_input)
+        self.local_tag_filter_input = QLineEdit(); self.local_tag_filter_input.setPlaceholderText("🏷️ Quick Filter (Alt+T): Tags...")
+        self.local_tag_filter_input.textChanged.connect(self.apply_local_filter)
+        quick_lay.addWidget(self.local_filter_input); quick_lay.addWidget(self.local_tag_filter_input)
+        tab1_layout.addLayout(quick_lay)
         
         self.table = QTableWidget(0, 9)
-        self.table.setHorizontalHeaderLabels(["S.No.", "Name", "Virtual Path", "Type", "Size", "Modified", "Labels", "SHA-256", "HiddenMeta"])
+        self.table.setHorizontalHeaderLabels(["S.No.", "Name", "Virtual Path", "Type", "Size", "Date", "Labels", "SHA-256", "HiddenMeta"])
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         self.table.setColumnWidth(0, 50); self.table.setColumnWidth(1, 280); self.table.setColumnWidth(2, 280)
-        self.table.setColumnWidth(3, 120); self.table.setColumnWidth(4, 90); self.table.setColumnWidth(5, 140); self.table.setColumnWidth(6, 120)
-        self.table.setColumnWidth(7, 200)
-        
+        self.table.setColumnWidth(3, 120); self.table.setColumnWidth(4, 90); self.table.setColumnWidth(5, 140); self.table.setColumnWidth(6, 120); self.table.setColumnWidth(7, 200)
         self.table.horizontalHeader().setStretchLastSection(True)
-        self.table.setSortingEnabled(True) 
-        self.table.setSelectionBehavior(QTableWidget.SelectRows)
-        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
-        self.table.setShowGrid(False)
-        self.table.verticalHeader().setVisible(False)
-        self.table.setIconSize(QSize(20, 20))
-        
+        self.table.setSortingEnabled(True); self.table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.table.setEditTriggers(QTableWidget.NoEditTriggers); self.table.setShowGrid(False)
+        self.table.verticalHeader().setVisible(False); self.table.setIconSize(QSize(20, 20))
         self.table.itemDoubleClicked.connect(self.handle_double_click)
         self.table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self.show_context_menu)
         self.table.horizontalHeader().setContextMenuPolicy(Qt.CustomContextMenu)
         self.table.horizontalHeader().customContextMenuRequested.connect(self.show_header_menu)
-        
-        tab1_layout.addWidget(self.table)
-        self.tabs.addTab(tab1_container, "📋 Search Results")
+        tab1_layout.addWidget(self.table); self.tabs.addTab(tab1_container, "📋 Search Results")
 
         # --- TAB 2: VISUAL GRID MAP ---
+        map_tab_container = QWidget(); map_tab_layout = QVBoxLayout(map_tab_container); map_tab_layout.setContentsMargins(0, 0, 0, 0); map_tab_layout.setSpacing(5)
+        map_quick_lay = QHBoxLayout()
+        self.map_highlight_input = QLineEdit(); self.map_highlight_input.setPlaceholderText("🔍 Map Highlight (Alt+M): Name/Path (Press Enter)...")
+        self.map_highlight_input.returnPressed.connect(self.trigger_map_highlight)
+        self.map_tag_highlight_input = QLineEdit(); self.map_tag_highlight_input.setPlaceholderText("🏷️ Map Highlight (Alt+N): Enter Tag to Border Tiles (Press Enter)...")
+        self.map_tag_highlight_input.returnPressed.connect(self.trigger_map_highlight)
+        map_quick_lay.addWidget(self.map_highlight_input); map_quick_lay.addWidget(self.map_tag_highlight_input)
+        map_tab_layout.addLayout(map_quick_lay)
+
         self.map_scroll = QScrollArea()
-        self.map_scroll.setWidgetResizable(True)
-        self.map_scroll.setFrameShape(QScrollArea.NoFrame)
+        self.map_scroll.setWidgetResizable(True); self.map_scroll.setFrameShape(QScrollArea.NoFrame)
         self.map_scroll.setAlignment(Qt.AlignTop | Qt.AlignHCenter)
         self.map_scroll.setContextMenuPolicy(Qt.CustomContextMenu)
         self.map_scroll.customContextMenuRequested.connect(self.show_map_context_menu)
         
-        map_widget = QWidget()
-        map_lay = QVBoxLayout(map_widget)
-        map_lay.setContentsMargins(0, 0, 0, 0)
-        
+        map_widget = QWidget(); map_lay = QVBoxLayout(map_widget); map_lay.setContentsMargins(0, 0, 0, 0)
         if MATPLOTLIB_AVAILABLE:
             self.figure_map = Figure(dpi=100)
             self.canvas_map = FigureCanvas(self.figure_map)
@@ -490,30 +1327,63 @@ class AdvancedSearchWindow(QMainWindow):
             self.canvas_map.wheelEvent = lambda event: self.map_scroll.wheelEvent(event)
             map_lay.addWidget(self.canvas_map, alignment=Qt.AlignTop | Qt.AlignHCenter)
         else:
-            self.figure_map = None
-            lbl = QLabel("Matplotlib is required.")
-            map_lay.addWidget(lbl)
+            self.figure_map = None; map_lay.addWidget(QLabel("Matplotlib is required."))
             
-        self.map_scroll.setWidget(map_widget)
-        self.tabs.addTab(self.map_scroll, "🗺️ Visual Grid Map")
-
-        # --- TAB 3: ADVANCED SEARCH ANALYTICS ---
-        chart_widget = QWidget()
-        chart_lay = QVBoxLayout(chart_widget)
-        chart_lay.setContentsMargins(10, 10, 10, 10)
+        self.map_scroll.setWidget(map_widget); map_tab_layout.addWidget(self.map_scroll); self.tabs.addTab(map_tab_container, "🗺️ Visual Grid Map")
         
+        # --- TAB 3: 24 HOUR TIME HEATMAP ---
+        time_widget = QWidget(); time_lay = QVBoxLayout(time_widget); time_lay.setContentsMargins(10, 10, 10, 10)
+        self.time_scroll = QScrollArea()
+        self.time_scroll.setWidgetResizable(True); self.time_scroll.setFrameShape(QScrollArea.NoFrame)
+        self.time_scroll.setAlignment(Qt.AlignTop | Qt.AlignHCenter)
+        self.time_scroll.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.time_scroll.customContextMenuRequested.connect(self.show_time_context_menu)
+        
+        tmap_w = QWidget(); tmap_l = QVBoxLayout(tmap_w); tmap_l.setContentsMargins(0,0,0,0)
+        if MATPLOTLIB_AVAILABLE:
+            self.figure_time = Figure(dpi=100)
+            self.canvas_time = FigureCanvas(self.figure_time)
+            self.canvas_time.setContextMenuPolicy(Qt.CustomContextMenu)
+            self.canvas_time.customContextMenuRequested.connect(self.show_time_context_menu)
+            self.canvas_time.mpl_connect('button_press_event', self.on_time_click)
+            self.canvas_time.wheelEvent = lambda event: self.time_scroll.wheelEvent(event)
+            tmap_l.addWidget(self.canvas_time, alignment=Qt.AlignTop | Qt.AlignHCenter)
+        else:
+            self.figure_time = None; tmap_l.addWidget(QLabel("Matplotlib is required."))
+            
+        self.time_scroll.setWidget(tmap_w); time_lay.addWidget(self.time_scroll, stretch=1)
+        self.tabs.addTab(time_widget, "🕒 Time Heatmap")
+
+        # --- TAB 4: ADVANCED SEARCH ANALYTICS ---
+        chart_widget = QWidget(); chart_lay = QVBoxLayout(chart_widget); chart_lay.setContentsMargins(10, 10, 10, 10)
         c_top = QHBoxLayout()
         self.combo_chart_metric = QComboBox()
         self.combo_chart_metric.addItems([
-            "By Extension (Count)", "By Extension (Size MB)", 
             "By Category (Count)", "By Category (Size MB)", 
-            "By Tags (Count)", "By Tags (Size MB)",
+            "By Extension (Count)", "By Extension (Size MB)", 
+            "By Tags (Count)", "By Tags (Size MB)", "By Tags (Size MB - Flat)",
             "By Virtual Path (Count)", "By Virtual Path (Size MB)", 
-            "By Year (Count)", "By Year (Size MB)"
+            "By Year (Count)", "By Year (Size MB)",
+            "By Month (Count)", "By Month (Size MB)",
+            "By Week (Count)", "By Week (Size MB)",
+            "By Day (Count)", "By Day (Size MB)",
+            "By Date (Count)", "By Date (Size MB)",
+            "By 24-Hour Time (Count)", "By 24-Hour Time (Size MB)"
         ])
-        self.combo_chart_metric.currentTextChanged.connect(self.render_analytics)
-        c_top.addWidget(QLabel("<b>Chart Metric:</b>"))
-        c_top.addWidget(self.combo_chart_metric, stretch=1)
+        
+        self.combo_chart_sort = QComboBox()
+        self.combo_chart_sort.addItems([
+            "Sort: Value (High to Low)",
+            "Sort: Value (Low to High)",
+            "Sort: Name/Time (Descending)",
+            "Sort: Name/Time (Ascending)"
+        ])
+        
+        self.combo_chart_metric.currentTextChanged.connect(self.safe_render_analytics)
+        self.combo_chart_sort.currentTextChanged.connect(self.safe_render_analytics)
+        
+        c_top.addWidget(QLabel("<b>Chart Metric:</b>")); c_top.addWidget(self.combo_chart_metric, stretch=1)
+        c_top.addWidget(QLabel("<b>Order:</b>")); c_top.addWidget(self.combo_chart_sort, stretch=1)
         chart_lay.addLayout(c_top)
         
         if MATPLOTLIB_AVAILABLE:
@@ -521,36 +1391,41 @@ class AdvancedSearchWindow(QMainWindow):
             self.canvas_chart = FigureCanvas(self.figure_chart)
             self.canvas_chart.setContextMenuPolicy(Qt.CustomContextMenu)
             self.canvas_chart.customContextMenuRequested.connect(self.show_chart_context_menu)
-            self.canvas_chart.wheelEvent = lambda event: event.ignore()
             chart_lay.addWidget(self.canvas_chart, stretch=1)
         else:
             self.figure_chart = None
             
         self.tabs.addTab(chart_widget, "📊 Search Analytics")
 
-        # --- TAB 4: SIMPLE DIRECTORY SCANNER ---
-        telemetry_widget = QWidget()
-        tele_lay = QVBoxLayout(telemetry_widget)
-        tele_lay.setContentsMargins(10, 10, 10, 10)
-        
-        self.txt_tele_log = QPlainTextEdit()
-        self.txt_tele_log.setReadOnly(True)
+        # --- TAB 5: SIMPLE DIRECTORY SCANNER ---
+        telemetry_widget = QWidget(); tele_lay = QVBoxLayout(telemetry_widget); tele_lay.setContentsMargins(10, 10, 10, 10)
+        self.txt_tele_log = QPlainTextEdit(); self.txt_tele_log.setReadOnly(True)
         self.txt_tele_log.setContextMenuPolicy(Qt.CustomContextMenu)
         self.txt_tele_log.customContextMenuRequested.connect(self.show_telemetry_context_menu)
-        
-        self.txt_tele_log.setStyleSheet("""
-            QPlainTextEdit { background-color: #0d1117; color: #8b949e; font-family: Consolas, monospace; border: 1px solid #30363d; border-radius: 6px; padding: 10px; }
-            QScrollBar:vertical { border: none; background: #0d1117; width: 8px; margin: 0px; }
-            QScrollBar::handle:vertical { background: #30363d; border-radius: 4px; min-height: 20px; }
-            QScrollBar::handle:vertical:hover { background: #58a6ff; }
-            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { border: none; background: none; height: 0px; }
-        """)
-        
-        tele_lay.addWidget(QLabel("Live Directory Path Tracing:"))
-        tele_lay.addWidget(self.txt_tele_log)
+        tele_lay.addWidget(QLabel("Live Directory Path Tracing:")); tele_lay.addWidget(self.txt_tele_log)
         self.tabs.addTab(telemetry_widget, "📡 Live Scanner")
 
         main_layout.addWidget(self.tabs, stretch=1)
+
+        # --- SAFE SHORTCUTS ---
+        QShortcut(QKeySequence("Alt+h"), self).activated.connect(self.safe_toggle_zen)
+        QShortcut(QKeySequence("Ctrl+h"), self).activated.connect(self.toggle_zen_mode)
+        QShortcut(QKeySequence("Alt+f"), self).activated.connect(lambda: self.safe_focus_filter("name"))
+        QShortcut(QKeySequence("Ctrl+f"), self).activated.connect(lambda: self.force_focus_filter("name"))
+        QShortcut(QKeySequence("Alt+t"), self).activated.connect(lambda: self.safe_focus_filter("tag"))
+        QShortcut(QKeySequence("Ctrl+t"), self).activated.connect(lambda: self.force_focus_filter("tag"))
+        QShortcut(QKeySequence("Alt+m"), self).activated.connect(lambda: self.safe_focus_filter("mname"))
+        QShortcut(QKeySequence("Ctrl+m"), self).activated.connect(lambda: self.force_focus_filter("mname"))
+        QShortcut(QKeySequence("Alt+n"), self).activated.connect(lambda: self.safe_focus_filter("mtag"))
+        QShortcut(QKeySequence("Ctrl+n"), self).activated.connect(lambda: self.force_focus_filter("mtag"))
+        QShortcut(QKeySequence("Alt+s"), self).activated.connect(self.safe_focus_search)
+        QShortcut(QKeySequence("Ctrl+s"), self).activated.connect(self.txt_name.setFocus)
+        QShortcut(QKeySequence("Alt+c"), self).activated.connect(self.safe_trigger_context)
+        QShortcut(QKeySequence("Ctrl+c"), self).activated.connect(self.trigger_context_menu_shortcut)
+        QShortcut(QKeySequence("Alt+e"), self).activated.connect(self.safe_focus_viewport)
+        for i in range(1, 6):
+            QShortcut(QKeySequence(f"Alt+{i}"), self).activated.connect(lambda idx=i-1: self.safe_switch_tab(idx))
+            QShortcut(QKeySequence(f"Ctrl+{i}"), self).activated.connect(lambda idx=i-1: self.force_switch_tab(idx))
 
         self.apply_theme()
         
@@ -559,40 +1434,242 @@ class AdvancedSearchWindow(QMainWindow):
             self.table.horizontalHeader().restoreState(saved_state)
         else:
             self.table.setColumnHidden(0, True) 
-            self.table.setColumnHidden(7, True) # Hide SHA-256 by default to save screen space
-            self.table.setColumnHidden(8, True) # HiddenMeta moved to index 8
+            self.table.setColumnHidden(7, True) 
+            self.table.setColumnHidden(8, True) 
+
+    def check_lazy_load(self, value):
+        if not getattr(self, '_lazy_enabled', False) or self.is_searching or self.is_rendering: return
+        scrollbar = self.table.verticalScrollBar()
+        if value >= scrollbar.maximum() - 5: 
+            current_rows = self.table.rowCount()
+            total = len(self.current_results)
+            if current_rows < total:
+                end_idx = min(current_rows + 500, total)
+                chunk = self.current_results[current_rows:end_idx]
+                
+                self.table.setUpdatesEnabled(False)
+                for i, (db_id, name, p_path, ext, size, mod, is_fldr, real_path, tags, color_tag, cat_val, sha256_val) in enumerate(chunk):
+                    if self._abort_render: break
+                    row = current_rows + i
+                    self.table.insertRow(row)
+                    
+                    sno_item = NumericTableItem(str(row + 1)); sno_item.setData(Qt.UserRole, row + 1)
+                    self.table.setItem(row, 0, sno_item)
+                    
+                    name_item = QTableWidgetItem(name)
+                    name_item.setIcon(self.get_icon(is_fldr, name, ext, db_id))
+                    if color_tag and color_tag in self.VMAN_COLORS: 
+                        name_item.setBackground(QBrush(self.VMAN_COLORS[color_tag])) 
+                        name_item.setForeground(QColor("#ffffff")) 
+                    self.table.setItem(row, 1, name_item)
+                    self.table.setItem(row, 2, QTableWidgetItem(p_path))
+                    
+                    type_str = "Folder" if is_fldr else (ext[1:].upper() + " File" if ext.startswith(".") else (ext.upper() + " File" if ext else "File"))
+                    self.table.setItem(row, 3, QTableWidgetItem(type_str))
+                    
+                    sz_str = "--" if is_fldr else self.human_size(size)
+                    sz_item = NumericTableItem(sz_str); sz_item.setData(Qt.UserRole, size if not is_fldr else -1)
+                    self.table.setItem(row, 4, sz_item)
+                    self.table.setItem(row, 5, QTableWidgetItem(str(mod)))
+                    
+                    eff_tag = tags if tags else self.inherited_tags.get(db_id, "")
+                    self.table.setItem(row, 6, QTableWidgetItem(str(eff_tag) if eff_tag else ""))
+                    
+                    sha_item = QTableWidgetItem(str(sha256_val) if sha256_val else "--")
+                    sha_item.setForeground(QColor("#8b949e"))
+                    self.table.setItem(row, 7, sha_item)
+                    
+                    meta_item = QTableWidgetItem("")
+                    meta_item.setData(Qt.UserRole, {'id': db_id, 'is_fldr': is_fldr, 'real_path': real_path, 'tags': eff_tag, 'size': size, 'mod': mod, 'name': name})
+                    self.table.setItem(row, 8, meta_item)
+                self.table.setUpdatesEnabled(True)
+
+    def is_typing(self):
+        fw = QApplication.focusWidget()
+        return isinstance(fw, (QLineEdit, QPlainTextEdit, QComboBox, QDoubleSpinBox, QSpinBox, QDateEdit, QTimeEdit))
+
+    def safe_toggle_zen(self):
+        if not self.is_typing(): self.toggle_zen_mode()
+            
+    def safe_focus_search(self):
+        if not self.is_typing(): self.txt_name.setFocus()
+
+    def safe_focus_filter(self, ftype):
+        if self.is_typing(): return
+        self.force_focus_filter(ftype)
+
+    def force_focus_filter(self, ftype):
+        idx = self.tabs.currentIndex()
+        if ftype == "name" and idx == 0: self.local_filter_input.setFocus()
+        elif ftype == "tag" and idx == 0: self.local_tag_filter_input.setFocus()
+        elif ftype == "mname" or (ftype == "name" and idx in [1, 2]): self.map_highlight_input.setFocus()
+        elif ftype == "mtag" or (ftype == "tag" and idx in [1, 2]): self.map_tag_highlight_input.setFocus()
+
+    def safe_trigger_context(self):
+        if not self.is_typing(): self.trigger_context_menu_shortcut()
+
+    def safe_switch_tab(self, idx):
+        if not self.is_typing(): self.force_switch_tab(idx)
+            
+    def force_switch_tab(self, idx):
+        self.tabs.setCurrentIndex(idx)
+        self.safe_focus_viewport()
+        
+    def safe_focus_viewport(self):
+        idx = self.tabs.currentIndex()
+        if idx == 0: self.table.setFocus()
+        elif idx == 1: self.map_scroll.setFocus()
+        elif idx == 2: self.time_scroll.setFocus()
+        elif idx == 3: self.tabs.widget(3).setFocus()
+        elif idx == 4: self.txt_tele_log.setFocus()
+
+    def trigger_context_menu_shortcut(self):
+        idx = self.tabs.currentIndex()
+        if idx == 0: 
+            if self.table.selectedItems():
+                rect = self.table.visualItemRect(self.table.selectedItems()[0])
+                pos = self.table.viewport().mapToGlobal(rect.center())
+                self.show_context_menu(self.table.viewport().mapFromGlobal(pos))
+            else:
+                pos = self.table.viewport().mapToGlobal(self.table.rect().center())
+                self.show_context_menu(self.table.viewport().mapFromGlobal(pos))
+        elif idx == 1: self.show_map_context_menu(QCursor.pos())
+        elif idx == 2: self.show_time_context_menu(QCursor.pos())
+        elif idx == 3: self.show_chart_context_menu(QCursor.pos())
+        elif idx == 4: self.show_telemetry_context_menu(QCursor.pos())
+
+    def toggle_ui_visibility(self):
+        self.top_wrap.setVisible(not self.top_wrap.isVisible())
+
+    def toggle_zen_mode(self):
+        state = not self.top_wrap.isVisible()
+        self.top_wrap.setVisible(state)
+        self.lbl_status.setVisible(state)
+        self.tabs.tabBar().setVisible(state)
+
+    def trigger_map_highlight(self):
+        self._show_highlight_dialog = True
+        self.safe_render_map()
+        self.safe_render_time_heatmap()
+        self._show_highlight_dialog = False
+
+    def reset_filters(self):
+        self.txt_name.clear()
+        self.txt_path.clear()
+        self.txt_search_tags.clear()
+        self.txt_ext.clear()
+        self.txt_exclude_ext.clear()
+        self.txt_exclude_name.clear()
+        self.combo_category.setCurrentIndex(0)
+        self.combo_match.setCurrentIndex(0)
+        self.combo_look_for.setCurrentIndex(0)
+        self.chk_use_date.setChecked(False)
+        self.chk_use_time.setChecked(False)
+        self.spin_size_min.setValue(0)
+        self.spin_size_max.setValue(999999)
+        self.chk_unique.setChecked(False)
+        self.chk_day_range.setChecked(False)
+        self.spin_lvl_min.setValue(0)
+        self.spin_lvl_max.setValue(999)
+
+    def apply_local_filter(self):
+        name_path_text = self.local_filter_input.text().lower()
+        tag_text = self.local_tag_filter_input.text().lower()
+        self.table.setUpdatesEnabled(False) 
+        
+        for row in range(self.table.rowCount()):
+            item_name = self.table.item(row, 1)
+            item_path = self.table.item(row, 2)
+            item_tags = self.table.item(row, 6)
+            item_meta = self.table.item(row, 8)
+            
+            if not item_name or not item_path or not item_tags or not item_meta: continue
+            
+            m_data = item_meta.data(Qt.UserRole)
+            is_fldr = m_data.get('is_fldr', False)
+            
+            if self.table_view_mode == "Files Only" and is_fldr:
+                self.table.setRowHidden(row, True)
+                continue
+            if self.table_view_mode == "Folders Only" and not is_fldr:
+                self.table.setRowHidden(row, True)
+                continue
+            
+            match_np = (not name_path_text) or (name_path_text in item_name.text().lower() or name_path_text in item_path.text().lower())
+            match_tag = (not tag_text) or (tag_text in item_tags.text().lower())
+            
+            self.table.setRowHidden(row, not (match_np and match_tag))
+            
+        self.table.setUpdatesEnabled(True)
 
     def _build_matrix_cache(self, files):
         self.matrix_cache = defaultdict(lambda: defaultdict(list))
+        self.time_matrix_cache = defaultdict(lambda: defaultdict(list))
         self.max_hits = 1
+        
+        self.inherited_tags = {}
+        folder_tags = { f"{r[2]}{r[1]}/": r[8] for r in files if r[6] and r[8] }
+        sorted_folders = sorted(folder_tags.keys(), key=len, reverse=True)
+        
         for r in files:
-            if r[6]: continue 
+            if not r[6] and not r[8]:
+                p = r[2]
+                for f_path in sorted_folders:
+                    if p.startswith(f_path):
+                        self.inherited_tags[r[0]] = folder_tags[f_path]
+                        break
+                        
+        self.duplicate_map = {}
+        hash_groups = defaultdict(list)
+        for r in files:
+            if r[11]: hash_groups[r[11]].append(r)
+            
+        for h, items in hash_groups.items():
+            if len(items) > 1:
+                items_sorted = sorted(items, key=lambda x: str(x[5]))
+                self.duplicate_map[items_sorted[0][0]] = "Original"
+                for item in items_sorted[1:]:
+                    self.duplicate_map[item[0]] = "Duplicate"
+        
+        for r in files:
             mod_str = str(r[5])
             if len(mod_str) >= 10:
                 ym = mod_str[:7]
                 try: day = int(mod_str[8:10])
                 except: continue
                 
-                meta = {'ext': r[3], 'cat': r[10] if r[10] else "Others", 'tag': r[8], 'size': r[4] or 0} 
+                eff_tag = r[8] if r[8] else self.inherited_tags.get(r[0], "")
+                meta = {
+                    'id': r[0], 'ext': r[3], 'cat': r[10] if r[10] else "Others", 
+                    'tag_exact': r[8], 'tag_inherited': eff_tag, 
+                    'size': r[4] or 0, 'name': r[1].lower(), 'path': r[2].lower(), 'is_fldr': r[6],
+                    'dup_status': self.duplicate_map.get(r[0], "Unique"), 'mod_full': mod_str
+                } 
                 self.matrix_cache[ym][day].append(meta)
                 if len(self.matrix_cache[ym][day]) > self.max_hits: 
                     self.max_hits = len(self.matrix_cache[ym][day])
-
-    def apply_local_filter(self, text):
-        search_text = text.lower()
-        self.table.setUpdatesEnabled(False) # Prevents UI stutter while filtering
-        
-        for row in range(self.table.rowCount()):
-            item_name = self.table.item(row, 1)
-            item_path = self.table.item(row, 2)
-            
-            if item_name and item_path:
-                match = search_text in item_name.text().lower() or search_text in item_path.text().lower()
-                self.table.setRowHidden(row, not match)
-                
-        self.table.setUpdatesEnabled(True)
+                    
+                if len(mod_str) >= 16:
+                    try:
+                        hh = int(mod_str[11:13]); mm = int(mod_str[14:16])
+                        b = hh + (0.5 if mm >= 30 else 0.0)
+                        self.time_matrix_cache[ym][b].append(meta)
+                    except: pass
 
     # --- Context Menus ---
+    def show_top_context_menu(self, pos):
+        menu = QMenu(self)
+        
+        act_refresh = menu.addAction("🔄 Refresh Entire Search Engine")
+        act_refresh.triggered.connect(self.trigger_search)
+        
+        menu.addSeparator()
+        
+        act_toggle = menu.addAction("👁️ Toggle Search Box & Buttons")
+        act_toggle.triggered.connect(self.toggle_ui_visibility)
+        
+        menu.exec(QCursor.pos())
+
     def show_telemetry_context_menu(self, pos):
         menu = QMenu(self)
         act_toggle = menu.addAction("Enable Live Directory Tracing (Impacts Performance)")
@@ -612,6 +1689,105 @@ class AdvancedSearchWindow(QMainWindow):
         menu = QMenu(self)
         act_save = menu.addAction("💾 Save Chart as Image")
         act_save.triggered.connect(lambda: self.save_canvas_as_image(self.figure_chart, "Analytics_Chart"))
+        menu.exec(QCursor.pos())
+
+    def _build_color_menu(self, menu, mode_attr, callback):
+        color_menu = menu.addMenu("🎨 Map Color Mode")
+        act = color_menu.addAction("By Duplicates")
+        act.setCheckable(True); act.setChecked(getattr(self, mode_attr) == "By Duplicates")
+        act.triggered.connect(lambda checked=False: callback("By Duplicates"))
+        
+        color_menu.addSeparator()
+        m_int = color_menu.addMenu("Intensity")
+        for m in ["Intensity (Count)", "Intensity (Size MB)"]:
+            act = m_int.addAction(m.replace("Intensity ", ""))
+            act.setCheckable(True); act.setChecked(getattr(self, mode_attr) == m)
+            act.triggered.connect(lambda checked=False, mode=m: callback(mode))
+            
+        m_cat = color_menu.addMenu("Category")
+        for m in ["Category Simple (Count)", "Category Simple (Size MB)", "Category Gradient (Count)", "Category Gradient (Size MB)"]:
+            act = m_cat.addAction(m.replace("Category ", ""))
+            act.setCheckable(True); act.setChecked(getattr(self, mode_attr) == m)
+            act.triggered.connect(lambda checked=False, mode=m: callback(mode))
+            
+        m_ext = color_menu.addMenu("Extension")
+        for m in ["Extension Simple (Count)", "Extension Simple (Size MB)", "Extension Gradient (Count)", "Extension Gradient (Size MB)"]:
+            act = m_ext.addAction(m.replace("Extension ", ""))
+            act.setCheckable(True); act.setChecked(getattr(self, mode_attr) == m)
+            act.triggered.connect(lambda checked=False, mode=m: callback(mode))
+            
+        m_tag = color_menu.addMenu("Tag")
+        for m in ["Tag Simple (Count)", "Tag Simple (Size MB)", "Tag Simple (Size MB - Flat)", "Tag Gradient (Count)", "Tag Gradient (Size MB)", "Tag Gradient (Size MB - Flat)"]:
+            act = m_tag.addAction(m.replace("Tag ", ""))
+            act.setCheckable(True); act.setChecked(getattr(self, mode_attr) == m)
+            act.triggered.connect(lambda checked=False, mode=m: callback(mode))
+
+        color_menu.addSeparator()
+        bg_menu = color_menu.addMenu("🖼️ Untagged / Unique Background...")
+        for bg_mode in ["Muted Blue Intensity", "Gray Intensity", "Solid Dark Blue", "Solid Dark Gray", "Hidden (Empty)", "Custom Intensity..."]:
+            bg_act = bg_menu.addAction(bg_mode)
+            bg_act.setCheckable(True)
+            bg_act.setChecked(getattr(self, 'dup_bg_mode', "Muted Blue Intensity") == bg_mode)
+            bg_act.triggered.connect(lambda checked=False, m=bg_mode: self.change_dup_bg_mode(m))
+
+    def change_dup_bg_mode(self, mode):
+        if mode == "Custom Intensity...":
+            QMessageBox.information(self, "Custom Background", "This mode uses the 'Low Intensity' and 'High Intensity' Base/Peak colors defined in 'Customize Map Colors'.")
+            self.open_color_config()
+        self.dup_bg_mode = mode
+        self.settings.setValue("dup_bg_mode", mode)
+        self.safe_render_map()
+        self.safe_render_time_heatmap()
+
+    def show_time_context_menu(self, pos):
+        menu = QMenu(self)
+        act_save = menu.addAction("💾 Save Time Map as Image")
+        act_save.triggered.connect(lambda: self.save_canvas_as_image(self.figure_time, "Time_Map"))
+        menu.addSeparator()
+        
+        layout_menu = menu.addMenu("🗓️ Time Layout Mode")
+        for mode in ["Compact Matrix", "Segmented Years"]:
+            act = layout_menu.addAction(mode)
+            act.setCheckable(True)
+            act.setChecked(self.time_layout_mode == mode)
+            act.triggered.connect(lambda checked=False, m=mode: self.change_time_layout(m))
+            
+        act_lines = menu.addAction("Show 6-Hour Vertical Dividers")
+        act_lines.setCheckable(True)
+        act_lines.setChecked(self.time_show_lines)
+        act_lines.triggered.connect(self.toggle_time_lines)
+        
+        hl_menu = menu.addMenu("🔦 Highlight Settings")
+        fld_menu = hl_menu.addMenu("Match Field")
+        for f in ["Name or Path", "Name Only", "Path Only"]:
+            act = fld_menu.addAction(f)
+            act.setCheckable(True)
+            act.setChecked(self.map_highlight_field == f)
+            act.triggered.connect(lambda checked=False, val=f: self.change_map_highlight_setting('field', val))
+            
+        typ_menu = hl_menu.addMenu("Target Type")
+        for t in ["Files & Folders", "Files Only", "Folders Only"]:
+            act = typ_menu.addAction(t)
+            act.setCheckable(True)
+            act.setChecked(self.map_highlight_type == t)
+            act.triggered.connect(lambda checked=False, val=t: self.change_map_highlight_setting('type', val))
+            
+        hl_menu.addSeparator()
+        act_hl_col = hl_menu.addAction("🎨 Border Color...")
+        act_hl_col.triggered.connect(self.change_map_highlight_color)
+        act_hl_size = hl_menu.addAction("📏 Border Size...")
+        act_hl_size.triggered.connect(self.change_map_highlight_size)
+        
+        menu.addSeparator()
+        self._build_color_menu(menu, 'time_color_mode', self.change_time_mode)
+        
+        menu.addSeparator()
+        grad_menu = menu.addMenu("🌈 Gradient Color (Intensity Mode)")
+        for grad in ["Fire", "Green", "Blue", "Yellow", "Excel (Green-Yellow-Red)", "Custom..."]:
+            act = grad_menu.addAction(grad)
+            act.setCheckable(True)
+            act.setChecked(self.map_gradient == grad)
+            act.triggered.connect(lambda checked=False, g=grad: self.change_map_gradient(g))
         menu.exec(QCursor.pos())
 
     def show_map_context_menu(self, pos):
@@ -639,6 +1815,32 @@ class AdvancedSearchWindow(QMainWindow):
             act.setChecked(self.map_layout_mode == mode)
             act.triggered.connect(lambda checked=False, m=mode: self.change_map_layout(m))
             
+        act_dates = layout_menu.addAction("Show Dates in Tiles")
+        act_dates.setCheckable(True)
+        act_dates.setChecked(self.map_show_dates)
+        act_dates.triggered.connect(self.toggle_map_dates)
+            
+        hl_menu = menu.addMenu("🔦 Highlight Settings")
+        fld_menu = hl_menu.addMenu("Match Field")
+        for f in ["Name or Path", "Name Only", "Path Only"]:
+            act = fld_menu.addAction(f)
+            act.setCheckable(True)
+            act.setChecked(self.map_highlight_field == f)
+            act.triggered.connect(lambda checked=False, val=f: self.change_map_highlight_setting('field', val))
+            
+        typ_menu = hl_menu.addMenu("Target Type")
+        for t in ["Files & Folders", "Files Only", "Folders Only"]:
+            act = typ_menu.addAction(t)
+            act.setCheckable(True)
+            act.setChecked(self.map_highlight_type == t)
+            act.triggered.connect(lambda checked=False, val=t: self.change_map_highlight_setting('type', val))
+            
+        hl_menu.addSeparator()
+        act_hl_col = hl_menu.addAction("🎨 Border Color...")
+        act_hl_col.triggered.connect(self.change_map_highlight_color)
+        act_hl_size = hl_menu.addAction("📏 Border Size...")
+        act_hl_size.triggered.connect(self.change_map_highlight_size)
+            
         menu.addSeparator()
         
         sort_menu = menu.addMenu("🔄 Sort Direction")
@@ -661,19 +1863,7 @@ class AdvancedSearchWindow(QMainWindow):
         act_margin.triggered.connect(self.adjust_top_margin)
             
         menu.addSeparator()
-        
-        color_menu = menu.addMenu("🎨 Map Color Mode")
-        color_modes = [
-            "Intensity (Count)", "Intensity (Size)", 
-            "By Category Color (Count)", "By Category Color (Size)",
-            "By Extension Color (Count)", "By Extension Color (Size)",
-            "By Tag Color (Count)", "By Tag Color (Size)"
-        ]
-        for mode in color_modes:
-            act = color_menu.addAction(mode)
-            act.setCheckable(True)
-            act.setChecked(self.map_color_mode == mode)
-            act.triggered.connect(lambda checked=False, m=mode: self.change_map_mode(m))
+        self._build_color_menu(menu, 'map_color_mode', self.change_map_mode)
             
         menu.addSeparator()
         grad_menu = menu.addMenu("🌈 Gradient Color (Intensity Mode)")
@@ -685,17 +1875,61 @@ class AdvancedSearchWindow(QMainWindow):
             
         menu.exec(QCursor.pos())
         
+    def toggle_map_dates(self, checked):
+        self.map_show_dates = checked
+        self.settings.setValue("map_show_dates", checked)
+        self.safe_render_map()
+        
+    def toggle_time_lines(self, checked):
+        self.time_show_lines = checked
+        self.settings.setValue("time_show_lines", checked)
+        self.safe_render_time_heatmap()
+
+    def change_time_layout(self, layout):
+        self.time_layout_mode = layout
+        self.settings.setValue("time_layout_mode", layout)
+        self.safe_render_time_heatmap()
+
+    def change_map_highlight_setting(self, stype, val):
+        if stype == 'field':
+            self.map_highlight_field = val
+            self.settings.setValue("map_highlight_field", val)
+        elif stype == 'type':
+            self.map_highlight_type = val
+            self.settings.setValue("map_highlight_type", val)
+        self.safe_render_map()
+        self.safe_render_time_heatmap()
+        
+    def change_map_highlight_color(self):
+        color = QColorDialog.getColor(QColor(self.map_highlight_color), self, "Select Border Color")
+        if color.isValid():
+            self.map_highlight_color = color.name()
+            self.settings.setValue("map_highlight_color", color.name())
+            self.safe_render_map()
+            self.safe_render_time_heatmap()
+            
+    def change_map_highlight_size(self):
+        val, ok = QInputDialog.getDouble(self, "Border Size", "Enter border thickness:", self.map_highlight_size, 0.5, 10.0, 1)
+        if ok:
+            self.map_highlight_size = val
+            self.settings.setValue("map_highlight_size", val)
+            self.safe_render_map()
+            self.safe_render_time_heatmap()
+        
     def open_color_config(self):
-        dlg = MapColorConfigDialog(self)
+        dlg = MapColorConfigDialog(self.current_results, self)
         if dlg.exec() == QDialog.Accepted:
-            self.render_grid_map()
+            self.safe_render_map()
+            self.safe_render_analytics()
+            self.safe_render_time_heatmap()
             
     def adjust_top_margin(self):
         val, ok = QInputDialog.getDouble(self, "Adjust Top Margin", "Enter top padding value (0 to obliterate space, 78 is default):", self.map_top_margin, 0, 200, 1)
         if ok:
             self.map_top_margin = val
             self.settings.setValue("map_top_margin", val)
-            self.render_grid_map()
+            self.safe_render_map()
+            self.safe_render_time_heatmap()
         
     def save_canvas_as_image(self, figure, prefix):
         if not figure: return
@@ -705,7 +1939,7 @@ class AdvancedSearchWindow(QMainWindow):
             prog.setWindowTitle("Saving Image")
             prog.setWindowModality(Qt.WindowModal)
             prog.show()
-            for _ in range(5): QApplication.processEvents() 
+            QApplication.processEvents(); QThread.msleep(50); QApplication.processEvents()
             try:
                 figure.savefig(path, bbox_inches='tight', dpi=300)
                 prog.close()
@@ -718,13 +1952,14 @@ class AdvancedSearchWindow(QMainWindow):
         self.map_layout_mode = layout
         self.settings.setValue("map_layout_mode", layout)
         self.lbl_status.setText(f"✅ Map layout changed to: {layout}")
-        self.render_grid_map()
+        self.safe_render_map()
         
     def change_map_sort(self, order):
         self.map_sort_order = order
         self.settings.setValue("map_sort_order", order)
         self.lbl_status.setText(f"✅ Sort order changed to: {order}")
-        self.render_grid_map()
+        self.safe_render_map()
+        self.safe_render_time_heatmap()
         
     def change_map_size(self, size):
         if size == "Custom...":
@@ -735,18 +1970,26 @@ class AdvancedSearchWindow(QMainWindow):
                 self.settings.setValue("map_custom_scale", val)
                 self.settings.setValue("map_tile_size", "Custom...")
                 self.lbl_status.setText(f"✅ Map tile size scaled to: {val}x")
-                self.render_grid_map()
+                self.safe_render_map()
+                self.safe_render_time_heatmap()
         else:
             self.map_tile_size = size
             self.settings.setValue("map_tile_size", size)
             self.lbl_status.setText(f"✅ Map tile size changed to: {size}")
-            self.render_grid_map()
+            self.safe_render_map()
+            self.safe_render_time_heatmap()
         
     def change_map_mode(self, mode):
         self.map_color_mode = mode
         self.settings.setValue("map_color_mode", mode)
         self.lbl_status.setText(f"✅ Map color mode changed to: {mode}")
-        self.render_grid_map()
+        self.safe_render_map()
+        
+    def change_time_mode(self, mode):
+        self.time_color_mode = mode
+        self.settings.setValue("time_color_mode", mode)
+        self.lbl_status.setText(f"✅ Time color mode changed to: {mode}")
+        self.safe_render_time_heatmap()
         
     def change_map_gradient(self, grad):
         if grad == "Custom...":
@@ -754,9 +1997,10 @@ class AdvancedSearchWindow(QMainWindow):
             self.open_color_config()
         self.map_gradient = grad
         self.settings.setValue("map_gradient", grad)
-        if "Intensity" in self.map_color_mode:
+        if "Intensity" in self.map_color_mode or self.map_color_mode == "By Duplicates":
             self.lbl_status.setText(f"✅ Map intensity gradient changed to: {grad}")
-            self.render_grid_map()
+            self.safe_render_map()
+            self.safe_render_time_heatmap()
             
     def toggle_fast_mode(self, checked):
         self.fast_mode = checked
@@ -767,11 +2011,18 @@ class AdvancedSearchWindow(QMainWindow):
     def trigger_search(self):
         if not self.active_db or not os.path.exists(self.active_db): return QMessageBox.warning(self, "No Database", "No active database found.")
         self.is_searching = True
+        self.is_rendering = False
         self._abort_render = False
         self.set_button_style("running")
+        QApplication.processEvents() 
+        
         self.table.setSortingEnabled(False)
         self.table.setRowCount(0)
-        self.local_filter_input.clear() # --- ADD THIS LINE ---
+        self.local_filter_input.clear()
+        self.local_tag_filter_input.clear()
+        self.map_highlight_input.clear()
+        self.map_tag_highlight_input.clear()
+        
         self.progress.setVisible(True)
         self.progress.setValue(0)
         self.lbl_status.setText("Searching...")
@@ -782,6 +2033,7 @@ class AdvancedSearchWindow(QMainWindow):
 
         params = {
             'name': self.txt_name.text().strip(), 'path': self.txt_path.text().strip(),
+            'tags': [t.strip().lower() for t in self.txt_search_tags.text().split(',') if t.strip()],
             'match': self.combo_match.currentText(), 'look_for': self.combo_look_for.currentText(),
             'exts': [e.strip().lower() for e in self.txt_ext.text().split(',') if e.strip()],
             'ex_exts': [e.strip().lower() for e in self.txt_exclude_ext.text().split(',') if e.strip()],
@@ -789,14 +2041,22 @@ class AdvancedSearchWindow(QMainWindow):
             'category': getattr(self, 'combo_category', QComboBox()).currentText() if hasattr(self, 'combo_category') else "All",
             'sz_min': self.spin_size_min.value() * mult, 'sz_max': self.spin_size_max.value() * mult,
             'use_date': self.chk_use_date.isChecked(), 'date_start': self.date_start.date(), 'date_end': self.date_end.date(),
+            'date_type': self.combo_date_type.currentText(),
+            'use_time': self.chk_use_time.isChecked(),
+            'time_start': self.time_start.time().toString("HH:mm"),
+            'time_end': self.time_end.time().toString("HH:mm"),
+            'use_day_range': self.chk_day_range.isChecked(),
+            'day_start': self.combo_day_start.currentText(),
+            'day_end': self.combo_day_end.currentText(),
+            'lvl_min': self.spin_lvl_min.value(),
+            'lvl_max': self.spin_lvl_max.value(),
+            'unique_patterns': getattr(self.chk_unique, 'isChecked', lambda: False)(),
             'verbose': self.verbose_telemetry,
             'db': self.active_db
         }
         self.worker = SearchWorker(params)
         self.worker.progress_update.connect(self.progress.setValue)
         self.worker.results_ready.connect(self.store_and_populate)
-        self.worker.finished_search.connect(self.search_complete)
-        self.worker.telemetry_update.connect(self.update_telemetry)
         self.worker.start()
 
     def store_and_populate(self, results):
@@ -804,18 +2064,44 @@ class AdvancedSearchWindow(QMainWindow):
         self.current_results = results
         total = len(results)
         start_idx, end_idx = 0, total
+        self._lazy_enabled = False 
         
-        if total > 1500:
+        unique_exts = set(r[3] for r in results)
+        if unique_exts and not self._abort_render:
+            dlg = ExtFilterDialog(unique_exts, self)
+            if dlg.exec() == QDialog.Accepted:
+                allowed = dlg.get_allowed()
+                results = [r for r in results if r[3] in allowed]
+                self.current_results = results
+                total = len(results)
+                end_idx = total
+        
+        if total > 1500 and not self._abort_render:
             dlg = RowLimitDialogSearch(total, self)
             if dlg.exec() == QDialog.Accepted:
-                start_idx, end_idx = dlg.get_values()
+                start_idx, end_idx, self._lazy_enabled = dlg.get_values()
             else:
-                start_idx, end_idx = 0, 0 
+                self.lbl_status.setText("Search Aborted by User.")
+                self.is_searching = False
+                self.set_button_style("idle")
+                return
                 
-        if not self.fast_mode:
+        # Safely connect lazy loader to scrollbar without triggering Qt RuntimeWarnings
+        if getattr(self, '_lazy_connected', False):
+            try: self.table.verticalScrollBar().valueChanged.disconnect(self.check_lazy_load)
+            except: pass
+            
+        if getattr(self, '_lazy_enabled', False):
+            self.table.verticalScrollBar().valueChanged.connect(self.check_lazy_load)
+            self._lazy_connected = True
+        else:
+            self._lazy_connected = False
+            
+        if not self.fast_mode and not self._abort_render:
             self._build_matrix_cache(results)
-            self.render_grid_map()
-            self.render_analytics()
+            self.safe_render_map()
+            self.safe_render_time_heatmap()
+            self.safe_render_analytics()
         else:
             if self.figure_map:
                 self.figure_map.clear()
@@ -825,7 +2111,12 @@ class AdvancedSearchWindow(QMainWindow):
                 self.figure_chart.clear()
                 self.figure_chart.add_subplot(111).text(0.5, 0.5, "⚡ Fast Mode is ON\nAnalytics rendering is disabled for maximum speed.", ha='center', va='center', color='gray')
                 self.canvas_chart.draw()
+            if self.figure_time:
+                self.figure_time.clear()
+                self.figure_time.add_subplot(111).text(0.5, 0.5, "⚡ Fast Mode is ON", ha='center', va='center', color='gray')
+                self.canvas_time.draw()
                 
+        self.is_rendering = True       
         self.populate_table(results[start_idx:end_idx], total)
 
     def update_telemetry(self, p_path):
@@ -842,12 +2133,21 @@ class AdvancedSearchWindow(QMainWindow):
         self.settings.setValue("table_state", self.table.horizontalHeader().saveState())
         self.settings.setValue("show_icons", self.show_icons)
         self.settings.setValue("map_layout_mode", self.map_layout_mode)
+        self.settings.setValue("time_layout_mode", self.time_layout_mode)
+        self.settings.setValue("time_color_mode", getattr(self, 'time_color_mode', "Intensity (Count)"))
+        self.settings.setValue("time_show_lines", getattr(self, 'time_show_lines', False))
         self.settings.setValue("map_color_mode", self.map_color_mode)
         self.settings.setValue("map_gradient", self.map_gradient)
         self.settings.setValue("map_sort_order", self.map_sort_order)
         self.settings.setValue("map_tile_size", self.map_tile_size)
         self.settings.setValue("map_custom_scale", self.map_custom_scale)
         self.settings.setValue("map_top_margin", self.map_top_margin)
+        self.settings.setValue("map_highlight_field", self.map_highlight_field)
+        self.settings.setValue("map_highlight_type", self.map_highlight_type)
+        self.settings.setValue("map_highlight_color", self.map_highlight_color)
+        self.settings.setValue("map_highlight_size", self.map_highlight_size)
+        self.settings.setValue("map_show_dates", self.map_show_dates)
+        self.settings.setValue("dup_bg_mode", getattr(self, 'dup_bg_mode', "Muted Blue Intensity"))
         self.settings.setValue("fast_mode", self.fast_mode)
         event.accept()
 
@@ -872,15 +2172,15 @@ class AdvancedSearchWindow(QMainWindow):
             QCheckBox::indicator:checked {{ background: #58a6ff; image: url(none); }} 
             QCheckBox {{ color: {lbl_col}; background: transparent; outline: none; }}
             
-            QDateEdit, QSpinBox, QDoubleSpinBox, QComboBox {{ 
-                background: {input_bg}; color: {input_text}; border: 1px solid {brd_col}; padding: 4px; border-radius: 4px;
+            QComboBox, QSpinBox, QDoubleSpinBox, QDateEdit, QTimeEdit, QLineEdit {{ 
+                background: {input_bg}; color: {input_text}; border: 1px solid {brd_col}; padding: 2px 4px; border-radius: 4px; min-height: 20px; font-size: 12px;
             }}
+            QComboBox::drop-down {{ width: 15px; border: none; }}
         """
         self.card_scope.setStyleSheet(card_css)
         self.card_type.setStyleSheet(card_css)
         self.card_metrics.setStyleSheet(card_css)
-
-        # --- NEW: MAKE TABS, PROGRESS BAR, AND TELEMETRY LOG 100% LIGHT-MODE COMPATIBLE ---
+        
         self.tabs.setStyleSheet(f"""
             QTabBar::tab {{ background: {bg_col}; color: {lbl_col}; padding: 10px 15px; border: 1px solid {brd_col}; border-top-left-radius: 4px; border-top-right-radius: 4px; }}
             QTabBar::tab:selected {{ background: {input_bg}; color: #58a6ff; font-weight: bold; border-bottom: 2px solid #58a6ff; }}
@@ -888,8 +2188,8 @@ class AdvancedSearchWindow(QMainWindow):
         """)
 
         self.progress.setStyleSheet(f"""
-            QProgressBar {{ border: 1px solid {brd_col}; border-radius: 4px; background-color: {input_bg}; color: {input_text}; font-weight: bold; }}
-            QProgressBar::chunk {{ background-color: #1f6feb; border-radius: 3px; }}
+            QProgressBar {{ border: 1px solid {brd_col}; border-radius: 4px; background: {input_bg}; color: {input_text}; font-weight: bold; text-align: center; }}
+            QProgressBar::chunk {{ background: #1f6feb; border-radius: 3px; }}
         """)
 
         self.txt_tele_log.setStyleSheet(f"""
@@ -899,21 +2199,25 @@ class AdvancedSearchWindow(QMainWindow):
             QScrollBar::handle:vertical:hover {{ background: #58a6ff; }}
             QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ border: none; background: none; height: 0px; }}
         """)
-        self.local_filter_input.setStyleSheet(f"background: {input_bg}; color: {input_text}; border: 1px solid {brd_col}; padding: 6px; border-radius: 4px; font-size: 13px;")
-        # ----------------------------------------------------------------------------------
         
+        css_inputs = f"background: {input_bg}; color: {input_text}; border: 1px solid {brd_col}; padding: 6px; border-radius: 4px; font-size: 13px;"
+        self.local_filter_input.setStyleSheet(css_inputs)
+        self.local_tag_filter_input.setStyleSheet(css_inputs)
+        self.map_highlight_input.setStyleSheet(css_inputs)
+        self.map_tag_highlight_input.setStyleSheet(css_inputs)
+
         glass_btn = f"""
             QPushButton {{ 
                 background-color: {'rgba(255, 255, 255, 0.05)' if is_dark else 'rgba(0, 0, 0, 0.03)'}; 
                 border: 1px solid {'rgba(255, 255, 255, 0.15)' if is_dark else 'rgba(0, 0, 0, 0.1)'}; 
                 border-radius: 6px; 
-                padding: 10px; font-size: 13px; font-weight: bold; 
+                font-size: 16px; font-weight: bold; 
                 color: {lbl_col}; 
             }}
             QPushButton:hover {{ background-color: {'rgba(255, 255, 255, 0.1)' if is_dark else 'rgba(0, 0, 0, 0.08)'}; }}
             QPushButton:checked {{ background-color: {'rgba(88, 166, 255, 0.15)' if is_dark else 'rgba(9, 105, 218, 0.1)'}; border-color: {'#58a6ff' if is_dark else '#0969da'}; }}
         """
-        for btn in [self.btn_scope, self.btn_type, self.btn_metrics]:
+        for btn in [self.btn_scope, self.btn_type, self.btn_metrics, self.btn_reset]:
             btn.setStyleSheet(glass_btn)
             
         self.set_button_style("idle" if not self.is_searching else "running")
@@ -930,15 +2234,15 @@ class AdvancedSearchWindow(QMainWindow):
         btn_hover_border = "#58a6ff" if is_dark else "#2563eb"
 
         if state == "idle":
-            self.btn_search.setText("EXECUTE")
+            self.btn_search.setText("⚡ SEARCH")
             self.btn_search.setStyleSheet(f"""
-                QPushButton {{ background-color: {btn_bg}; color: {btn_fg}; border: 2px solid {btn_border}; border-radius: 6px; font-weight: 900; font-size: 14px; padding: 10px; }} 
+                QPushButton {{ background-color: {btn_bg}; color: {btn_fg}; border: 2px solid {btn_border}; border-radius: 6px; font-weight: 900; font-size: 13px; }} 
                 QPushButton:hover {{ background-color: {btn_hover}; border-color: {btn_hover_border}; }}
             """)
         elif state == "running":
             self.btn_search.setText("🛑 ABORT")
             self.btn_search.setStyleSheet("""
-                QPushButton { background-color: #4a0000; color: #ff7b72; border: 2px solid #f85149; border-radius: 6px; font-weight: 900; font-size: 14px; padding: 10px; } 
+                QPushButton { background-color: #4a0000; color: #ff7b72; border: 2px solid #f85149; border-radius: 6px; font-weight: 900; font-size: 13px; } 
                 QPushButton:hover { background-color: #6a0000; }
             """)
             
@@ -949,12 +2253,13 @@ class AdvancedSearchWindow(QMainWindow):
         self.filters_container.setVisible(self.btn_scope.isChecked() or self.btn_type.isChecked() or self.btn_metrics.isChecked())
 
     def handle_button_action(self):
-        if self.is_searching:
+        if self.is_searching or getattr(self, 'is_rendering', False):
             self._abort_render = True
-            self.worker.abort()
-            self.lbl_status.setText("Aborting search...")
+            if hasattr(self, 'worker'): self.worker.abort()
+            self.lbl_status.setText("Aborting...")
             self.btn_search.setEnabled(False)
-        else: self.trigger_search()
+        else: 
+            self.trigger_search()
 
     def get_icon(self, is_folder, name, ext, db_id):
         if not self.show_icons: return QIcon()
@@ -988,8 +2293,11 @@ class AdvancedSearchWindow(QMainWindow):
             size /= 1024.0
         return f"{size:.2f} PB"
 
+    def set_table_view_mode(self, mode):
+        self.table_view_mode = mode
+        self.apply_local_filter()
+
     def populate_table(self, display_results, total_matches):
-        # FIX: Forcefully disable sorting BEFORE adding rows to prevent data scrambling!
         self.table.setSortingEnabled(False) 
         self.table.setUpdatesEnabled(False)
         self.table.setRowCount(0)
@@ -998,6 +2306,10 @@ class AdvancedSearchWindow(QMainWindow):
             self.table.setUpdatesEnabled(True)
             self.table.setSortingEnabled(True)
             self.lbl_status.setText(f"Search complete. 0 rows loaded into Table. ({total_matches} available in Maps).")
+            self.is_rendering = False
+            self.is_searching = False
+            self.btn_search.setEnabled(True)
+            self.set_button_style("idle")
             return
             
         display_total = len(display_results)
@@ -1007,9 +2319,9 @@ class AdvancedSearchWindow(QMainWindow):
         self.progress.setValue(0)
         QApplication.processEvents()
         
-        
+        i = 0
         for i, (db_id, name, p_path, ext, size, mod, is_fldr, real_path, tags, color_tag, cat_val, sha256_val) in enumerate(display_results):
-            if self._abort_render: break
+            if self._abort_render: break 
             
             self.table.insertRow(i)
             
@@ -1033,16 +2345,16 @@ class AdvancedSearchWindow(QMainWindow):
             self.table.setItem(i, 4, sz_item)
             
             self.table.setItem(i, 5, QTableWidgetItem(str(mod)))
-            self.table.setItem(i, 6, QTableWidgetItem(str(tags) if tags else ""))
             
-            # --- NEW: SHA-256 Column (Index 7) ---
+            eff_tag = tags if tags else self.inherited_tags.get(db_id, "")
+            self.table.setItem(i, 6, QTableWidgetItem(str(eff_tag) if eff_tag else ""))
+            
             sha_item = QTableWidgetItem(str(sha256_val) if sha256_val else "--")
-            sha_item.setForeground(QColor("#8b949e")) # Muted color for hashes
+            sha_item.setForeground(QColor("#8b949e"))
             self.table.setItem(i, 7, sha_item)
             
-            # Moved HiddenMeta to Index 8
             meta_item = QTableWidgetItem("")
-            meta_item.setData(Qt.UserRole, {'id': db_id, 'is_fldr': is_fldr, 'real_path': real_path, 'tags': tags, 'size': size, 'mod': mod})
+            meta_item.setData(Qt.UserRole, {'id': db_id, 'is_fldr': is_fldr, 'real_path': real_path, 'tags': eff_tag, 'size': size, 'mod': mod, 'name': name})
             self.table.setItem(i, 8, meta_item)
             
             if i % 100 == 0:
@@ -1052,25 +2364,27 @@ class AdvancedSearchWindow(QMainWindow):
         self.progress.setValue(display_total)
         self.progress.setVisible(False)
         self.table.setUpdatesEnabled(True)
-        # Re-enable sorting only AFTER all rows and properties are safely mapped
         self.table.setSortingEnabled(True)
         
-        self.lbl_status.setText(f"Search complete. Displaying {len(display_results)} out of {total_matches} total matches.")
+        self.apply_local_filter() 
         
-    def search_complete(self, was_aborted):
+        self.is_rendering = False
         self.is_searching = False
         self.btn_search.setEnabled(True)
         self.set_button_style("idle")
-        if was_aborted:
-            self.progress.setVisible(False)
-            self.lbl_status.setText(f"Search aborted. Displaying partial results.")
+        
+        if self._abort_render:
+            self.lbl_status.setText(f"Rendering aborted. Displaying {i} rows.")
+        else:
+            self.lbl_status.setText(f"Search complete. Displaying {len(display_results)} out of {total_matches} total matches.")
+
+    def search_complete(self, was_aborted):
+        pass
 
     def show_header_menu(self, pos):
         menu = QMenu(self)
         for col in range(self.table.columnCount()):
             col_name = self.table.horizontalHeaderItem(col).text()
-            
-            # (Removed the line that was hiding "HiddenMeta" from the menu)
             action = menu.addAction(f"Show {col_name}")
             action.setCheckable(True)
             action.setChecked(not self.table.isColumnHidden(col))
@@ -1090,8 +2404,8 @@ class AdvancedSearchWindow(QMainWindow):
 
     def handle_double_click(self, item):
         if not item: return
-        meta_item = self.table.item(item.row(), 8) # Changed from 7 to 8
-        if not meta_item: return
+        meta_item = self.table.item(item.row(), 8)
+        if not meta_item: return 
         
         meta = meta_item.data(Qt.UserRole)
         if not meta: return
@@ -1109,7 +2423,7 @@ class AdvancedSearchWindow(QMainWindow):
         
         i_name = self.table.item(row, 1)
         i_vpath = self.table.item(row, 2)
-        i_meta = self.table.item(row, 8) # Changed from 7 to 8
+        i_meta = self.table.item(row, 8) 
         
         if not i_name or not i_vpath or not i_meta: return
         
@@ -1122,6 +2436,16 @@ class AdvancedSearchWindow(QMainWindow):
         selected_rows = self.table.selectionModel().selectedRows()
         
         menu = QMenu(self)
+        
+        view_menu = menu.addMenu("👁️ Filter View")
+        for mode in ["Files & Folders", "Files Only", "Folders Only"]:
+            act = view_menu.addAction(mode)
+            act.setCheckable(True)
+            act.setChecked(self.table_view_mode == mode)
+            act.triggered.connect(lambda checked=False, m=mode: self.set_table_view_mode(m))
+            
+        menu.addSeparator()
+        
         act_open_os = menu.addAction("🚀 Open Native OS Default")
         act_show_os = menu.addAction("📂 Show in OS Explorer")
         
@@ -1151,6 +2475,11 @@ class AdvancedSearchWindow(QMainWindow):
         act_props = menu.addAction("ℹ️ Properties")
         
         menu.addSeparator()
+        
+        act_fix_ts = menu.addAction("🕰️ Fix Timestamps (Forensic Extractor)")
+        act_fix_ts.triggered.connect(self.run_timestamp_corrector)
+        
+        menu.addSeparator()
         act_fast = menu.addAction("⚡ Fast Mode (Disable Visual Maps)")
         act_fast.setCheckable(True)
         act_fast.setChecked(self.fast_mode)
@@ -1163,7 +2492,7 @@ class AdvancedSearchWindow(QMainWindow):
         elif action == act_vman:
             playlist = []
             for idx in selected_rows:
-                m = self.table.item(idx.row(), 8).data(Qt.UserRole) # Changed from 7 to 8
+                m = self.table.item(idx.row(), 8).data(Qt.UserRole)
                 if not m or not m.get('is_fldr', True) and m.get('real_path') and os.path.exists(m['real_path']):
                     n = self.table.item(idx.row(), 1).text()
                     e = os.path.splitext(m['real_path'])[1].lower()
@@ -1189,18 +2518,49 @@ class AdvancedSearchWindow(QMainWindow):
         elif action == act_copy: QApplication.clipboard().setText(f"{v_path}{name}/" if meta['is_fldr'] else f"{v_path}{name}")
         elif action == act_tags: self.edit_tags(row, name, meta)
         elif action == act_props: self.show_properties(name, v_path, meta)
+
+    def run_timestamp_corrector(self):
+        selected_rows = self.table.selectionModel().selectedRows()
+        if not selected_rows: return
+        items_data = []
         
+        with sqlite3.connect(self.active_db) as conn:
+            cur = conn.cursor()
+            for idx in selected_rows:
+                meta = self.table.item(idx.row(), 8).data(Qt.UserRole)
+                if not meta: continue
+                
+                if meta.get('is_fldr'):
+                    v_path = self.table.item(idx.row(), 2).text()
+                    fldr_name = self.table.item(idx.row(), 1).text()
+                    full_v_path = f"{v_path}{fldr_name}/"
+                    
+                    cur.execute("SELECT id, name, modified, real_path, custom_tags, creation_date FROM virtual_fs WHERE is_folder=0 AND parent_path LIKE ?", (f"{full_v_path}%",))
+                    for r in cur.fetchall():
+                        items_data.append({'id': r[0], 'name': r[1], 'mod': r[2], 'real_path': r[3], 'tags': r[4], 'creation_date': r[5] or r[2]})
+                else:
+                    items_data.append(meta)
+                    
+        unique_items = {item['id']: item for item in items_data}.values()
+        
+        if not unique_items:
+            return QMessageBox.warning(self, "No Files Found", "No valid files found inside the selected items/folders.")
+            
+        dlg = TimestampCorrectorDialog(list(unique_items), self.active_db, self)
+        if dlg.exec() == QDialog.Accepted:
+            self.trigger_search()
+
     def export_table_to_csv(self, selected_rows):
         path, _ = QFileDialog.getSaveFileName(self, "Export to CSV", "VMan_Search_Results.csv", "CSV Files (*.csv)", options=QFileDialog.DontUseNativeDialog)
         if not path: return
         try:
             with open(path, 'w', newline='', encoding='utf-8') as f:
                 writer = csv.writer(f)
-                headers = [self.table.horizontalHeaderItem(c).text() for c in range(1, 7)]
+                headers = [self.table.horizontalHeaderItem(c).text() for c in range(1, 8)]
                 writer.writerow(headers)
                 for idx in selected_rows:
                     r = idx.row()
-                    writer.writerow([self.table.item(r, c).text() for c in range(1, 7)])
+                    writer.writerow([self.table.item(r, c).text() for c in range(1, 8)])
             QMessageBox.information(self, "Success", "Exported successfully.")
         except Exception as e:
             QMessageBox.critical(self, "Error", str(e))
@@ -1258,7 +2618,7 @@ class AdvancedSearchWindow(QMainWindow):
                     conn.cursor().execute("UPDATE virtual_fs SET custom_tags=? WHERE id=?", (new_tags.strip(), meta['id']))
                     conn.commit()
                 meta['tags'] = new_tags.strip()
-                self.table.item(row, 7).setData(Qt.UserRole, meta)
+                self.table.item(row, 8).setData(Qt.UserRole, meta)
                 self.table.item(row, 6).setText(meta['tags'])
                 if self.main_app: self.main_app.refresh_all()
             except Exception as e: QMessageBox.critical(self, "Error", str(e))
@@ -1276,24 +2636,64 @@ class AdvancedSearchWindow(QMainWindow):
         btn = QPushButton("Close"); btn.clicked.connect(dlg.accept); layout.addRow("", btn)
         dlg.exec()
 
+    # --- Async Render Wrappers ---
+    def safe_render_map(self):
+        prog = QProgressDialog("Rendering Visual Grid Map...\nThis may take a moment for massive maps.", None, 0, 0, self)
+        prog.setWindowTitle("Processing"); prog.setWindowModality(Qt.WindowModal); prog.show()
+        QApplication.processEvents(); QThread.msleep(50); QApplication.processEvents()
+        try: self.render_grid_map()
+        finally: prog.close()
+
+    def safe_render_analytics(self):
+        prog = QProgressDialog("Rendering Search Analytics...\nAggregating large datasets.", None, 0, 0, self)
+        prog.setWindowTitle("Processing"); prog.setWindowModality(Qt.WindowModal); prog.show()
+        QApplication.processEvents(); QThread.msleep(50); QApplication.processEvents()
+        try: self.render_analytics()
+        finally: prog.close()
+
+    def safe_render_time_heatmap(self):
+        prog = QProgressDialog("Rendering 24-Hour Time Heatmap...\nAggregating timeframes.", None, 0, 0, self)
+        prog.setWindowTitle("Processing"); prog.setWindowModality(Qt.WindowModal); prog.show()
+        QApplication.processEvents(); QThread.msleep(50); QApplication.processEvents()
+        try: self.render_time_heatmap()
+        finally: prog.close()
+
     # --- MAP CLICK INTERACTION ---
     def on_map_click(self, event):
         if not hasattr(self, 'figure_map') or not self.figure_map or event.inaxes != self.figure_map.axes[0] or event.xdata is None or event.ydata is None: return
         if not hasattr(self, 'map_coords_dict') or not self.map_coords_dict: return
         
-        # FIX: The internal Matplotlib data coordinates are ALWAYS 1.0 base, 
-        # regardless of UI scaling! We must not multiply by scale here.
-        box_w, box_h, gap = 1.0, 1.0, 0.2
+        scale = 1.0
+        if self.map_tile_size == "Small (0.7x)": scale = 0.7
+        elif self.map_tile_size == "Medium (1.0x)": scale = 1.0
+        elif self.map_tile_size == "Large (1.2x)": scale = 1.2
+        elif self.map_tile_size == "Custom...": scale = getattr(self, 'map_custom_scale', 1.0)
+        box_w, box_h, gap = 1.0 * scale, 1.0 * scale, 0.2 * scale
         
-        col = int(event.xdata / (box_w + gap))
-        row = int(event.ydata / (box_h + gap))
+        col = int(math.floor(event.xdata / (box_w + gap)))
+        row = int(math.floor(event.ydata / (box_h + gap)))
         
         if (col, row) in self.map_coords_dict:
             target_ym, target_day = self.map_coords_dict[(col, row)]
         else: return
             
         target_date_prefix = f"{target_ym}-{target_day:02d}"
-        filtered_results = [r for r in self.current_results if str(r[5]).startswith(target_date_prefix)]
+        filtered_results = []
+        
+        if "Tag" in self.map_color_mode:
+            is_flat = "Flat" in self.map_color_mode
+            is_size = "Size" in self.map_color_mode
+            for r in self.current_results:
+                if not str(r[5]).startswith(target_date_prefix): continue
+                eff_tag = r[8] if (is_flat or not is_size) else (r[8] if r[8] else self.inherited_tags.get(r[0]))
+                if eff_tag: filtered_results.append(r)
+        elif self.map_color_mode == "By Duplicates":
+            for r in self.current_results:
+                if not str(r[5]).startswith(target_date_prefix): continue
+                if self.duplicate_map.get(r[0], "Unique") in ["Original", "Duplicate"]:
+                    filtered_results.append(r)
+        else:
+            filtered_results = [r for r in self.current_results if str(r[5]).startswith(target_date_prefix)]
         
         if filtered_results:
             self._abort_render = False 
@@ -1302,10 +2702,75 @@ class AdvancedSearchWindow(QMainWindow):
             self.lbl_status.setText(f"Viewing {len(filtered_results)} files modified exactly on {target_date_prefix}.")
         else:
             self.lbl_status.setText(f"No files found exactly on {target_date_prefix}.")
+
+    def on_time_click(self, event):
+        if not hasattr(self, 'figure_time') or not self.figure_time or event.inaxes != self.figure_time.axes[0] or event.xdata is None or event.ydata is None: return
+        if not hasattr(self, 'time_coords_dict') or not self.time_coords_dict: return
+        
+        scale = 1.0
+        if self.map_tile_size == "Small (0.7x)": scale = 0.7
+        elif self.map_tile_size == "Medium (1.0x)": scale = 1.0
+        elif self.map_tile_size == "Large (1.2x)": scale = 1.2
+        elif self.map_tile_size == "Custom...": scale = getattr(self, 'map_custom_scale', 1.0)
+        box_w, box_h, gap = 1.0 * scale, 1.0 * scale, 0.2 * scale
+        
+        col = int(math.floor(event.xdata / (box_w + gap)))
+        row = int(math.floor(event.ydata / (box_h + gap)))
+        
+        if (col, row) in self.time_coords_dict:
+            target_ym, target_b = self.time_coords_dict[(col, row)]
+        else: return
             
+        hh = int(target_b)
+        mm_start = 30 if target_b - hh >= 0.5 else 0
+        mm_end = 59 if mm_start == 30 else 29
+        
+        filtered_results = []
+        
+        if "Tag" in self.time_color_mode:
+            is_flat = "Flat" in self.time_color_mode
+            is_size = "Size" in self.time_color_mode
+            for r in self.current_results:
+                dt_str = str(r[5])
+                if dt_str.startswith(target_ym) and len(dt_str) >= 16:
+                    try:
+                        r_hh = int(dt_str[11:13]); r_mm = int(dt_str[14:16])
+                        if r_hh == hh and mm_start <= r_mm <= mm_end:
+                            eff_tag = r[8] if (is_flat or not is_size) else (r[8] if r[8] else self.inherited_tags.get(r[0]))
+                            if eff_tag: filtered_results.append(r)
+                    except: pass
+        elif self.time_color_mode == "By Duplicates":
+            for r in self.current_results:
+                dt_str = str(r[5])
+                if dt_str.startswith(target_ym) and len(dt_str) >= 16:
+                    try:
+                        r_hh = int(dt_str[11:13]); r_mm = int(dt_str[14:16])
+                        if r_hh == hh and mm_start <= r_mm <= mm_end:
+                            if self.duplicate_map.get(r[0], "Unique") in ["Original", "Duplicate"]:
+                                filtered_results.append(r)
+                    except: pass
+        else:
+            for r in self.current_results:
+                dt_str = str(r[5])
+                if dt_str.startswith(target_ym) and len(dt_str) >= 16:
+                    try:
+                        r_hh = int(dt_str[11:13]); r_mm = int(dt_str[14:16])
+                        if r_hh == hh and mm_start <= r_mm <= mm_end:
+                            filtered_results.append(r)
+                    except: pass
+        
+        if filtered_results:
+            self._abort_render = False 
+            self.populate_table(filtered_results, len(self.current_results))
+            self.tabs.setCurrentIndex(0) 
+            self.lbl_status.setText(f"Viewing {len(filtered_results)} files modified in {target_ym} between {hh:02d}:{mm_start:02d} - {hh:02d}:{mm_end:02d}.")
+        else:
+            self.lbl_status.setText(f"No files found in {target_ym} between {hh:02d}:{mm_start:02d} - {hh:02d}:{mm_end:02d}.")
+
     # --- PERFECT HIGH-SPEED ZERO-MARGIN RENDERING ---
     def get_map_value(self, items, mode):
-        is_size = "(Size)" in mode
+        is_size = "Size" in mode
+        is_flat = "Flat" in mode
         total_val = sum((i['size'] for i in items)) if is_size else len(items)
         if total_val == 0: return 0, None
         
@@ -1321,7 +2786,7 @@ class AdvancedSearchWindow(QMainWindow):
             counts = defaultdict(float)
             has_tag = False
             for i in items:
-                t_str = i['tag']
+                t_str = i['tag_exact'] if (is_flat or not is_size) else i['tag_inherited']
                 if t_str:
                     for t in t_str.split(','):
                         if t.strip(): 
@@ -1329,43 +2794,120 @@ class AdvancedSearchWindow(QMainWindow):
                             has_tag = True
             if not has_tag: return total_val, "Untagged"
             return total_val, max(counts, key=counts.get)
+        elif mode == "By Duplicates":
+            orig_count = sum(1 for i in items if i.get('dup_status') == "Original")
+            dup_count = sum(1 for i in items if i.get('dup_status') == "Duplicate")
+            if orig_count + dup_count == 0: return total_val, None
+            ratio = dup_count / float(orig_count + dup_count)
+            return total_val, ratio
             
         return total_val, None
         
-    def get_intensity_hex(self, val, max_val, grad, saved_colors):
-        if max_val <= 0: return "#21262d"
-        intensity = math.pow(float(val) / float(max_val), 0.5) 
+    def get_cell_color(self, val, max_val, dom, is_dark, saved_colors, color_mode):
+        if val == 0: return ("#21262d" if is_dark else "#ebecf0", "black" if not is_dark else "white")
+        
+        def get_background_hex():
+            dup_bg = getattr(self, 'dup_bg_mode', 'Muted Blue Intensity')
+            if dup_bg == "Hidden (Empty)": return "#21262d" if is_dark else "#ebecf0"
+            elif dup_bg == "Solid Dark Blue": return "#1e293b"
+            elif dup_bg == "Solid Dark Gray": return "#30363d"
+            elif dup_bg == "Gray Intensity":
+                intensity = max(0.2, min(1.0, math.pow(val / max_val, 0.5))) if max_val > 0 else 0
+                r = g = b = int(33 + 100 * intensity)
+                return f"#{min(255,max(0,r)):02x}{min(255,max(0,g)):02x}{min(255,max(0,b)):02x}"
+            elif dup_bg == "Custom Intensity...":
+                intensity = max(0.2, min(1.0, math.pow(val / max_val, 0.5))) if max_val > 0 else 0
+                low = QColor(saved_colors.get("Gradient_Low", "#21262d" if is_dark else "#ebecf0"))
+                high = QColor(saved_colors.get("Gradient_High", "#f85149"))
+                r = int(low.red() + (high.red() - low.red()) * intensity)
+                g = int(low.green() + (high.green() - low.green()) * intensity)
+                b = int(low.blue() + (high.blue() - low.blue()) * intensity)
+                return f"#{min(255,max(0,r)):02x}{min(255,max(0,g)):02x}{min(255,max(0,b)):02x}"
+            else: 
+                intensity = max(0.2, min(1.0, math.pow(val / max_val, 0.5))) if max_val > 0 else 0
+                r, g, b = int(33 + 50*intensity), int(38 + 50*intensity), int(45 + 100*intensity)
+                return f"#{min(255,max(0,r)):02x}{min(255,max(0,g)):02x}{min(255,max(0,b)):02x}"
+        
+        if color_mode == "By Duplicates":
+            if dom is None:
+                bg_hex = get_background_hex()
+                bg_c = QColor(bg_hex)
+                lum = 0.299 * bg_c.red() + 0.587 * bg_c.green() + 0.114 * bg_c.blue()
+                return (bg_hex, "black" if lum > 140 else "white")
+                
+            ratio = float(dom)
+            if ratio <= 0.5:
+                pct = ratio * 2.0
+                r = int(46 + (227 - 46) * pct); g = int(160 + (179 - 160) * pct); b = int(67 + (65 - 67) * pct)
+            else:
+                pct = (ratio - 0.5) * 2.0
+                r = int(227 + (248 - 227) * pct); g = int(179 + (81 - 179) * pct); b = int(65 + (73 - 65) * pct)
+            
+            bg_hex = f"#{min(255,max(0,r)):02x}{min(255,max(0,g)):02x}{min(255,max(0,b)):02x}"
+            lum = 0.299 * r + 0.587 * g + 0.114 * b
+            return (bg_hex, "black" if lum > 140 else "white")
+        
+        is_gradient = "Gradient" in color_mode or "Intensity" in color_mode
+        intensity = math.pow(float(val) / float(max_val), 0.5) if (max_val > 0 and is_gradient) else 1.0
         intensity = max(0.15, min(1.0, intensity)) 
         
-        if grad == "Excel (Green-Yellow-Red)":
-            if intensity <= 0.5:
-                pct = intensity * 2.0
-                r = int(99 + (255 - 99) * pct)
-                g = int(190 + (235 - 190) * pct)
-                b = int(123 + (132 - 123) * pct)
+        default_cat_colors = {"Images": "#a371f7", "Videos": "#f85149", "Audio": "#ff7b72", "Documents": "#d2a8ff", "Code": "#79c0ff", "Archives": "#e3b341", "Others": "#8b949e"}
+        
+        if "Category" in color_mode:
+            base_hex = saved_colors.get(f"Category_{dom}", default_cat_colors.get(dom, "#8b949e"))
+        elif "Extension" in color_mode:
+            base_hex = saved_colors.get(f"Extension_{dom}", f"#{min(255, max(100, int(hashlib.md5(dom.encode()).hexdigest()[:6], 16) & 0xFFFFFF)):06x}")
+        elif "Tag" in color_mode:
+            if dom == "Untagged":
+                bg_hex = get_background_hex()
+                bg_c = QColor(bg_hex)
+                lum = 0.299 * bg_c.red() + 0.587 * bg_c.green() + 0.114 * bg_c.blue()
+                return (bg_hex, "black" if lum > 140 else "white")
             else:
-                pct = (intensity - 0.5) * 2.0
-                r = int(255 + (248 - 255) * pct)
-                g = int(235 + (105 - 235) * pct)
-                b = int(132 + (107 - 132) * pct)
-        elif grad == "Fire":
-            r, g, b = int(40 + 215*intensity), int(20 + 130*(intensity**2)), int(20)
-        elif grad == "Green":
-            r, g, b = int(20), int(50 + 205*intensity), int(40)
-        elif grad == "Blue":
-            r, g, b = int(20), int(60 + 150*(intensity**2)), int(40 + 215*intensity)
-        elif grad == "Yellow":
-            r, g, b = int(50 + 205*intensity), int(50 + 180*intensity), int(20)
-        elif grad == "Custom...":
-            low = QColor(saved_colors.get("Gradient_Low", "#21262d"))
-            high = QColor(saved_colors.get("Gradient_High", "#f85149"))
-            r = int(low.red() + (high.red() - low.red()) * intensity)
-            g = int(low.green() + (high.green() - low.green()) * intensity)
-            b = int(low.blue() + (high.blue() - low.blue()) * intensity)
+                base_hex = saved_colors.get(f"Tag_{dom}", f"#{min(255, max(100, int(hashlib.md5(dom.encode()).hexdigest()[:6], 16) & 0xFFFFFF)):06x}")
         else:
-            r, g, b = int(40 + 215*intensity), int(20 + 130*intensity), int(20)
+            grad = getattr(self, 'map_gradient', 'Excel (Green-Yellow-Red)')
+            if grad == "Excel (Green-Yellow-Red)":
+                if intensity <= 0.5:
+                    pct = intensity * 2.0
+                    r = int(99 + (255 - 99) * pct); g = int(190 + (235 - 190) * pct); b = int(123 + (132 - 123) * pct)
+                else:
+                    pct = (intensity - 0.5) * 2.0
+                    r = int(255 + (248 - 255) * pct); g = int(235 + (105 - 235) * pct); b = int(132 + (107 - 132) * pct)
+            elif grad == "Fire":
+                r, g, b = int(40 + 215*intensity), int(20 + 130*(intensity**2)), int(20)
+            elif grad == "Green":
+                r, g, b = int(20), int(50 + 205*intensity), int(40)
+            elif grad == "Blue":
+                r, g, b = int(10 + 100*(intensity**2)), int(20 + 150*(intensity**2)), int(40 + 215*intensity)
+            elif grad == "Yellow":
+                r, g, b = int(50 + 205*intensity), int(50 + 180*intensity), int(20)
+            elif grad == "Custom...":
+                low = QColor(saved_colors.get("Gradient_Low", "#21262d"))
+                high = QColor(saved_colors.get("Gradient_High", "#f85149"))
+                r = int(low.red() + (high.red() - low.red()) * intensity)
+                g = int(low.green() + (high.green() - low.green()) * intensity)
+                b = int(low.blue() + (high.blue() - low.blue()) * intensity)
+            else:
+                r, g, b = int(40 + 215*intensity), int(20 + 130*intensity), int(20)
             
-        return f"#{min(255,max(0,r)):02x}{min(255,max(0,g)):02x}{min(255,max(0,b)):02x}"
+            bg_hex = f"#{min(255,max(0,r)):02x}{min(255,max(0,g)):02x}{min(255,max(0,b)):02x}"
+            lum = 0.299 * r + 0.587 * g + 0.114 * b
+            return (bg_hex, "black" if lum > 140 else "white")
+            
+        base_c = QColor(base_hex)
+        if not is_gradient:
+            lum = 0.299 * base_c.red() + 0.587 * base_c.green() + 0.114 * base_c.blue()
+            return (base_hex, "black" if lum > 140 else "white")
+            
+        bg_c = QColor("#21262d" if is_dark else "#ebecf0")
+        r = int(bg_c.red() + (base_c.red() - bg_c.red()) * intensity)
+        g = int(bg_c.green() + (base_c.green() - bg_c.green()) * intensity)
+        b = int(bg_c.blue() + (base_c.blue() - bg_c.blue()) * intensity)
+        
+        bg_hex = f"#{min(255,max(0,r)):02x}{min(255,max(0,g)):02x}{min(255,max(0,b)):02x}"
+        lum = 0.299 * r + 0.587 * g + 0.114 * b
+        return (bg_hex, "black" if lum > 140 else "white")
 
     def render_grid_map(self):
         if not hasattr(self, 'figure_map') or not self.figure_map: return
@@ -1375,6 +2917,8 @@ class AdvancedSearchWindow(QMainWindow):
         is_dark = True
         if self.main_app and hasattr(self.main_app, 'theme_combo'):
             is_dark = self.main_app.theme_combo.currentText() == "Dark"
+        else:
+            is_dark = QApplication.palette().window().color().lightness() < 128
             
         bg_c, txt_c = ('#0d1117', '#c9d1d9') if is_dark else ('#ffffff', '#24292f')
         self.figure_map.patch.set_facecolor(bg_c)
@@ -1389,7 +2933,6 @@ class AdvancedSearchWindow(QMainWindow):
             
         saved_colors = QSettings("vmanOS", "HeatmapColors").value("custom_colors", {})
         if not isinstance(saved_colors, dict): saved_colors = {}
-        cat_colors = {"Images": "#a371f7", "Videos": "#f85149", "Audio": "#ff7b72", "Documents": "#d2a8ff", "Code": "#79c0ff", "Archives": "#e3b341", "Others": "#8b949e"}
 
         scale = 1.0
         if self.map_tile_size == "Small (0.7x)": scale = 0.7
@@ -1397,14 +2940,25 @@ class AdvancedSearchWindow(QMainWindow):
         elif self.map_tile_size == "Large (1.2x)": scale = 1.2
         elif self.map_tile_size == "Custom...": scale = getattr(self, 'map_custom_scale', 1.2)
         
-        box_w, box_h, gap = 1.0, 1.0, 0.2 
+        box_w, box_h, gap = 1.0 * scale, 1.0 * scale, 0.2 * scale 
         pixel_scale = 16 * scale 
         
-        patches, facecolors = [], []
+        patches, facecolors, edgecolors, linewidths = [], [], [], []
         self.map_coords_dict = {} 
         
         is_reverse_sort = (self.map_sort_order == "Top to Bottom (Newest First)")
         matrix = self.matrix_cache
+        
+        name_filter = self.map_highlight_input.text().lower()
+        tag_highlight = self.map_tag_highlight_input.text().lower()
+        
+        hl_field = getattr(self, 'map_highlight_field', 'Name or Path')
+        hl_type = getattr(self, 'map_highlight_type', 'Files & Folders')
+        hl_color = getattr(self, 'map_highlight_color', '#b8860b')
+        hl_size = getattr(self, 'map_highlight_size', 2.0)
+        show_dates = getattr(self, 'map_show_dates', True)
+        
+        highlighted_years = set()
         
         max_val = 0.1
         for ym, days in matrix.items():
@@ -1414,65 +2968,65 @@ class AdvancedSearchWindow(QMainWindow):
 
         ax.set_aspect('equal')
 
-        # -----------------------------------------------------
-        # MODE 1: COMPACT MATRIX (31 Days)
-        # -----------------------------------------------------
         if self.map_layout_mode == "Compact Matrix (31 Days)":
             ym_keys = sorted(matrix.keys(), reverse=is_reverse_sort)
-            
             for row_idx, ym in enumerate(ym_keys):
                 for day in range(1, 32):
                     items = matrix[ym].get(day, [])
+                    has_highlight = False
+                    if name_filter or tag_highlight:
+                        for i in items:
+                            if hl_type == "Files Only" and i.get('is_fldr'): continue
+                            if hl_type == "Folders Only" and not i.get('is_fldr'): continue
+                            
+                            match_n = not name_filter
+                            if name_filter:
+                                n_match = name_filter in i['name']
+                                p_match = name_filter in i['path']
+                                if hl_field == "Name or Path": match_n = n_match or p_match
+                                elif hl_field == "Name Only": match_n = n_match
+                                elif hl_field == "Path Only": match_n = p_match
+                            
+                            match_t = not tag_highlight
+                            if tag_highlight:
+                                match_t = tag_highlight in (i['tag_exact'] or "").lower() or tag_highlight in (i['tag_inherited'] or "").lower()
+                                
+                            if match_n and match_t:
+                                has_highlight = True; highlighted_years.add(ym.split('-')[0])
+                                break
+                    
                     val, dom = self.get_map_value(items, self.map_color_mode)
-                    
-                    x_pos = (day - 1) * (box_w + gap)
-                    y_pos = row_idx * (box_h + gap)
-                    
+                    x_pos = (day - 1) * (box_w + gap); y_pos = row_idx * (box_h + gap)
                     self.map_coords_dict[(day-1, row_idx)] = (ym, day)
-                    
-                    if val == 0: c_hex = "#21262d" if is_dark else "#ebecf0"
-                    else:
-                        if "Category" in self.map_color_mode: c_hex = saved_colors.get(f"Category_{dom}", cat_colors.get(dom, "#8b949e"))
-                        elif "Extension" in self.map_color_mode: c_hex = saved_colors.get(f"Extension_{dom}", f"#{min(255, max(100, int(hashlib.md5(dom.encode()).hexdigest()[:6], 16) & 0xFFFFFF)):06x}")
-                        elif "Tag" in self.map_color_mode: 
-                            c_hex = "#30363d" if dom == "Untagged" else saved_colors.get(f"Tag_{dom}", f"#{min(255, max(100, int(hashlib.md5(dom.encode()).hexdigest()[:6], 16) & 0xFFFFFF)):06x}")
-                        else: c_hex = self.get_intensity_hex(val, max_val, getattr(self, 'map_gradient', 'Fire'), saved_colors)
+                    c_hex, font_color = self.get_cell_color(val, max_val, dom, is_dark, saved_colors, self.map_color_mode)
                             
                     rect = mpatches.Rectangle((x_pos, y_pos), box_w, box_h)
-                    patches.append(rect)
-                    facecolors.append(c_hex)
+                    patches.append(rect); facecolors.append(c_hex)
+                    if (name_filter or tag_highlight) and has_highlight:
+                        edgecolors.append(hl_color); linewidths.append(hl_size)
+                    else:
+                        edgecolors.append("none"); linewidths.append(0.0)
+                        
+                    if show_dates:
+                        ax.text(x_pos + box_w/2, y_pos + box_h/2, str(day), ha='center', va='center', color=font_color, fontsize=int(7 * scale))
                     
-            max_x = 31 * (box_w + gap)
-            max_y = len(ym_keys) * (box_h + gap)
-            ax.set_xlim(-gap, max_x)
-            ax.set_ylim(max_y, -gap)
-            
+            max_x = 31 * (box_w + gap); max_y = len(ym_keys) * (box_h + gap)
+            ax.set_xlim(-gap, max_x); ax.set_ylim(max_y, -gap)
             x_ticks = [(d - 1) * (box_w + gap) + (box_w / 2) for d in range(1, 32)]
-            ax.set_xticks(x_ticks)
-            ax.set_xticklabels([str(d) for d in range(1, 32)])
+            ax.set_xticks(x_ticks); ax.set_xticklabels([str(d) for d in range(1, 32)])
             ax.xaxis.tick_top()
-            
             y_ticks = [r * (box_h + gap) + (box_h / 2) for r in range(len(ym_keys))]
-            ax.set_yticks(y_ticks)
-            ax.set_yticklabels(ym_keys, fontweight="bold")
-            
-            top_pad = getattr(self, 'map_top_margin', 40.0) / max(100, max_y * pixel_scale)
+            ax.set_yticks(y_ticks); ax.set_yticklabels(ym_keys, fontweight="bold")
+            top_pad = getattr(self, 'map_top_margin', 78.0) / max(100, max_y * pixel_scale)
             self.figure_map.subplots_adjust(top=1.0 - top_pad, bottom=0.01, left=0.10, right=0.98)
             self.canvas_map.setFixedSize(int(max_x * pixel_scale + 100), int(max_y * pixel_scale + 80))
 
-        # -----------------------------------------------------
-        # MODE 2: SEGMENTED YEARS (31 Days)
-        # -----------------------------------------------------
         elif self.map_layout_mode == "Segmented Years (31 Days)":
             ym_keys = sorted(matrix.keys(), reverse=is_reverse_sort)
-            current_row = 0
-            y_ticks_pos = []
-            y_ticks_labels = []
-            last_year = None
+            current_row = 0; y_ticks_pos = []; y_ticks_labels = []; last_year = None
             
             for ym in ym_keys:
                 y, m = ym.split('-')
-                
                 if last_year and last_year != y:
                     year_rect = mpatches.Rectangle((-gap, (current_row-1) * (box_h + gap) + box_h), 31 * (box_w + gap), 0, edgecolor="#b8860b", linewidth=2)
                     ax.add_patch(year_rect)
@@ -1480,63 +3034,66 @@ class AdvancedSearchWindow(QMainWindow):
                 
                 for day in range(1, 32):
                     items = matrix[ym].get(day, [])
+                    has_highlight = False
+                    if name_filter or tag_highlight:
+                        for i in items:
+                            if hl_type == "Files Only" and i.get('is_fldr'): continue
+                            if hl_type == "Folders Only" and not i.get('is_fldr'): continue
+                            
+                            match_n = not name_filter
+                            if name_filter:
+                                n_match = name_filter in i['name']; p_match = name_filter in i['path']
+                                if hl_field == "Name or Path": match_n = n_match or p_match
+                                elif hl_field == "Name Only": match_n = n_match
+                                elif hl_field == "Path Only": match_n = p_match
+                            match_t = not tag_highlight
+                            if tag_highlight:
+                                match_t = tag_highlight in (i['tag_exact'] or "").lower() or tag_highlight in (i['tag_inherited'] or "").lower()
+                                
+                            if match_n and match_t:
+                                has_highlight = True; highlighted_years.add(y)
+                                break
+                            
                     val, dom = self.get_map_value(items, self.map_color_mode)
-                    
-                    x_pos = (day - 1) * (box_w + gap)
-                    y_pos = current_row * (box_h + gap)
+                    x_pos = (day - 1) * (box_w + gap); y_pos = current_row * (box_h + gap)
                     self.map_coords_dict[(day-1, current_row)] = (ym, day)
-                    
-                    if val == 0: c_hex = "#21262d" if is_dark else "#ebecf0"
-                    else:
-                        if "Category" in self.map_color_mode: c_hex = saved_colors.get(f"Category_{dom}", cat_colors.get(dom, "#8b949e"))
-                        elif "Extension" in self.map_color_mode: c_hex = saved_colors.get(f"Extension_{dom}", f"#{min(255, max(100, int(hashlib.md5(dom.encode()).hexdigest()[:6], 16) & 0xFFFFFF)):06x}")
-                        elif "Tag" in self.map_color_mode: 
-                            c_hex = "#30363d" if dom == "Untagged" else saved_colors.get(f"Tag_{dom}", f"#{min(255, max(100, int(hashlib.md5(dom.encode()).hexdigest()[:6], 16) & 0xFFFFFF)):06x}")
-                        else: c_hex = self.get_intensity_hex(val, max_val, getattr(self, 'map_gradient', 'Fire'), saved_colors)
+                    c_hex, font_color = self.get_cell_color(val, max_val, dom, is_dark, saved_colors, self.map_color_mode)
                             
                     rect = mpatches.Rectangle((x_pos, y_pos), box_w, box_h)
-                    patches.append(rect)
-                    facecolors.append(c_hex)
+                    patches.append(rect); facecolors.append(c_hex)
+                    if (name_filter or tag_highlight) and has_highlight:
+                        edgecolors.append(hl_color); linewidths.append(hl_size)
+                    else:
+                        edgecolors.append("none"); linewidths.append(0.0)
+                        
+                    if show_dates:
+                        ax.text(x_pos + box_w/2, y_pos + box_h/2, str(day), ha='center', va='center', color=font_color, fontsize=int(7 * scale))
                     
                 y_ticks_pos.append(current_row * (box_h + gap) + (box_h / 2))
                 y_ticks_labels.append(f"{y} {calendar.month_abbr[int(m)]}")
-                current_row += 1
-                last_year = y
+                current_row += 1; last_year = y
                 
-            max_x = 31 * (box_w + gap)
-            max_y = current_row * (box_h + gap)
-            ax.set_xlim(-gap, max_x)
-            ax.set_ylim(max_y, -gap) 
-            
+            max_x = 31 * (box_w + gap); max_y = current_row * (box_h + gap)
+            ax.set_xlim(-gap, max_x); ax.set_ylim(max_y, -gap) 
             x_ticks = [(d - 1) * (box_w + gap) + (box_w / 2) for d in range(1, 32)]
-            ax.set_xticks(x_ticks)
-            ax.set_xticklabels([str(d) for d in range(1, 32)])
+            ax.set_xticks(x_ticks); ax.set_xticklabels([str(d) for d in range(1, 32)])
             ax.xaxis.tick_top()
-            
-            ax.set_yticks(y_ticks_pos)
-            ax.set_yticklabels(y_ticks_labels, fontweight="bold")
-            
-            top_pad = getattr(self, 'map_top_margin', 40.0) / max(100, max_y * pixel_scale)
+            ax.set_yticks(y_ticks_pos); ax.set_yticklabels(y_ticks_labels, fontweight="bold")
+            top_pad = getattr(self, 'map_top_margin', 78.0) / max(100, max_y * pixel_scale)
             self.figure_map.subplots_adjust(top=1.0 - top_pad, bottom=0.01, left=0.12, right=0.98)
             self.canvas_map.setFixedSize(int(max_x * pixel_scale + 120), int(max_y * pixel_scale + 60))
 
-        # -----------------------------------------------------
-        # MODE 3: TRUE CALENDAR (Dynamic Widescreen/Standard)
-        # -----------------------------------------------------
         elif "True Calendar" in self.map_layout_mode:
             years = set(int(ym[:4]) for ym in matrix.keys())
             if not years: years.add(datetime.datetime.now().year)
             years = sorted(list(years), reverse=is_reverse_sort)
             
             cols_per_row = 4 if "Widescreen" in self.map_layout_mode else 3
-            # --- FIX: Subtract 2 unused trailing columns to perfectly align right edge ---
             total_cols_width = cols_per_row * 9 - 2
-            
             current_row = 0
             
             for y in years:
                 current_row += 3 
-                # Changed from "- 2.5" to "- (0.8 * scale)" to pull the Year text perfectly downwards
                 ax.text((total_cols_width / 2) * (box_w + gap), current_row * (box_h + gap) - (0.8 * scale), str(y), ha='center', va='bottom', color='#8a6306', fontweight='bold', fontsize=int(18 * scale))
                 year_start_row = current_row
                 
@@ -1545,8 +3102,7 @@ class AdvancedSearchWindow(QMainWindow):
                     if m_idx > 1 and grid_col == 0: current_row += 9 
                     
                     x_offset = grid_col * 9 
-                    
-                    ax.text(x_offset * (box_w + gap) + 3.5 * (box_w + gap), current_row * (box_h + gap) - 0.2, calendar.month_abbr[m_idx], ha='center', va='bottom', color=txt_c, fontweight='bold', fontsize=int(10 * scale))
+                    ax.text(x_offset * (box_w + gap) + 3.5 * (box_w + gap), current_row * (box_h + gap) - 0.2, calendar.month_abbr[m_idx], ha='center', va='bottom', color='#b8860b', fontweight='bold', fontsize=int(10 * scale))
                     day_labels = ["M", "T", "W", "T", "F", "S", "S"]
                     for i, d in enumerate(day_labels):
                         ax.text((x_offset + i) * (box_w + gap) + box_w/2, (current_row + 0.8) * (box_h + gap), d, ha='center', va='bottom', color='#8b949e', fontsize=int(8 * scale))
@@ -1558,123 +3114,294 @@ class AdvancedSearchWindow(QMainWindow):
                     for day in range(1, days_in_month + 1):
                         col = x_offset + ((start_idx + day - 1) % 7)
                         r_idx = current_row + 1 + ((start_idx + day - 1) // 7)
-                        
-                        x_pos = col * (box_w + gap)
-                        y_pos = r_idx * (box_h + gap)
-                        
+                        x_pos = col * (box_w + gap); y_pos = r_idx * (box_h + gap)
                         self.map_coords_dict[(col, r_idx)] = (ym, day)
-                        
                         items = matrix[ym].get(day, [])
-                        val, dom = self.get_map_value(items, self.map_color_mode)
                         
-                        if val == 0: c_hex = "#21262d" if is_dark else "#ebecf0"
-                        else:
-                            if "Category" in self.map_color_mode: c_hex = saved_colors.get(f"Category_{dom}", cat_colors.get(dom, "#8b949e"))
-                            elif "Extension" in self.map_color_mode: c_hex = saved_colors.get(f"Extension_{dom}", f"#{min(255, max(100, int(hashlib.md5(dom.encode()).hexdigest()[:6], 16) & 0xFFFFFF)):06x}")
-                            elif "Tag" in self.map_color_mode: 
-                                c_hex = "#30363d" if dom == "Untagged" else saved_colors.get(f"Tag_{dom}", f"#{min(255, max(100, int(hashlib.md5(dom.encode()).hexdigest()[:6], 16) & 0xFFFFFF)):06x}")
-                            else: c_hex = self.get_intensity_hex(val, max_val, getattr(self, 'map_gradient', 'Fire'), saved_colors)
+                        has_highlight = False
+                        if name_filter or tag_highlight:
+                            for i in items:
+                                if hl_type == "Files Only" and i.get('is_fldr'): continue
+                                if hl_type == "Folders Only" and not i.get('is_fldr'): continue
+                                match_n = not name_filter
+                                if name_filter:
+                                    n_match = name_filter in i['name']; p_match = name_filter in i['path']
+                                    if hl_field == "Name or Path": match_n = n_match or p_match
+                                    elif hl_field == "Name Only": match_n = n_match
+                                    elif hl_field == "Path Only": match_n = p_match
+                                match_t = not tag_highlight
+                                if tag_highlight: match_t = tag_highlight in (i['tag_exact'] or "").lower() or tag_highlight in (i['tag_inherited'] or "").lower()
+                                if match_n and match_t: has_highlight = True; highlighted_years.add(str(y)); break
+                                
+                        val, dom = self.get_map_value(items, self.map_color_mode)
+                        c_hex, font_color = self.get_cell_color(val, max_val, dom, is_dark, saved_colors, self.map_color_mode)
                                 
                         rect = mpatches.Rectangle((x_pos, y_pos), box_w, box_h)
-                        patches.append(rect)
-                        facecolors.append(c_hex)
+                        patches.append(rect); facecolors.append(c_hex)
+                        if (name_filter or tag_highlight) and has_highlight:
+                            edgecolors.append(hl_color); linewidths.append(hl_size)
+                        else:
+                            edgecolors.append("none"); linewidths.append(0.0)
                         
-                        font_color = "black" if (not is_dark and val==0) else "white"
-                        ax.text(x_pos + box_w/2, y_pos + box_h/2, str(day), ha='center', va='center', color=font_color, fontsize=int(7 * scale))
+                        if show_dates:
+                            ax.text(x_pos + box_w/2, y_pos + box_h/2, str(day), ha='center', va='center', color=font_color, fontsize=int(7 * scale))
 
                 current_row += 8 
                 y_box_h = (current_row - year_start_row - 0.5) * (box_h + gap)
-                
-                # --- FIX: Balanced Border width exactly symmetrically ---
                 year_rect = mpatches.Rectangle((-gap, year_start_row * (box_h + gap) - gap*2), total_cols_width * (box_w + gap) + gap, y_box_h, fill=False, edgecolor="#b8860b", linewidth=2)
                 ax.add_patch(year_rect)
                 
-            max_x = total_cols_width * (box_w + gap)
-            max_y = current_row * (box_h + gap)
-            
-            # --- FIX: Added extra 'gap' breathing room outside the X limits so border isn't clipped ---
-            ax.set_xlim(-gap*2, max_x + gap)
-            ax.set_ylim(max_y, -gap*3)
+            max_x = total_cols_width * (box_w + gap); max_y = current_row * (box_h + gap)
+            ax.set_xlim(-gap*2, max_x + gap); ax.set_ylim(max_y, -gap*3)
             ax.set_xticks([]); ax.set_yticks([])
-            
-            top_pad = getattr(self, 'map_top_margin', 40.0) / max(100, max_y * pixel_scale)
+            top_pad = getattr(self, 'map_top_margin', 78.0) / max(100, max_y * pixel_scale)
             self.figure_map.subplots_adjust(top=1.0 - top_pad, bottom=0.01, left=0.02, right=0.98)
             self.canvas_map.setFixedSize(int(max_x * pixel_scale + 50), int(max_y * pixel_scale + 60))
 
-        # -----------------------------------------------------
-        # MODE 4: GITHUB CONTRIBUTION (52 Weeks Horizontal)
-        # -----------------------------------------------------
         elif self.map_layout_mode == "GitHub Contribution (52 Weeks)":
             years = set(int(ym[:4]) for ym in matrix.keys())
             if not years: years.add(datetime.datetime.now().year)
             years = sorted(list(years), reverse=is_reverse_sort)
             
-            current_row = 0
-            y_ticks_pos = []
-            y_ticks_labels = []
+            current_row = 0; y_ticks_pos = []; y_ticks_labels = []
             
             for y in years:
                 y_ticks_pos.append((current_row + 3) * (box_h + gap))
                 y_ticks_labels.append(str(y))
-                
                 try: start_date = datetime.date(y, 1, 1)
                 except: continue
                 
                 start_wday = start_date.weekday() 
-                
                 for day_offset in range(365 + (1 if calendar.isleap(y) else 0)):
                     curr_date = start_date + datetime.timedelta(days=day_offset)
-                    
                     week = (day_offset + start_wday) // 7
                     wday = curr_date.weekday()
-                    
-                    ym = curr_date.strftime("%Y-%m")
-                    day = curr_date.day
-                    
-                    x_pos = week * (box_w + gap)
-                    y_pos = (current_row + wday) * (box_h + gap)
-                    
+                    ym = curr_date.strftime("%Y-%m"); day = curr_date.day
+                    x_pos = week * (box_w + gap); y_pos = (current_row + wday) * (box_h + gap)
                     self.map_coords_dict[(week, current_row + wday)] = (ym, day)
-                    
                     items = matrix[ym].get(day, [])
-                    val, dom = self.get_map_value(items, self.map_color_mode)
                     
-                    if val == 0: c_hex = "#21262d" if is_dark else "#ebecf0"
-                    else:
-                        if "Category" in self.map_color_mode: c_hex = saved_colors.get(f"Category_{dom}", cat_colors.get(dom, "#8b949e"))
-                        elif "Extension" in self.map_color_mode: c_hex = saved_colors.get(f"Extension_{dom}", f"#{min(255, max(100, int(hashlib.md5(dom.encode()).hexdigest()[:6], 16) & 0xFFFFFF)):06x}")
-                        elif "Tag" in self.map_color_mode: 
-                            c_hex = "#30363d" if dom == "Untagged" else saved_colors.get(f"Tag_{dom}", f"#{min(255, max(100, int(hashlib.md5(dom.encode()).hexdigest()[:6], 16) & 0xFFFFFF)):06x}")
-                        else: c_hex = self.get_intensity_hex(val, max_val, getattr(self, 'map_gradient', 'Fire'), saved_colors)
+                    has_highlight = False
+                    if name_filter or tag_highlight:
+                        for i in items:
+                            if hl_type == "Files Only" and i.get('is_fldr'): continue
+                            if hl_type == "Folders Only" and not i.get('is_fldr'): continue
+                            match_n = not name_filter
+                            if name_filter:
+                                n_match = name_filter in i['name']; p_match = name_filter in i['path']
+                                if hl_field == "Name or Path": match_n = n_match or p_match
+                                elif hl_field == "Name Only": match_n = n_match
+                                elif hl_field == "Path Only": match_n = p_match
+                            match_t = not tag_highlight
+                            if tag_highlight: match_t = tag_highlight in (i['tag_exact'] or "").lower() or tag_highlight in (i['tag_inherited'] or "").lower()
+                            if match_n and match_t: has_highlight = True; highlighted_years.add(str(y)); break
+                                
+                    val, dom = self.get_map_value(items, self.map_color_mode)
+                    c_hex, font_color = self.get_cell_color(val, max_val, dom, is_dark, saved_colors, self.map_color_mode)
                             
                     rect = mpatches.Rectangle((x_pos, y_pos), box_w, box_h)
-                    patches.append(rect)
-                    facecolors.append(c_hex)
+                    patches.append(rect); facecolors.append(c_hex)
+                    if (name_filter or tag_highlight) and has_highlight:
+                        edgecolors.append(hl_color); linewidths.append(hl_size)
+                    else:
+                        edgecolors.append("none"); linewidths.append(0.0)
+                        
+                    if show_dates:
+                        ax.text(x_pos + box_w/2, y_pos + box_h/2, str(day), ha='center', va='center', color=font_color, fontsize=int(5 * scale))
                     
                 current_row += 8 
                 
-            max_x = 54 * (box_w + gap)
-            max_y = current_row * (box_h + gap)
-            ax.set_xlim(-gap, max_x)
-            ax.set_ylim(max_y, -gap)
-            ax.set_xticks([])
-            ax.set_yticks(y_ticks_pos)
+            max_x = 54 * (box_w + gap); max_y = current_row * (box_h + gap)
+            ax.set_xlim(-gap, max_x); ax.set_ylim(max_y, -gap)
+            ax.set_xticks([]); ax.set_yticks(y_ticks_pos)
             ax.set_yticklabels(y_ticks_labels, fontweight="bold")
-            
-            top_pad = getattr(self, 'map_top_margin', 40.0) / max(100, max_y * pixel_scale)
+            top_pad = getattr(self, 'map_top_margin', 78.0) / max(100, max_y * pixel_scale)
             self.figure_map.subplots_adjust(top=1.0 - top_pad, bottom=0.01, left=0.08, right=0.98)
             self.canvas_map.setFixedSize(int(max_x * pixel_scale + 100), int(max_y * pixel_scale + 60))
 
-        collection = PatchCollection(patches, facecolors=facecolors, edgecolors="none")
+        collection = PatchCollection(patches, facecolors=facecolors, edgecolors=edgecolors, linewidths=linewidths)
         ax.add_collection(collection)
-        
-        ax.set_title(f"Visual Grid Map [{self.map_layout_mode}] - ({self.map_color_mode})\nClick any tile to view files", color=txt_c, fontweight='bold', pad=15)
-        
+        ax.set_title(f"Visual Grid Map [{self.map_layout_mode}] - ({self.map_color_mode})", color=txt_c, fontweight='bold', pad=15)
         for spine in ['top', 'right', 'bottom', 'left']: ax.spines[spine].set_visible(False)
         ax.tick_params(axis='both', which='major', length=0)
-        
         self.canvas_map.draw()
         
+        if getattr(self, '_show_highlight_dialog', False) and (name_filter or tag_highlight):
+            if highlighted_years: QMessageBox.information(self, "Highlight Found", f"Matched tiles dynamically bordered in: {', '.join(sorted(list(highlighted_years)))}")
+            else: QMessageBox.warning(self, "Not Found", "No tiles matched your highlight criteria.")
+
+    def render_time_heatmap(self):
+        if not hasattr(self, 'figure_time') or not self.figure_time: return
+        self.figure_time.clear()
+        ax = self.figure_time.add_subplot(111)
+        
+        is_dark = True
+        if self.main_app and hasattr(self.main_app, 'theme_combo'):
+            is_dark = self.main_app.theme_combo.currentText() == "Dark"
+        else:
+            is_dark = QApplication.palette().window().color().lightness() < 128
+            
+        bg_c, txt_c = ('#0d1117', '#c9d1d9') if is_dark else ('#ffffff', '#24292f')
+        self.figure_time.patch.set_facecolor(bg_c)
+        ax.set_facecolor(bg_c)
+        ax.tick_params(colors=txt_c, labelsize=9)
+        ax.set_anchor('N') 
+
+        if not hasattr(self, 'time_matrix_cache') or not self.time_matrix_cache:
+            ax.text(0.5, 0.5, "No specific time data to visualize", color=txt_c, ha='center', va='center')
+            ax.axis('off'); self.canvas_time.draw(); return
+
+        scale = 1.0
+        if self.map_tile_size == "Small (0.7x)": scale = 0.7
+        elif self.map_tile_size == "Medium (1.0x)": scale = 1.0
+        elif self.map_tile_size == "Large (1.2x)": scale = 1.2
+        elif self.map_tile_size == "Custom...": scale = getattr(self, 'map_custom_scale', 1.2)
+        
+        box_w, box_h, gap = 1.0 * scale, 1.0 * scale, 0.2 * scale 
+        pixel_scale = 16 * scale 
+        
+        patches, facecolors, edgecolors, linewidths = [], [], [], []
+        self.time_coords_dict = {} 
+        
+        is_reverse_sort = (self.map_sort_order == "Top to Bottom (Newest First)")
+        matrix = self.time_matrix_cache
+        ym_keys = sorted(matrix.keys(), reverse=is_reverse_sort)
+        
+        saved_colors = QSettings("vmanOS", "HeatmapColors").value("custom_colors", {})
+        if not isinstance(saved_colors, dict): saved_colors = {}
+        
+        name_filter = self.map_highlight_input.text().lower()
+        tag_highlight = self.map_tag_highlight_input.text().lower()
+        hl_field = getattr(self, 'map_highlight_field', 'Name or Path')
+        hl_type = getattr(self, 'map_highlight_type', 'Files & Folders')
+        hl_color = getattr(self, 'map_highlight_color', '#b8860b')
+        hl_size = getattr(self, 'map_highlight_size', 2.0)
+        
+        max_val = 0.1
+        for ym in ym_keys:
+            for b_idx in range(48):
+                items = matrix[ym].get(b_idx/2.0, [])
+                val, _ = self.get_map_value(items, self.time_color_mode)
+                if val > max_val: max_val = val
+                
+        ax.set_aspect('equal')
+        
+        if self.time_layout_mode == "Segmented Years":
+            current_row = 0; y_ticks_pos = []; y_ticks_labels = []; last_year = None
+            
+            for ym in ym_keys:
+                y, m = ym.split('-')
+                if last_year and last_year != y:
+                    year_rect = mpatches.Rectangle((-gap, (current_row-1) * (box_h + gap) + box_h), 48 * (box_w + gap), 0, edgecolor="#b8860b", linewidth=2)
+                    ax.add_patch(year_rect)
+                    current_row += 1 
+                
+                for b_idx in range(48):
+                    b_val = b_idx / 2.0
+                    items = matrix[ym].get(b_val, [])
+                    x_pos = b_idx * (box_w + gap)
+                    y_pos = current_row * (box_h + gap)
+                    self.time_coords_dict[(b_idx, current_row)] = (ym, b_val)
+                    
+                    has_highlight = False
+                    if name_filter or tag_highlight:
+                        for i in items:
+                            if hl_type == "Files Only" and i.get('is_fldr'): continue
+                            if hl_type == "Folders Only" and not i.get('is_fldr'): continue
+                            match_n = not name_filter
+                            if name_filter:
+                                n_match = name_filter in i['name']; p_match = name_filter in i['path']
+                                if hl_field == "Name or Path": match_n = n_match or p_match
+                                elif hl_field == "Name Only": match_n = n_match
+                                elif hl_field == "Path Only": match_n = p_match
+                            match_t = not tag_highlight
+                            if tag_highlight: match_t = tag_highlight in (i['tag_exact'] or "").lower() or tag_highlight in (i['tag_inherited'] or "").lower()
+                            if match_n and match_t: has_highlight = True; break
+                    
+                    val, dom = self.get_map_value(items, self.time_color_mode)
+                    c_hex, _ = self.get_cell_color(val, max_val, dom, is_dark, saved_colors, self.time_color_mode)
+                            
+                    rect = mpatches.Rectangle((x_pos, y_pos), box_w, box_h)
+                    patches.append(rect); facecolors.append(c_hex)
+                    if (name_filter or tag_highlight) and has_highlight:
+                        edgecolors.append(hl_color); linewidths.append(hl_size)
+                    else:
+                        edgecolors.append("none"); linewidths.append(0.0)
+                
+                y_ticks_pos.append(current_row * (box_h + gap) + (box_h / 2))
+                y_ticks_labels.append(f"{y} {calendar.month_abbr[int(m)]}")
+                current_row += 1; last_year = y
+                
+            max_x = 48 * (box_w + gap); max_y = current_row * (box_h + gap)
+            ax.set_xlim(-gap, max_x); ax.set_ylim(max_y, -gap)
+            x_ticks = [i * (box_w + gap) + (box_w / 2) for i in range(48)]
+            ax.set_xticks(x_ticks)
+            ax.set_xticklabels([f"{int(i/2)}:30" if i%2!=0 else f"{int(i/2)}:00" for i in range(48)], rotation=90, fontsize=int(6*scale))
+            ax.xaxis.tick_top()
+            ax.set_yticks(y_ticks_pos); ax.set_yticklabels(y_ticks_labels, fontweight="bold")
+            top_pad = getattr(self, 'map_top_margin', 78.0) / max(100, max_y * pixel_scale)
+            self.figure_time.subplots_adjust(top=1.0 - top_pad, bottom=0.01, left=0.10, right=0.98)
+            self.canvas_time.setFixedSize(int(max_x * pixel_scale + 100), int(max_y * pixel_scale + 100))
+        
+        else:
+            for row_idx, ym in enumerate(ym_keys):
+                for b_idx in range(48):
+                    b_val = b_idx / 2.0
+                    items = matrix[ym].get(b_val, [])
+                    x_pos = b_idx * (box_w + gap)
+                    y_pos = row_idx * (box_h + gap)
+                    self.time_coords_dict[(b_idx, row_idx)] = (ym, b_val)
+                    
+                    has_highlight = False
+                    if name_filter or tag_highlight:
+                        for i in items:
+                            if hl_type == "Files Only" and i.get('is_fldr'): continue
+                            if hl_type == "Folders Only" and not i.get('is_fldr'): continue
+                            match_n = not name_filter
+                            if name_filter:
+                                n_match = name_filter in i['name']; p_match = name_filter in i['path']
+                                if hl_field == "Name or Path": match_n = n_match or p_match
+                                elif hl_field == "Name Only": match_n = n_match
+                                elif hl_field == "Path Only": match_n = p_match
+                            match_t = not tag_highlight
+                            if tag_highlight: match_t = tag_highlight in (i['tag_exact'] or "").lower() or tag_highlight in (i['tag_inherited'] or "").lower()
+                            if match_n and match_t: has_highlight = True; break
+                    
+                    val, dom = self.get_map_value(items, self.time_color_mode)
+                    c_hex, _ = self.get_cell_color(val, max_val, dom, is_dark, saved_colors, self.time_color_mode)
+                            
+                    rect = mpatches.Rectangle((x_pos, y_pos), box_w, box_h)
+                    patches.append(rect); facecolors.append(c_hex)
+                    if (name_filter or tag_highlight) and has_highlight:
+                        edgecolors.append(hl_color); linewidths.append(hl_size)
+                    else:
+                        edgecolors.append("none"); linewidths.append(0.0)
+                    
+            max_x = 48 * (box_w + gap); max_y = len(ym_keys) * (box_h + gap)
+            ax.set_xlim(-gap, max_x); ax.set_ylim(max_y, -gap)
+            x_ticks = [i * (box_w + gap) + (box_w / 2) for i in range(48)]
+            ax.set_xticks(x_ticks)
+            ax.set_xticklabels([f"{int(i/2)}:30" if i%2!=0 else f"{int(i/2)}:00" for i in range(48)], rotation=90, fontsize=int(6*scale))
+            ax.xaxis.tick_top()
+            y_ticks = [r * (box_h + gap) + (box_h / 2) for r in range(len(ym_keys))]
+            ax.set_yticks(y_ticks); ax.set_yticklabels(ym_keys, fontweight="bold")
+            top_pad = getattr(self, 'map_top_margin', 78.0) / max(100, max_y * pixel_scale)
+            self.figure_time.subplots_adjust(top=1.0 - top_pad, bottom=0.01, left=0.10, right=0.98)
+            self.canvas_time.setFixedSize(int(max_x * pixel_scale + 100), int(max_y * pixel_scale + 100))
+
+        collection = PatchCollection(patches, facecolors=facecolors, edgecolors=edgecolors, linewidths=linewidths)
+        ax.add_collection(collection)
+        
+        if self.time_show_lines:
+            for div in [12, 24, 36]: 
+                xl = div * (box_w + gap) - (gap / 2.0)
+                ax.axvline(x=xl, color='#b8860b' if is_dark else 'gray', linestyle='--', linewidth=1.5, alpha=0.8)
+
+        ax.set_title(f"24-Hour Time Heatmap [{self.time_layout_mode}] - ({self.time_color_mode})", color=txt_c, fontweight='bold', pad=25)
+        for spine in ['top', 'right', 'bottom', 'left']: ax.spines[spine].set_visible(False)
+        ax.tick_params(axis='both', which='major', length=0)
+        self.canvas_time.draw()
+
     def render_analytics(self):
         if not hasattr(self, 'figure_chart') or not self.figure_chart: return
         self.figure_chart.clear()
@@ -1683,6 +3410,8 @@ class AdvancedSearchWindow(QMainWindow):
         is_dark = True
         if self.main_app and hasattr(self.main_app, 'theme_combo'):
             is_dark = self.main_app.theme_combo.currentText() == "Dark"
+        else:
+            is_dark = QApplication.palette().window().color().lightness() < 128
             
         bg_c, txt_c = ('#0d1117', '#c9d1d9') if is_dark else ('#ffffff', '#24292f')
         grid_c = '#30363d' if is_dark else '#e1e4e8'
@@ -1695,7 +3424,8 @@ class AdvancedSearchWindow(QMainWindow):
             self.canvas_chart.draw(); return
 
         metric = self.combo_chart_metric.currentText()
-        is_size = "(Size MB)" in metric
+        is_size = "Size" in metric
+        is_flat = "Flat" in metric
         
         data_map = defaultdict(float)
         
@@ -1704,7 +3434,7 @@ class AdvancedSearchWindow(QMainWindow):
             size_mb = (r[4] or 0) / (1024*1024)
             val = size_mb if is_size else 1.0
             
-            if is_size and is_fldr: continue 
+            if is_size and is_fldr and not is_flat: continue 
             
             if "Extension" in metric:
                 k = r[3].upper() if r[3] else "NONE"
@@ -1713,7 +3443,7 @@ class AdvancedSearchWindow(QMainWindow):
                 k = r[10] if r[10] else "Others" 
                 data_map[k] += val
             elif "By Tags" in metric:
-                tags_str = r[8]
+                tags_str = r[8] if (is_flat or not is_size) else (r[8] if r[8] else self.inherited_tags.get(r[0]))
                 if tags_str:
                     for t in tags_str.split(','):
                         if t.strip(): data_map[t.strip()] += val
@@ -1726,16 +3456,90 @@ class AdvancedSearchWindow(QMainWindow):
                 mod_str = str(r[5])
                 k = mod_str[:4] if len(mod_str)>=4 else "Unknown"
                 data_map[k] += val
+            elif "Month" in metric:
+                mod_str = str(r[5])
+                k = mod_str[:7] if len(mod_str)>=7 else "Unknown"
+                data_map[k] += val
+            elif "Week" in metric:
+                mod_str = str(r[5])
+                if len(mod_str) >= 10:
+                    try:
+                        dto = datetime.datetime.strptime(mod_str[:10], "%Y-%m-%d")
+                        y, w, _ = dto.isocalendar()
+                        k = f"{y}-W{w:02d}"
+                        data_map[k] += val
+                    except: pass
+            elif "Day" in metric:
+                mod_str = str(r[5])
+                if len(mod_str) >= 10:
+                    try:
+                        dto = datetime.datetime.strptime(mod_str[:10], "%Y-%m-%d")
+                        k = dto.strftime("%A")
+                        data_map[k] += val
+                    except: pass
+            elif "By Date" in metric:
+                mod_str = str(r[5])
+                if len(mod_str) >= 10:
+                    k = mod_str[8:10] 
+                    data_map[k] += val
+            elif "24-Hour Time" in metric:
+                dt_str = str(r[5])
+                if len(dt_str) >= 16:
+                    try:
+                        k = dt_str[11:13] + ":00"
+                        data_map[k] += val
+                    except: pass
 
         if not data_map:
             ax.text(0.5, 0.5, "Insufficient data for this metric", color=txt_c, ha='center', va='center'); ax.axis('off')
             self.canvas_chart.draw(); return
 
-        sorted_items = sorted(data_map.items(), key=lambda x: x[1], reverse=True)[:12]
+        sort_mode = self.combo_chart_sort.currentText()
+        day_order = {"Monday": 1, "Tuesday": 2, "Wednesday": 3, "Thursday": 4, "Friday": 5, "Saturday": 6, "Sunday": 7}
+        
+        # Exact Custom Category Sorting implementation
+        cat_order = {"Images": 1, "Videos": 2, "Audio": 3, "Documents": 4, "Code": 5, "Archives": 6, "Others": 7}
+        
+        if "Category" in metric:
+            if sort_mode == "Sort: Name/Time (Descending)":
+                sorted_items = sorted(data_map.items(), key=lambda x: cat_order.get(x[0], 99), reverse=True)
+            elif sort_mode == "Sort: Name/Time (Ascending)":
+                sorted_items = sorted(data_map.items(), key=lambda x: cat_order.get(x[0], 99), reverse=False)
+            elif sort_mode == "Sort: Value (High to Low)":
+                sorted_items = sorted(data_map.items(), key=lambda x: x[1], reverse=True)
+            else:
+                sorted_items = sorted(data_map.items(), key=lambda x: x[1], reverse=False)
+        else:
+            if sort_mode == "Sort: Value (High to Low)":
+                sorted_items = sorted(data_map.items(), key=lambda x: x[1], reverse=True)
+            elif sort_mode == "Sort: Value (Low to High)":
+                sorted_items = sorted(data_map.items(), key=lambda x: x[1], reverse=False)
+            elif sort_mode == "Sort: Name/Time (Descending)":
+                if "By Day" in metric:
+                    sorted_items = sorted(data_map.items(), key=lambda x: day_order.get(x[0], 99), reverse=True)
+                else:
+                    sorted_items = sorted(data_map.items(), key=lambda x: str(x[0]), reverse=True)
+            else: # Ascending
+                if "By Day" in metric:
+                    sorted_items = sorted(data_map.items(), key=lambda x: day_order.get(x[0], 99), reverse=False)
+                else:
+                    sorted_items = sorted(data_map.items(), key=lambda x: str(x[0]), reverse=False)
+        
+        sorted_items = sorted_items[:31]
+        
         labels = [x[0] for x in sorted_items]
         values = [x[1] for x in sorted_items]
         
-        colors = ["#58a6ff", "#3fb950", "#e3b341", "#a371f7", "#f85149", "#d2a8ff", "#79c0ff", "#2ea043", "#ff7b72", "#bc8cff"]
+        saved_colors = QSettings("vmanOS", "HeatmapColors").value("custom_colors", {})
+        if not isinstance(saved_colors, dict): saved_colors = {}
+        default_cat_colors = {"Images": "#a371f7", "Videos": "#f85149", "Audio": "#ff7b72", "Documents": "#d2a8ff", "Code": "#79c0ff", "Archives": "#e3b341", "Others": "#8b949e"}
+        
+        colors = []
+        for lab in labels:
+            if "Category" in metric: colors.append(saved_colors.get(f"Category_{lab}", default_cat_colors.get(lab, "#8b949e")))
+            elif "Extension" in metric: colors.append(saved_colors.get(f"Extension_{lab}", f"#{min(255, max(100, int(hashlib.md5(lab.encode()).hexdigest()[:6], 16) & 0xFFFFFF)):06x}"))
+            elif "Tags" in metric: colors.append(saved_colors.get(f"Tag_{lab}", f"#{min(255, max(100, int(hashlib.md5(lab.encode()).hexdigest()[:6], 16) & 0xFFFFFF)):06x}"))
+            else: colors.append("#58a6ff")
         
         ax.bar(labels, values, color=colors, edgecolor=bg_c)
         
