@@ -25,7 +25,7 @@ from PySide6.QtWidgets import (
     QStatusBar, QSizePolicy, QFormLayout, QDockWidget, QToolButton,
     QStackedWidget, QListView, QTabWidget, QSlider, QStyle, QGraphicsOpacityEffect, 
     QScrollArea, QDialog, QGraphicsView, QGraphicsScene, QTextBrowser, 
-    QTableWidget, QTableWidgetItem, QCheckBox, QCalendarWidget, QSpinBox, 
+    QTableWidget, QTableWidgetItem, QCheckBox, QCalendarWidget, QSpinBox, QDoubleSpinBox, 
     QGridLayout, QFrame, QSplitter, QListWidget, QListWidgetItem, QGroupBox, QFormLayout, QProgressBar
 )
 
@@ -476,27 +476,19 @@ class TagLibraryLoaderThread(QThread):
         tag_cache = {}
         try:
             with sqlite3.connect(self.db_path, timeout=10) as conn:
+                # --- LINUX OPTIMIZATION: Boosts read speed by up to 10x ---
                 conn.execute("PRAGMA journal_mode=WAL;")
                 conn.execute("PRAGMA synchronous=NORMAL;")
                 conn.execute("PRAGMA cache_size=-64000;")
+                
                 cur = conn.cursor()
-                
-                # --- CPU OPTIMIZATION: Only fetch files that actually have tags! ---
-                # Reduces Linux RAM/CPU usage by 99% on massive databases
-                cur.execute("SELECT parent_path, name, custom_tags, is_folder FROM virtual_fs WHERE parent_path LIKE ? AND custom_tags IS NOT NULL AND custom_tags != '' AND in_trash=0", (f"{self.base_v_path}%",))
-                
+                cur.execute("SELECT parent_path, name, custom_tags, is_folder FROM virtual_fs WHERE parent_path LIKE ?", (f"{self.base_v_path}%",))
                 for pp, name, tags, is_folder in cur.fetchall():
                     full_path = f"{pp}{name}/" if is_folder else f"{pp}{name}"
                     full_path = full_path.replace("//", "/")
-                    tag_cache[full_path] = [t.strip() for t in str(tags).split(',')] if tags else []
                     
-                    # Reconstruct parent folder tree purely from tagged items
-                    parts = [p for p in pp.split('/') if p]
-                    curr = "/"
-                    for p in parts:
-                        curr += p + "/"
-                        if curr not in tag_cache: tag_cache[curr] = []
-                        
+                    # Store ALL files and folders so the columns explore completely
+                    tag_cache[full_path] = [t.strip() for t in str(tags).split(',')] if tags else []
         except Exception as e: 
             print(f"DB Load Error: {e}")
             
@@ -636,6 +628,16 @@ class SizeTableWidgetItem(QTableWidgetItem):
         if isinstance(other, SizeTableWidgetItem):
             return self.size_bytes < other.size_bytes
         return super().__lt__(other)
+        
+class CustomSortWidgetItem(QTableWidgetItem):
+    def __init__(self, text, sort_val):
+        super().__init__(text)
+        self.sort_val = sort_val
+
+    def __lt__(self, other):
+        if hasattr(other, 'sort_val'):
+            return self.sort_val < other.sort_val
+        return super().__lt__(other)        
 
 class SpaceScannerThread(QThread):
     progress = Signal(int, int, str)
@@ -2158,18 +2160,27 @@ class vmanTagLibraryDialog(QDialog):
         lst.blockSignals(True)
         lst.clear()
         
-        for name in sorted(list(items)):
-            item = QListWidgetItem(name)
-            
+        # High-speed grouping: Folders vs Files
+        folders, files = [], []
+        cache_keys = self.tag_cache.keys()
+        
+        for name in items:
             test_folder = f"{prefix_path}{name}/"
-            test_file = f"{prefix_path}{name}"
+            is_fldr = test_folder in self.tag_cache or any(p.startswith(test_folder) for p in cache_keys)
             
-            # --- UPDATED: Uses the new high-speed icon fetcher ---
-            is_fldr = test_folder in self.tag_cache or any(p.startswith(test_folder) for p in self.tag_cache.keys())
-            item.setData(Qt.UserRole, test_folder if is_fldr else test_file)
-            item.setIcon(self._get_icon_for_node(name, is_fldr))
-            # -----------------------------------------------------
+            if is_fldr:
+                folders.append((name, True, test_folder))
+            else:
+                files.append((name, False, f"{prefix_path}{name}"))
                 
+        # Sort alphabetically, ensuring Folders appear before Files
+        folders.sort(key=lambda x: natural_sort_key(x[0]))
+        files.sort(key=lambda x: natural_sort_key(x[0]))
+        
+        for name, is_fldr, node_v_path in (folders + files):
+            item = QListWidgetItem(name)
+            item.setData(Qt.UserRole, node_v_path)
+            item.setIcon(self._get_icon_for_node(name, is_fldr))
             lst.addItem(item)
             
         lst.blockSignals(False)
@@ -2266,7 +2277,11 @@ class vmanTagLibraryDialog(QDialog):
                     node_v_path = "/" + "/".join(parts[:base_depth + i + 1]) + ("/" if is_folder else "")
                     level_nodes[name] = (node_v_path, is_folder)
             
-            sorted_names = sorted(level_nodes.keys())
+            # Sort folders first, then files alphabetically
+            f_nodes = [k for k, v in level_nodes.items() if v[1]]
+            file_nodes = [k for k, v in level_nodes.items() if not v[1]]
+            sorted_names = sorted(f_nodes, key=natural_sort_key) + sorted(file_nodes, key=natural_sort_key)
+            
             display_names = sorted_names[:1000]
             
             for j, name in enumerate(display_names):
@@ -2391,7 +2406,11 @@ class vmanTagLibraryDialog(QDialog):
                     level_nodes[name] = (node_v_path, is_folder)
             
             # --- FREEZE PREVENTION: Cap UI rendering to 1000 items per column ---
-            sorted_names = sorted(level_nodes.keys())
+            # Sort folders first, then files alphabetically
+            f_nodes = [k for k, v in level_nodes.items() if v[1]]
+            file_nodes = [k for k, v in level_nodes.items() if not v[1]]
+            sorted_names = sorted(f_nodes, key=natural_sort_key) + sorted(file_nodes, key=natural_sort_key)
+            
             display_names = sorted_names[:1000]
             
             for j, name in enumerate(display_names):
@@ -2915,11 +2934,108 @@ class RowLimitDialog(QDialog):
         elif idx == 3: return self.total_rows, 0
         else: return self.spin_limit.value(), self.spin_offset.value()
 
+class HeatmapFilterDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Heatmap Advanced Filters")
+        self.resize(450, 400)
+        if parent and hasattr(parent, 'styleSheet'): self.setStyleSheet(parent.styleSheet())
+        
+        self.settings = QSettings("vmanOS", "HeatmapFilters")
+        layout = QFormLayout(self)
+        
+        # --- NEW: Advanced Search & Category Filters ---
+        self.txt_search = QLineEdit(str(self.settings.value("search_text", "")))
+        self.txt_search.setPlaceholderText("Search string...")
+        
+        self.combo_match = QComboBox()
+        self.combo_match.addItems(["Contains", "Exact Match", "Starts With", "Ends With"])
+        self.combo_match.setCurrentText(str(self.settings.value("match_mode", "Contains")))
+        
+        self.combo_type = QComboBox()
+        self.combo_type.addItems(["Files Only", "Folders Only", "Files & Folders"])
+        self.combo_type.setCurrentText(str(self.settings.value("data_type", "Files Only")))
+        
+        self.combo_cat = QComboBox()
+        self.combo_cat.addItems(["All", "Images", "Videos", "Audio", "Documents", "Code", "Archives", "Others"])
+        self.combo_cat.setCurrentText(str(self.settings.value("category", "All")))
+        
+        self.txt_skip_names = QLineEdit(str(self.settings.value("skip_names", "")))
+        self.txt_skip_names.setPlaceholderText("e.g. thumb.jpg, backup.tar")
+        # -----------------------------------------------
+        
+        self.txt_inc = QLineEdit(str(self.settings.value("include_exts", "")))
+        self.txt_inc.setPlaceholderText("e.g. jpg, png, mp4")
+        self.txt_exc = QLineEdit(str(self.settings.value("exclude_exts", "")))
+        self.txt_exc.setPlaceholderText("e.g. tmp, bak")
+        
+        self.spin_min = QDoubleSpinBox()
+        self.spin_min.setRange(0, 999999)
+        self.spin_min.setValue(float(self.settings.value("min_size_mb", 0.0)))
+        self.spin_min.setSuffix(" MB")
+        
+        self.spin_max = QDoubleSpinBox()
+        self.spin_max.setRange(0, 999999)
+        self.spin_max.setValue(float(self.settings.value("max_size_mb", 999999.0)))
+        self.spin_max.setSuffix(" MB")
+        
+        layout.addRow("Search Name:", self.txt_search)
+        layout.addRow("Match Mode:", self.combo_match)
+        layout.addRow("Data Type:", self.combo_type)
+        layout.addRow("Category:", self.combo_cat)
+        layout.addRow("Skip Names:", self.txt_skip_names)
+        layout.addRow("Include Exts:", self.txt_inc)
+        layout.addRow("Exclude Exts:", self.txt_exc)
+        layout.addRow("Min Size:", self.spin_min)
+        layout.addRow("Max Size:", self.spin_max)
+        
+        btn_box = QHBoxLayout()
+        btn_clear = QPushButton("Clear Filters")
+        btn_clear.clicked.connect(self.clear_filters)
+        btn_apply = QPushButton("Apply & Render")
+        btn_apply.setStyleSheet("background-color: #2ea043; color: white; font-weight: bold;")
+        btn_apply.clicked.connect(self.accept)
+        
+        btn_box.addWidget(btn_clear)
+        btn_box.addWidget(btn_apply)
+        layout.addRow(btn_box)
+
+    def clear_filters(self):
+        self.txt_search.clear()
+        self.combo_match.setCurrentIndex(0)
+        self.combo_type.setCurrentIndex(0)
+        self.combo_cat.setCurrentIndex(0)
+        self.txt_skip_names.clear()
+        self.txt_inc.clear()
+        self.txt_exc.clear()
+        self.spin_min.setValue(0)
+        self.spin_max.setValue(999999)
+
+    def accept(self):
+        self.settings.setValue("search_text", self.txt_search.text().strip())
+        self.settings.setValue("match_mode", self.combo_match.currentText())
+        self.settings.setValue("data_type", self.combo_type.currentText())
+        self.settings.setValue("category", self.combo_cat.currentText())
+        self.settings.setValue("skip_names", self.txt_skip_names.text().strip())
+        self.settings.setValue("include_exts", self.txt_inc.text().strip())
+        self.settings.setValue("exclude_exts", self.txt_exc.text().strip())
+        self.settings.setValue("min_size_mb", self.spin_min.value())
+        self.settings.setValue("max_size_mb", self.spin_max.value())
+        super().accept()
+
 class TimelineDiaryDialog(QDialog):
     def __init__(self, db_path, parent=None):
         super().__init__(parent)
         self.db_path = db_path
         self.setWindowTitle("Timeline Diary & Analytics")
+        
+        # --- PRIVACY ENFORCEMENT: Wipe Heatmap traces on launch, keep only exclusions ---
+        heat_settings = QSettings("vmanOS", "HeatmapFilters")
+        saved_exc = heat_settings.value("exclude_exts", "")
+        heat_settings.clear()
+        heat_settings.setValue("exclude_exts", saved_exc)
+        # -------------------------------------------------------------------------------
+        
         # --Add Minimize, Maximize, and Restore buttons ---
         self.setWindowFlags(self.windowFlags() | Qt.WindowMaximizeButtonHint | Qt.WindowMinimizeButtonHint)
         self.resize(1100, 670)
@@ -3077,8 +3193,23 @@ class TimelineDiaryDialog(QDialog):
         self.table.horizontalHeader().customContextMenuRequested.connect(self.show_header_menu)
         
         self.table.setColumnWidth(0, 50); self.table.setColumnWidth(1, 220); self.table.setColumnWidth(2, 80)
-        self.table.setColumnWidth(3, 60); self.table.setColumnWidth(4, 80); self.table.setColumnWidth(5, 140)
-        self.table.horizontalHeader().setSectionResizeMode(6, QHeaderView.Stretch)
+        # Establish default widths for all 9 columns
+        self.table.setColumnWidth(0, 50)
+        self.table.setColumnWidth(1, 220)
+        self.table.setColumnWidth(2, 80)
+        self.table.setColumnWidth(3, 60)
+        self.table.setColumnWidth(4, 80)
+        self.table.setColumnWidth(5, 140)
+        self.table.setColumnWidth(6, 300) # Virtual Location (~3 inches)
+        self.table.setColumnWidth(7, 150) # Tags
+        self.table.setColumnWidth(8, 120) # ID
+        
+        # Completely unlock column boundaries to allow infinite rightward resizing
+        self.table.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
+        self.table.horizontalHeader().setStretchLastSection(False)
+        for c in range(9):
+            self.table.horizontalHeader().setSectionResizeMode(c, QHeaderView.Interactive)
+            
         self.table.setColumnHidden(0, True) # Hide S.No by default
         self.table.setColumnHidden(8, True) # Hide ID by default
         
@@ -3086,6 +3217,16 @@ class TimelineDiaryDialog(QDialog):
         saved_state = self.settings.value("table_state")
         if saved_state: self.table.horizontalHeader().restoreState(saved_state)
         
+        # --- PERMANENT RESIZE FIX: Override any corrupted saved states ---
+        self.table.horizontalHeader().setStretchLastSection(False)
+        self.table.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
+        for c in range(9):
+            self.table.horizontalHeader().setSectionResizeMode(c, QHeaderView.Interactive)
+            # Failsafe: if a column got squished to 0 in memory, reset it to make the drag handle appear
+            if self.table.columnWidth(c) < 30: 
+                self.table.setColumnWidth(c, 150)
+        # -----------------------------------------------------------------
+
         data_lay.addWidget(self.table)
         self.tabs.addTab(tab_data, "📋 Activity Log")
         
@@ -3181,9 +3322,11 @@ class TimelineDiaryDialog(QDialog):
         heat_bar.addStretch()
         heat_lay.addLayout(heat_bar)
         
+        # Heatmap advanced filters
         self.fig_heat = Figure(figsize=(10, 3), dpi=100)
         self.fig_heat.patch.set_facecolor('#0d1117')
         self.canvas_heat = FigureCanvasQTAgg(self.fig_heat)
+        self.canvas_heat.mpl_connect('button_press_event', self.on_heatmap_click)
         
         heat_scroll_area = QScrollArea()
         heat_scroll_area.setWidgetResizable(True)
@@ -3191,6 +3334,172 @@ class TimelineDiaryDialog(QDialog):
         heat_lay.addWidget(heat_scroll_area)
         
         self.tabs.addTab(tab_heatmap, "📅 Yearly Activity")
+
+        # --- TAB 6: Deep Report (NEW) ---
+        tab_report = QWidget()
+        rep_lay = QVBoxLayout(tab_report)
+        rep_lay.setContentsMargins(0, 0, 0, 0)
+
+        # --- Report Filter Bar (SLIM & SMALL TEXT) ---
+        rep_filter_bg = QWidget()
+        rep_filter_bg.setStyleSheet("background-color: #161b22; border-bottom: 1px solid #30363d;")
+        rep_filter_lay = QHBoxLayout(rep_filter_bg)
+        rep_filter_lay.setContentsMargins(5, 4, 5, 4) # Slim margins
+        
+        self.cb_rep_from_year = QComboBox(); self.cb_rep_from_year.setMinimumWidth(65)
+        self.cb_rep_to_year = QComboBox(); self.cb_rep_to_year.setMinimumWidth(65)
+        self.cb_rep_month = QComboBox(); self.cb_rep_month.setMinimumWidth(110) # <-- Increased width for month names
+        self.cb_rep_month.addItems(["All", "01 - January", "02 - February", "03 - March", "04 - April", "05 - May", "06 - June", "07 - July", "08 - August", "09 - September", "10 - October", "11 - November", "12 - December"])
+        self.cb_rep_dow = QComboBox()
+        self.cb_rep_dow.addItems(["All", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"])
+        self.cb_rep_groupby = QComboBox()
+        self.cb_rep_groupby.addItems(["Day", "Week", "Month", "Year", "Day of Week"])
+        
+        # Apply smaller font AND slim dropdown scrollbars
+        slim_combo_style = """
+            QComboBox { font-size: 11px; padding: 2px; }
+            QComboBox QAbstractItemView {
+                background: #161b22;
+                border: 1px solid #30363d;
+            }
+            QComboBox QAbstractItemView QScrollBar:vertical {
+                border: none; background: #0d1117; width: 6px; margin: 0px;
+            }
+            QComboBox QAbstractItemView QScrollBar::handle:vertical {
+                background: #30363d; border-radius: 3px; min-height: 20px;
+            }
+            QComboBox QAbstractItemView QScrollBar::handle:vertical:hover {
+                background: #58a6ff;
+            }
+            QComboBox QAbstractItemView QScrollBar::add-line:vertical, 
+            QComboBox QAbstractItemView QScrollBar::sub-line:vertical {
+                border: none; background: none; height: 0px;
+            }
+        """
+        for cb in [self.cb_rep_from_year, self.cb_rep_to_year, self.cb_rep_month, self.cb_rep_dow, self.cb_rep_groupby]:
+            cb.setStyleSheet(slim_combo_style)
+
+        self.btn_rep_generate = QPushButton("📈 Generate")
+        self.btn_rep_generate.setStyleSheet("QPushButton { background-color: #243447; color: #dbe7f3; font-weight: bold; padding: 4px 12px; border-radius: 4px; font-size: 11px; } QPushButton:hover { background-color: #2f4358; }")
+        self.btn_rep_generate.clicked.connect(self.generate_deep_report)
+
+        rep_filter_lay.addWidget(QLabel("<span style='font-size: 11px;'><b>From:</b></span>")); rep_filter_lay.addWidget(self.cb_rep_from_year)
+        rep_filter_lay.addWidget(QLabel("<span style='font-size: 11px;'><b>To:</b></span>")); rep_filter_lay.addWidget(self.cb_rep_to_year)
+        rep_filter_lay.addWidget(QLabel("<span style='font-size: 11px;'><b>Month:</b></span>")); rep_filter_lay.addWidget(self.cb_rep_month)
+        rep_filter_lay.addWidget(QLabel("<span style='font-size: 11px;'><b>Day:</b></span>")); rep_filter_lay.addWidget(self.cb_rep_dow)
+        rep_filter_lay.addWidget(QLabel("<span style='font-size: 11px;'><b>Group By:</b></span>")); rep_filter_lay.addWidget(self.cb_rep_groupby)
+        rep_filter_lay.addSpacing(5)
+        rep_filter_lay.addWidget(self.btn_rep_generate)
+        rep_filter_lay.addStretch()
+
+        rep_lay.addWidget(rep_filter_bg)
+
+        self.rep_scroll = QScrollArea()
+        self.rep_scroll.setWidgetResizable(True)
+        self.rep_scroll.setFrameShape(QScrollArea.NoFrame)
+        self.rep_scroll.setStyleSheet("QScrollArea { background-color: #0d1117; }")
+        
+        self.rep_container = QWidget()
+        self.rep_vbox = QVBoxLayout(self.rep_container)
+        self.rep_vbox.setSpacing(25) 
+        self.rep_vbox.setContentsMargins(20, 15, 20, 30)
+
+        # Overview Stats (SMALL TEXT)
+        self.rep_lbl_overview = QLabel("<b>Overview:</b> Select filters and click Generate Report.")
+        self.rep_lbl_overview.setStyleSheet("font-size: 12px; color: #c9d1d9; background: #161b22; padding: 12px; border-radius: 6px; border: 1px solid #30363d; line-height: 1.4;")
+        self.rep_lbl_overview.setWordWrap(True)
+        self.rep_vbox.addWidget(self.rep_lbl_overview)
+
+        # Charts Canvas
+        self.fig_rep = Figure(figsize=(12, 9), dpi=100) 
+        self.fig_rep.patch.set_facecolor('#0d1117')
+        self.canvas_rep = FigureCanvasQTAgg(self.fig_rep)
+        self.canvas_rep.setMinimumHeight(700) 
+        self.rep_vbox.addWidget(self.canvas_rep)
+        
+        # --- CTRL+SCROLL TO ZOOM FEATURE ---
+        def on_rep_scroll(event):
+            from PySide6.QtGui import QGuiApplication
+            from PySide6.QtCore import Qt
+            
+            # Use PySide6 hardware detection to perfectly catch Ctrl key on Linux/Windows
+            modifiers = QGuiApplication.keyboardModifiers()
+            if event.inaxes and (modifiers == Qt.ControlModifier):
+                ax = event.inaxes
+                # Scroll up (step > 0) = Zoom In, Scroll down = Zoom Out
+                scale_factor = 0.85 if event.step > 0 else 1.15
+                
+                xdata, ydata = event.xdata, event.ydata
+                if xdata is None or ydata is None: return
+                
+                xlim, ylim = ax.get_xlim(), ax.get_ylim()
+                
+                # Math to zoom directly into the mouse cursor position
+                new_xlim = [xdata + (x - xdata) * scale_factor for x in xlim]
+                new_ylim = [ydata + (y - ydata) * scale_factor for y in ylim]
+                
+                ax.set_xlim(new_xlim)
+                ax.set_ylim(new_ylim)
+                self.canvas_rep.draw_idle()
+                
+        self.canvas_rep.mpl_connect('scroll_event', on_rep_scroll)
+
+        # Helper method to create styled, SORTABLE tables
+        def create_rep_table(headers):
+            tbl = QTableWidget(0, len(headers))
+            tbl.setHorizontalHeaderLabels(headers)
+            tbl.verticalHeader().setVisible(False)
+            tbl.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+            tbl.horizontalHeader().setStretchLastSection(True)
+            tbl.setEditTriggers(QAbstractItemView.NoEditTriggers)
+            tbl.setSelectionBehavior(QAbstractItemView.SelectRows)
+            tbl.setCursor(Qt.PointingHandCursor)
+            tbl.setSortingEnabled(True) # ENABLE SORTING
+            tbl.setMinimumHeight(350) 
+            tbl.setAlternatingRowColors(True)
+            tbl.setStyleSheet("""
+                QTableWidget { background-color: #0d1117; alternate-background-color: #161b22; border: 1px solid #30363d; border-radius: 6px; }
+                QHeaderView::section { background-color: #21262d; color: #c9d1d9; font-weight: bold; padding: 8px; border: 1px solid #30363d; }
+            """)
+            tbl.cellDoubleClicked.connect(self.handle_report_drilldown)
+            return tbl
+
+        # Initialize Tables
+        self.tbl_rep_group = create_rep_table(["Group", "Files", "Size"])
+        self.tbl_rep_cat = create_rep_table(["Category", "Files", "Size"])
+        self.tbl_rep_ext = create_rep_table(["Extension", "Files", "Size"])
+        self.tbl_rep_tag = create_rep_table(["Tag", "Files", "Size", "Avg Size"])
+        self.tbl_rep_largest = create_rep_table(["Largest Files", "Size", "Type", "ID"])
+        self.tbl_rep_smallest = create_rep_table(["Smallest Files", "Size", "Type", "ID"])
+
+        # Hide internal ID columns
+        self.tbl_rep_largest.setColumnHidden(3, True)
+        self.tbl_rep_smallest.setColumnHidden(3, True)
+        
+        # FIX: Allow interactive resizing while still stretching to fill the right side!
+        self.tbl_rep_largest.horizontalHeader().setSectionResizeMode(0, QHeaderView.Interactive)
+        self.tbl_rep_smallest.horizontalHeader().setSectionResizeMode(0, QHeaderView.Interactive)
+
+        # Helper to add full-width sections cleanly
+        def add_section(title, subtitle, widget):
+            header = QLabel(f"<span style='font-size: 20px; color: #58a6ff; font-weight: bold;'>{title}</span><br><span style='color: #8b949e; font-size: 13px;'>{subtitle}</span>")
+            self.rep_vbox.addWidget(header)
+            self.rep_vbox.addWidget(widget)
+
+        # Add Full-Width Stacked Layout
+        add_section("📅 Temporal Grouping", "Double-click any row to filter the Activity Log to that specific time period.", self.tbl_rep_group)
+        add_section("📁 Data by Category", "Distribution of storage and file counts across major file categories.", self.tbl_rep_cat)
+        add_section("📄 Top 50 Extensions", "Most dominant file formats matching your current filters.", self.tbl_rep_ext)
+        add_section("🏷️ Custom Tag Utilization", "File metrics grouped by your user-defined tags.", self.tbl_rep_tag)
+        add_section("🐘 Top 20 Largest Files", "Heaviest outliers in the current dataset (Double click to locate).", self.tbl_rep_largest)
+        add_section("🦠 Top 20 Smallest Files", "Smallest tracked items (Double click to locate).", self.tbl_rep_smallest)
+        
+        self.rep_vbox.addStretch()
+        self.rep_scroll.setWidget(self.rep_container)
+        rep_lay.addWidget(self.rep_scroll)
+
+        self.tabs.addTab(tab_report, "📑 Report")
+
 
         # Layout Assembly
         self.splitter.addWidget(left_widget)
@@ -3212,7 +3521,372 @@ class TimelineDiaryDialog(QDialog):
         today = QDate.currentDate()
         self.calendar.setSelectedDate(today)
         self.highlight_month(today.year(), today.month())
-    
+
+    def on_heatmap_click(self, event):
+        if event.inaxes != self.fig_heat.axes[0] or event.xdata is None or event.ydata is None: return
+        year_str = self.cb_heat_year.currentText()
+        if not year_str or year_str == "All": return
+        try: start_date = dt_lib.date(int(year_str), 1, 1)
+        except ValueError: return
+        
+        grid_settings = QSettings("vmanOS", "HeatmapGridSettings")
+        block_spacing = grid_settings.value("block_spacing", "Normal")
+        gap_x, gap_y = 0.2, 0.2
+        if block_spacing == "Touching (No Gap)": gap_x, gap_y = 0.0, 0.0
+        elif block_spacing == "Wide": gap_x, gap_y = 0.5, 0.5
+        elif block_spacing == "Custom":
+            gap_x = grid_settings.value("custom_gap_x", 0.1, type=float)
+            gap_y = grid_settings.value("custom_gap_y", 0.1, type=float)
+            
+        layout_style = grid_settings.value("layout_style", "Standard")
+        if layout_style == "Pure GitHub": gap_x, gap_y = 0.2, 0.2
+        elif layout_style == "Weeks View (Spreadsheet)": gap_x, gap_y = 0.0, 0.0
+        
+        col = int(event.xdata / (1.0 + gap_x))
+        row = int(event.ydata / (1.0 + gap_y))
+        
+        start_weekday = start_date.weekday()
+        day_offset = (col * 7) + row - start_weekday
+        
+        if 0 <= day_offset <= (dt_lib.date(int(year_str), 12, 31) - start_date).days:
+            clicked_date = start_date + dt_lib.timedelta(days=day_offset)
+            from PySide6.QtCore import QDate
+            qdate = QDate(clicked_date.year, clicked_date.month, clicked_date.day)
+            self.calendar.setSelectedDate(qdate)
+            
+            # --- START FILTER INJECTION LOGIC ---
+            date_str = qdate.toString("yyyy-MM-dd")
+            db_col = "creation_date" if getattr(self, 'date_mode_cre', None) and self.date_mode_cre.isChecked() else "modified"
+            
+            filter_settings = QSettings("vmanOS", "HeatmapFilters")
+            search_text = str(filter_settings.value("search_text", "")).strip()
+            match_mode = str(filter_settings.value("match_mode", "Contains"))
+            data_type = str(filter_settings.value("data_type", "Files Only"))
+            category = str(filter_settings.value("category", "All"))
+            skip_names = [x.strip().lower() for x in str(filter_settings.value("skip_names", "")).split(',') if x.strip()]
+            inc_exts = [x.strip().lower() for x in str(filter_settings.value("include_exts", "")).split(',') if x.strip()]
+            exc_exts = [x.strip().lower() for x in str(filter_settings.value("exclude_exts", "")).split(',') if x.strip()]
+            min_bytes = int(float(filter_settings.value("min_size_mb", 0.0)) * 1024 * 1024)
+            max_bytes = int(float(filter_settings.value("max_size_mb", 999999.0)) * 1024 * 1024)
+            
+            where_sql = f"{db_col} LIKE ? AND in_trash=0"
+            params = [f"{date_str}%"]
+            
+            if data_type == "Files Only": where_sql += " AND is_folder=0"
+            elif data_type == "Folders Only": where_sql += " AND is_folder=1"
+            
+            if category != "All":
+                where_sql += " AND category=?"
+                params.append(category)
+                
+            if search_text:
+                where_sql += " AND LOWER(name) LIKE ?"
+                if match_mode == "Exact Match": params.append(search_text.lower())
+                elif match_mode == "Starts With": params.append(f"{search_text.lower()}%")
+                elif match_mode == "Ends With": params.append(f"%{search_text.lower()}")
+                else: params.append(f"%{search_text.lower()}%")
+                
+            if skip_names:
+                for skip_val in skip_names:
+                    where_sql += " AND LOWER(name) NOT LIKE ?"
+                    params.append(f"%{skip_val}%")
+            
+            if inc_exts:
+                ext_placeholders = ",".join(["?"] * len(inc_exts))
+                inc_exts = [ext if ext.startswith('.') else f".{ext}" for ext in inc_exts]
+                where_sql += f" AND LOWER(extension) IN ({ext_placeholders})"
+                params.extend(inc_exts)
+                
+            if exc_exts:
+                ext_placeholders = ",".join(["?"] * len(exc_exts))
+                exc_exts = [ext if ext.startswith('.') else f".{ext}" for ext in exc_exts]
+                where_sql += f" AND LOWER(extension) NOT IN ({ext_placeholders})"
+                params.extend(exc_exts)
+                
+            if min_bytes > 0:
+                where_sql += " AND size >= ?"
+                params.append(min_bytes)
+            if max_bytes < int(999999.0 * 1024 * 1024):
+                where_sql += " AND size <= ?"
+                params.append(max_bytes)
+            
+            query = f"SELECT id, name, is_folder, extension, size, parent_path, {db_col}, custom_tags FROM virtual_fs WHERE {where_sql}"
+            self.execute_search(query, tuple(params), update_highlights=False)
+            
+            # Update HTML Diary with exactly the same constraints
+            with sqlite3.connect(self.db_path) as conn:
+                diary_query = f"SELECT SUBSTR({db_col}, 12, 8), name, parent_path, size, category FROM virtual_fs WHERE {where_sql} ORDER BY {db_col} ASC LIMIT 150"
+                entries = conn.cursor().execute(diary_query, tuple(params)).fetchall()
+                
+            html = f"<h1 style='color:#58a6ff; text-align:center;'>📖 System Timeline: {qdate.toString('dddd, MMMM d, yyyy')}</h1><hr>"
+            if not entries: 
+                html += "<h3 style='color:#8b949e; text-align:center;'><br><br>No system activity recorded matching these filters.</h3>"
+            else:
+                if len(entries) == 150:
+                    html += f"<p style='color:#e3b341; text-align:center;'><b>Showing first 150 activities. Check Activity Log tab for full list.</b></p><br>"
+                else:
+                    html += f"<p style='color:#c9d1d9; text-align:center;'><b>{len(entries)}</b> files were logged.</p><br>"
+                
+                html += "<ul style='list-style-type: none; padding-left: 0;'>"
+                cat_colors = {"Images": "#a371f7", "Videos": "#f85149", "Audio": "#ff7b72", "Documents": "#d2a8ff", "Code": "#79c0ff", "Others": "#8b949e"}
+                action_verb = "Created" if getattr(self, 'date_mode_cre', None) and self.date_mode_cre.isChecked() else "Modified"
+                
+                for time_str, name, pp, size, cat in entries:
+                    c_color = cat_colors.get(cat, "#8b949e")
+                    try: safe_size = human_size(size)
+                    except: safe_size = f"{size} bytes"
+                    
+                    html += f"<li style='margin-bottom: 15px; background-color: rgba(33, 38, 45, 0.6); padding: 12px; border-left: 5px solid {c_color}; border-radius: 6px;'><span style='color: #58a6ff; font-size: 15px;'><b>🕒 {time_str}</b></span><br><span style='font-size: 16px; color: white;'>{action_verb} <b style='color: {c_color};'>{name}</b></span> <span style='color: #8b949e; font-size: 13px;'>({safe_size})</span><br><span style='color: #8b949e; font-size: 13px;'>Path: {pp}</span></li>"
+                html += "</ul>"
+            self.diary_browser.setHtml(html)
+            # --- END FILTER INJECTION LOGIC ---
+
+            self.tabs.setCurrentIndex(1) # Instantly switch to Activity Log
+            
+    def generate_deep_report(self):
+        # --- AUTO-PATCH: Fix Stale or Missing Categories in Database ---
+        # This instantly fixes the issue where archives were scanned as 'Others', left blank, or saved as singular 'Archive'
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("PRAGMA journal_mode=WAL;")
+            # Covers extensions both with and without dots just to be perfectly safe
+            conn.execute("UPDATE virtual_fs SET category = 'Archives' WHERE LOWER(extension) IN ('.zip', '.rar', '.7z', '.tar', '.gz', 'zip', 'rar', '7z', 'tar', 'gz')")
+            conn.execute("UPDATE virtual_fs SET category = 'Archives' WHERE category = 'Archive'")
+            conn.commit()
+
+        # --- SETUP FILTERS ---
+        f_year = self.cb_rep_from_year.currentText()
+        t_year = self.cb_rep_to_year.currentText()
+        month = self.cb_rep_month.currentText()
+        dow = self.cb_rep_dow.currentText()
+        groupby = self.cb_rep_groupby.currentText()
+
+        col = "creation_date" if getattr(self, 'date_mode_cre', None) and self.date_mode_cre.isChecked() else "modified"
+
+        where_clauses = ["is_folder=0", "in_trash=0", f"{col} IS NOT NULL", f"{col} != ''"]
+        params = []
+
+        if f_year and f_year != "All":
+            where_clauses.append(f"SUBSTR({col}, 1, 4) >= ?"); params.append(f_year)
+        if t_year and t_year != "All":
+            where_clauses.append(f"SUBSTR({col}, 1, 4) <= ?"); params.append(t_year)
+        if month != "All":
+            where_clauses.append(f"SUBSTR({col}, 6, 2) = ?"); params.append(month[:2])
+
+        dow_map = {"Sunday": "0", "Monday": "1", "Tuesday": "2", "Wednesday": "3", "Thursday": "4", "Friday": "5", "Saturday": "6"}
+        if dow != "All":
+            where_clauses.append(f"strftime('%w', {col}) = ?"); params.append(dow_map[dow])
+
+        base_where = " AND ".join(where_clauses)
+
+        self.rep_base_where = base_where
+        self.rep_base_params = tuple(params)
+        self.rep_date_col = col
+
+        prog = QProgressDialog("Generating Deep Report Analytics...", "Cancel", 0, 100, self)
+        prog.setWindowModality(Qt.WindowModal)
+        prog.show(); QApplication.processEvents()
+
+        with sqlite3.connect(self.db_path) as conn:
+            cur = conn.cursor()
+
+            # 1. Overview
+            prog.setLabelText("Calculating Overview..."); prog.setValue(10); QApplication.processEvents()
+            cur.execute(f"SELECT COUNT(id), SUM(size), AVG(size), MAX(size), MIN(size) FROM virtual_fs WHERE {base_where}", params)
+            tot_count, tot_size, avg_size, max_size, min_size = cur.fetchone()
+
+            if not tot_count:
+                self.rep_lbl_overview.setText("<b>Overview:</b> No data found for the selected filters.")
+                prog.close(); return
+
+            self.rep_lbl_overview.setText(f"<b>Overview:</b> <b>Total Files:</b> {tot_count:,} &nbsp;|&nbsp; <b>Total Size:</b> {human_size(tot_size)} &nbsp;|&nbsp; <b>Avg Size:</b> {human_size(avg_size)} &nbsp;|&nbsp; <b>Max Size:</b> {human_size(max_size)} &nbsp;|&nbsp; <b>Min Size:</b> {human_size(min_size)}")
+
+            # 2. Group By Engine
+            prog.setLabelText("Grouping Data..."); prog.setValue(20); QApplication.processEvents()
+            if groupby == "Day": gb_sql = f"SUBSTR({col}, 1, 10)"
+            elif groupby == "Month": gb_sql = f"SUBSTR({col}, 1, 7)"
+            elif groupby == "Year": gb_sql = f"SUBSTR({col}, 1, 4)"
+            elif groupby == "Week": gb_sql = f"strftime('%W', {col})"
+            elif groupby == "Day of Week": gb_sql = f"strftime('%w', {col})"
+
+            cur.execute(f"SELECT {gb_sql}, COUNT(id), SUM(size) FROM virtual_fs WHERE {base_where} GROUP BY {gb_sql} ORDER BY {gb_sql}", params)
+            grp_data = cur.fetchall()
+            self._fill_report_table(self.tbl_rep_group, grp_data, format_size=True, map_dow=(groupby=="Day of Week"))
+
+            # 3. Categories (Enforce Custom Order & Guarantee All Categories Exist)
+            prog.setLabelText("Analyzing Categories..."); prog.setValue(40); QApplication.processEvents()
+            cur.execute(f"SELECT category, COUNT(id), SUM(size) FROM virtual_fs WHERE {base_where} GROUP BY category", params)
+            cat_data_raw = cur.fetchall()
+            
+            # Convert raw SQL to dictionary
+            db_cat_dict = {r[0] if r[0] else "Others": (r[1], r[2]) for r in cat_data_raw}
+            
+            # Strict Template ensures they are injected in this exact order
+            cat_order = ["Images", "Videos", "Audio", "Documents", "Code", "Archives", "Others"]
+            cat_data = []
+            for c in cat_order:
+                count, size = db_cat_dict.get(c, (0, 0))
+                cat_data.append((c, count, size))
+                
+            # Pass cat_order so the table permanently enforces this sort mathematically
+            self._fill_report_table(self.tbl_rep_cat, cat_data, format_size=True, custom_order_list=cat_order)
+            
+            # 4. Extensions
+            prog.setLabelText("Analyzing Extensions..."); prog.setValue(60); QApplication.processEvents()
+            cur.execute(f"SELECT extension, COUNT(id), SUM(size) FROM virtual_fs WHERE {base_where} GROUP BY extension ORDER BY SUM(size) DESC LIMIT 50", params)
+            self._fill_report_table(self.tbl_rep_ext, cur.fetchall(), format_size=True)
+
+            # 5. Tags
+            prog.setLabelText("Analyzing Tags..."); prog.setValue(70); QApplication.processEvents()
+            cur.execute(f"SELECT custom_tags, COUNT(id), SUM(size), AVG(size) FROM virtual_fs WHERE {base_where} AND custom_tags IS NOT NULL AND custom_tags != '' GROUP BY custom_tags ORDER BY SUM(size) DESC LIMIT 50", params)
+            tag_data = cur.fetchall()
+            self.tbl_rep_tag.setSortingEnabled(False) # Safe insert
+            self.tbl_rep_tag.setRowCount(0)
+            for r, row_data in enumerate(tag_data):
+                self.tbl_rep_tag.insertRow(r)
+                self.tbl_rep_tag.setItem(r, 0, QTableWidgetItem(str(row_data[0])))
+                self.tbl_rep_tag.setItem(r, 1, SizeTableWidgetItem(row_data[1] or 0)) # Use SizeTableWidgetItem for correct number sorting
+                self.tbl_rep_tag.setItem(r, 2, SizeTableWidgetItem(row_data[2] or 0))
+                self.tbl_rep_tag.setItem(r, 3, SizeTableWidgetItem(row_data[3] or 0))
+            self.tbl_rep_tag.setSortingEnabled(True)
+
+            # 6. Extremes (Largest/Smallest - Top 20)
+            prog.setLabelText("Finding Extremes..."); prog.setValue(80); QApplication.processEvents()
+            cur.execute(f"SELECT name, size, extension, id FROM virtual_fs WHERE {base_where} ORDER BY size DESC LIMIT 20", params)
+            self._fill_report_table(self.tbl_rep_largest, cur.fetchall(), is_files=True)
+
+            cur.execute(f"SELECT name, size, extension, id FROM virtual_fs WHERE {base_where} AND size > 0 ORDER BY size ASC LIMIT 20", params)
+            self._fill_report_table(self.tbl_rep_smallest, cur.fetchall(), is_files=True)
+            
+        prog.setLabelText("Rendering Charts..."); prog.setValue(90); QApplication.processEvents()
+        self.render_report_charts(grp_data, cat_data)
+
+        prog.setValue(100); prog.close()
+
+    def _fill_report_table(self, table, data, format_size=False, is_files=False, map_dow=False, custom_order_list=None):
+        table.setSortingEnabled(False) # Suspend sorting during insert
+        table.setRowCount(0)
+        
+        # Logical mappings for Day of Week (Monday = 1 ... Sunday = 7)
+        dow_names = {"1": "Monday", "2": "Tuesday", "3": "Wednesday", "4": "Thursday", "5": "Friday", "6": "Saturday", "0": "Sunday"}
+        dow_sort = {"Monday": 1, "Tuesday": 2, "Wednesday": 3, "Thursday": 4, "Friday": 5, "Saturday": 6, "Sunday": 7}
+        
+        for r, row_data in enumerate(data):
+            table.insertRow(r)
+            col0_val = str(row_data[0]) if row_data[0] else ("None" if not is_files else "Unknown")
+            
+            sort_val = r
+            if map_dow:
+                col0_val = dow_names.get(col0_val, col0_val)
+                sort_val = dow_sort.get(col0_val, 99)
+            elif custom_order_list:
+                try: sort_val = custom_order_list.index(col0_val)
+                except ValueError: sort_val = 99
+                
+            # Apply Custom Sorter if it's a DOW or Category table
+            item0 = CustomSortWidgetItem(col0_val, sort_val) if (map_dow or custom_order_list) else QTableWidgetItem(col0_val)
+            table.setItem(r, 0, item0)
+            
+            if is_files:
+                table.setItem(r, 1, SizeTableWidgetItem(row_data[1] or 0))
+                table.setItem(r, 2, QTableWidgetItem(str(row_data[2])))
+                table.setItem(r, 3, QTableWidgetItem(str(row_data[3])))
+            else:
+                table.setItem(r, 1, SizeTableWidgetItem(row_data[1] or 0)) 
+                table.setItem(r, 2, SizeTableWidgetItem(row_data[2] or 0)) 
+
+        table.setSortingEnabled(True) # Re-enable sorting (Will now sort logically!)
+
+    def render_report_charts(self, grp_data, cat_data):
+        self.fig_rep.clear()
+        ax_pie = self.fig_rep.add_subplot(211); ax_pie.set_facecolor('#0d1117')
+        ax_line = self.fig_rep.add_subplot(212); ax_line.set_facecolor('#0d1117')
+
+        # 1. Pie Chart (All Categories, Mapped Colors)
+        if cat_data:
+            # Filter out 0 size for the physical pie wedges so it doesn't error out, 
+            # but maintain the color map for the legend.
+            labels = [r[0] for r in cat_data if (r[2] or 0) > 0]
+            sizes = [r[2] or 0 for r in cat_data if (r[2] or 0) > 0]
+            
+            c_map = {"Images": "#a371f7", "Videos": "#f85149", "Audio": "#ff7b72", "Documents": "#d2a8ff", "Code": "#79c0ff", "Archives": "#e3b341", "Others": "#8b949e"}
+            colors = [c_map.get(lbl, "#30363d") for lbl in labels]
+            
+            if sizes:
+                ax_pie.pie(sizes, labels=labels, autopct='%1.1f%%', colors=colors, textprops={'color': "white", 'fontsize': 9})
+                ax_pie.set_title("Category Distribution by Total Size (Ctrl+Scroll to Zoom)", color='#c9d1d9', fontsize=12, fontweight='bold', pad=15)
+            else:
+                ax_pie.text(0.5, 0.5, "Categories exist but have 0 bytes of data.", color='#8b949e', ha='center', va='center')
+                ax_pie.axis('off')
+        else:
+            ax_pie.text(0.5, 0.5, "No Category Data Available", color='#8b949e', ha='center', va='center')
+            ax_pie.axis('off')
+
+        # 2. Line Chart (Data Volume Grouping)
+        if grp_data:
+            x_vals = [str(r[0]) for r in grp_data][-30:] 
+            y_vals = [(r[2] or 0)/1024/1024 for r in grp_data][-30:]
+            ax_line.plot(x_vals, y_vals, marker='o', color='#58a6ff', linewidth=2)
+            ax_line.fill_between(x_vals, y_vals, color='#58a6ff', alpha=0.2)
+            ax_line.set_title("Data Volume Grouping (MB) (Ctrl+Scroll to Zoom)", color='#c9d1d9', fontsize=12, fontweight='bold', pad=12)
+            ax_line.tick_params(axis='x', rotation=45, colors='#c9d1d9', labelsize=8)
+            ax_line.tick_params(axis='y', colors='#8b949e', labelsize=8)
+            ax_line.grid(True, linestyle='--', alpha=0.2, color='#ffffff')
+        else:
+            ax_line.text(0.5, 0.5, "No Grouping Data Available", color='#8b949e', ha='center', va='center')
+            ax_line.axis('off')
+
+        for spine in ['top', 'right']: ax_line.spines[spine].set_visible(False)
+        for spine in ['bottom', 'left']: ax_line.spines[spine].set_color('#30363d')
+
+        self.fig_rep.tight_layout(pad=3.0)
+        self.canvas_rep.draw()
+
+    def handle_report_drilldown(self, row, col):
+        sender = self.sender()
+        if not hasattr(self, 'rep_base_where'): return
+
+        drill_query = f"SELECT id, name, is_folder, extension, size, parent_path, {self.rep_date_col}, custom_tags FROM virtual_fs WHERE {self.rep_base_where}"
+        drill_params = list(self.rep_base_params)
+
+        try:
+            if sender == self.tbl_rep_group:
+                val = sender.item(row, 0).text()
+                groupby = self.cb_rep_groupby.currentText()
+                if groupby == "Day": drill_query += f" AND SUBSTR({self.rep_date_col}, 1, 10) = ?"; drill_params.append(val)
+                elif groupby == "Month": drill_query += f" AND SUBSTR({self.rep_date_col}, 1, 7) = ?"; drill_params.append(val)
+                elif groupby == "Year": drill_query += f" AND SUBSTR({self.rep_date_col}, 1, 4) = ?"; drill_params.append(val)
+                elif groupby == "Week": drill_query += f" AND strftime('%W', {self.rep_date_col}) = ?"; drill_params.append(val)
+                elif groupby == "Day of Week":
+                    rev_dow = {"Sunday": "0", "Monday": "1", "Tuesday": "2", "Wednesday": "3", "Thursday": "4", "Friday": "5", "Saturday": "6"}
+                    drill_query += f" AND strftime('%w', {self.rep_date_col}) = ?"; drill_params.append(rev_dow.get(val, val))
+            
+            elif sender == self.tbl_rep_cat:
+                val = sender.item(row, 0).text()
+                if val == "None": drill_query += " AND (category IS NULL OR category = '')"
+                else: drill_query += " AND category = ?"; drill_params.append(val)
+            
+            elif sender == self.tbl_rep_ext:
+                val = sender.item(row, 0).text()
+                if val == "None": drill_query += " AND (extension IS NULL OR extension = '')"
+                else: drill_query += " AND extension = ?"; drill_params.append(val)
+            
+            elif sender == self.tbl_rep_tag:
+                val = sender.item(row, 0).text()
+                drill_query += " AND custom_tags = ?"; drill_params.append(val)
+            
+            elif sender in (self.tbl_rep_largest, self.tbl_rep_smallest):
+                db_id = sender.item(row, 3).text()
+                drill_query += " AND id = ?"; drill_params.append(db_id)
+
+            # Route to the main search execution which will populate the Activity Log!
+            self.execute_search(drill_query, tuple(drill_params), update_highlights=False)
+            
+            # Switch view to Activity Log (Tab index 1)
+            self.tabs.setCurrentIndex(1) 
+            
+        except Exception as e:
+            QMessageBox.warning(self, "Drilldown Error", str(e))
+ 
     def update_calendar_style(self):
         font = self.calendar.font()
         font.setPointSize(10)
@@ -3293,6 +3967,11 @@ class TimelineDiaryDialog(QDialog):
         act_custom.triggered.connect(self.prompt_custom_spacing)
             
         menu.addSeparator()
+        
+        # --- NEW ADVANCED FILTERS MENU HOOK ---
+        act_filter = menu.addAction("🔍 Advanced Data Filters...")
+        act_filter.triggered.connect(lambda: self.render_heatmap() if HeatmapFilterDialog(self).exec() == QDialog.Accepted else None)
+        menu.addSeparator()
 
         color_int_menu = menu.addMenu("Gradient Color (Intensity Mode)")
         current_int = settings.value("intensity_color", "Fire")
@@ -3339,36 +4018,100 @@ class TimelineDiaryDialog(QDialog):
 
         with sqlite3.connect(self.db_path) as conn:
             cur = conn.cursor()
+            
+            # Fetch securely from settings
+            filter_settings = QSettings("vmanOS", "HeatmapFilters")
+            
+            search_text = str(filter_settings.value("search_text", "")).strip()
+            match_mode = str(filter_settings.value("match_mode", "Contains"))
+            data_type = str(filter_settings.value("data_type", "Files Only"))
+            category = str(filter_settings.value("category", "All"))
+            skip_names = [x.strip().lower() for x in str(filter_settings.value("skip_names", "")).split(',') if x.strip()]
+            
+            inc_exts = [x.strip().lower() for x in str(filter_settings.value("include_exts", "")).split(',') if x.strip()]
+            exc_exts = [x.strip().lower() for x in str(filter_settings.value("exclude_exts", "")).split(',') if x.strip()]
+            min_bytes = int(float(filter_settings.value("min_size_mb", 0.0)) * 1024 * 1024)
+            max_bytes = int(float(filter_settings.value("max_size_mb", 999999.0)) * 1024 * 1024)
+            
+            # --- Base Architecture ---
+            where_sql = "year=? AND in_trash=0"
+            params = [year_str]
+            
+            # 1. Data Type Filter
+            if data_type == "Files Only": where_sql += " AND is_folder=0"
+            elif data_type == "Folders Only": where_sql += " AND is_folder=1"
+            
+            # 2. Category Filter
+            if category != "All":
+                where_sql += " AND category=?"
+                params.append(category)
+                
+            # 3. Search Filter
+            if search_text:
+                where_sql += " AND LOWER(name) LIKE ?"
+                if match_mode == "Exact Match": params.append(search_text.lower())
+                elif match_mode == "Starts With": params.append(f"{search_text.lower()}%")
+                elif match_mode == "Ends With": params.append(f"%{search_text.lower()}")
+                else: params.append(f"%{search_text.lower()}%") # Contains
+                
+            # 4. Skip Names Filter (Partial Match Exclusions)
+            if skip_names:
+                for skip_val in skip_names:
+                    where_sql += " AND LOWER(name) NOT LIKE ?"
+                    params.append(f"%{skip_val}%")
+            
+            # 5. Extension & Size Filters
+            if inc_exts:
+                ext_placeholders = ",".join(["?"] * len(inc_exts))
+                inc_exts = [ext if ext.startswith('.') else f".{ext}" for ext in inc_exts]
+                where_sql += f" AND LOWER(extension) IN ({ext_placeholders})"
+                params.extend(inc_exts)
+                
+            if exc_exts:
+                ext_placeholders = ",".join(["?"] * len(exc_exts))
+                exc_exts = [ext if ext.startswith('.') else f".{ext}" for ext in exc_exts]
+                where_sql += f" AND LOWER(extension) NOT IN ({ext_placeholders})"
+                params.extend(exc_exts)
+                
+            if min_bytes > 0:
+                where_sql += " AND size >= ?"
+                params.append(min_bytes)
+            if max_bytes < int(999999.0 * 1024 * 1024):
+                where_sql += " AND size <= ?"
+                params.append(max_bytes)
+
+            p_tuple = tuple(params)
+
             if "Volume by Count" in mode:
-                cur.execute("SELECT SUBSTR(modified, 1, 10), COUNT(id) FROM virtual_fs WHERE year=? AND in_trash=0 GROUP BY SUBSTR(modified, 1, 10)", (year_str,))
+                cur.execute(f"SELECT SUBSTR(modified, 1, 10), COUNT(id) FROM virtual_fs WHERE {where_sql} GROUP BY SUBSTR(modified, 1, 10)", p_tuple)
                 for dt, val in cur.fetchall(): data_dict[dt] = val
             elif "Volume by Size" in mode:
-                cur.execute("SELECT SUBSTR(modified, 1, 10), SUM(size) FROM virtual_fs WHERE year=? AND in_trash=0 AND is_folder=0 GROUP BY SUBSTR(modified, 1, 10)", (year_str,))
+                cur.execute(f"SELECT SUBSTR(modified, 1, 10), SUM(size) FROM virtual_fs WHERE {where_sql} GROUP BY SUBSTR(modified, 1, 10)", p_tuple)
                 for dt, val in cur.fetchall(): data_dict[dt] = val
             elif "Forensic: Tagging" in mode:
-                cur.execute("SELECT SUBSTR(modified, 1, 10), COUNT(id) FROM virtual_fs WHERE year=? AND in_trash=0 AND is_folder=0 AND custom_tags IS NOT NULL AND custom_tags != '' GROUP BY SUBSTR(modified, 1, 10)", (year_str,))
+                cur.execute(f"SELECT SUBSTR(modified, 1, 10), COUNT(id) FROM virtual_fs WHERE {where_sql} AND custom_tags IS NOT NULL AND custom_tags != '' GROUP BY SUBSTR(modified, 1, 10)", p_tuple)
                 for dt, val in cur.fetchall(): data_dict[dt] = val
             elif "Forensic: Average" in mode:
-                cur.execute("SELECT SUBSTR(modified, 1, 10), AVG(size) FROM virtual_fs WHERE year=? AND in_trash=0 AND is_folder=0 GROUP BY SUBSTR(modified, 1, 10)", (year_str,))
+                cur.execute(f"SELECT SUBSTR(modified, 1, 10), AVG(size) FROM virtual_fs WHERE {where_sql} GROUP BY SUBSTR(modified, 1, 10)", p_tuple)
                 for dt, val in cur.fetchall(): data_dict[dt] = val
             elif "Forensic: Max" in mode:
-                cur.execute("SELECT SUBSTR(modified, 1, 10), MAX(size) FROM virtual_fs WHERE year=? AND in_trash=0 AND is_folder=0 GROUP BY SUBSTR(modified, 1, 10)", (year_str,))
+                cur.execute(f"SELECT SUBSTR(modified, 1, 10), MAX(size) FROM virtual_fs WHERE {where_sql} GROUP BY SUBSTR(modified, 1, 10)", p_tuple)
                 for dt, val in cur.fetchall(): data_dict[dt] = val
             elif "Dominant Category" in mode:
                 metric = "SUM(size)" if "Size" in mode else "COUNT(id)"
-                cur.execute(f"SELECT SUBSTR(modified, 1, 10), category, {metric} FROM virtual_fs WHERE year=? AND in_trash=0 AND is_folder=0 GROUP BY SUBSTR(modified, 1, 10), category", (year_str,))
+                cur.execute(f"SELECT SUBSTR(modified, 1, 10), category, {metric} FROM virtual_fs WHERE {where_sql} GROUP BY SUBSTR(modified, 1, 10), category", p_tuple)
                 temp_dict = {}
                 for dt, cat, val in cur.fetchall():
                     if dt not in temp_dict or (val or 0) > temp_dict[dt][1]: temp_dict[dt] = (cat, val or 0)
                 for dt, (cat, _) in temp_dict.items(): data_dict[dt] = cat
             elif "Dominant Extension" in mode:
                 metric = "SUM(size)" if "Size" in mode else "COUNT(id)"
-                cur.execute(f"SELECT SUBSTR(modified, 1, 10), extension, {metric} FROM virtual_fs WHERE year=? AND in_trash=0 AND is_folder=0 GROUP BY SUBSTR(modified, 1, 10), extension", (year_str,))
+                cur.execute(f"SELECT SUBSTR(modified, 1, 10), extension, {metric} FROM virtual_fs WHERE {where_sql} GROUP BY SUBSTR(modified, 1, 10), extension", p_tuple)
                 temp_dict = {}
                 for dt, ext, val in cur.fetchall():
                     if dt not in temp_dict or (val or 0) > temp_dict[dt][1]: temp_dict[dt] = (ext, val or 0)
                 for dt, (ext, _) in temp_dict.items(): data_dict[dt] = ext
-        
+                
         import datetime as dt_lib
         try:
             start_date = dt_lib.date(int(year_str), 1, 1)
@@ -3683,6 +4426,9 @@ class TimelineDiaryDialog(QDialog):
 
     def populate_dropdowns(self):
         try:
+            self.cb_year.clear(); self.cb_month.clear(); self.cb_category.clear()
+            self.cb_ext.clear(); self.cb_size.clear(); self.cb_tag.clear()
+            
             with sqlite3.connect(self.db_path) as conn:
                 cur = conn.cursor()
                 
@@ -3697,6 +4443,9 @@ class TimelineDiaryDialog(QDialog):
                     self.cb_year.addItems(years)
                     self.cb_heat_year.clear()          # ADD THIS
                     self.cb_heat_year.addItems(years)  # ADD THIS
+                    # --- ADD TO REPORT DROPDOWNS ---
+                    self.cb_rep_from_year.clear(); self.cb_rep_from_year.addItems(["All"] + years[::-1]) # Oldest first
+                    self.cb_rep_to_year.clear(); self.cb_rep_to_year.addItems(["All"] + years)
                     
                 self.cb_month.addItem("All")
                 if 'month' in cols:
@@ -4154,8 +4903,13 @@ class TimelineDiaryDialog(QDialog):
         
         menu = QMenu(self)
         act_open = menu.addAction("🚀 Open Native File")
-        act_vman = menu.addAction("🎞 Open in vman Viewer")
+        
+        # Grab highlighted rows to update context menu text dynamically
+        selected_rows = self.table.selectionModel().selectedRows()
+        act_vman = menu.addAction(f"🎞 Open {len(selected_rows)} Highlighted in vman Viewer" if len(selected_rows) > 1 else "🎞 Open in vman Viewer")
+        
         act_loc = menu.addAction("📂 Open OS Location")
+        act_v_loc = menu.addAction("🌐 Open Virtual Location")
         menu.addSeparator()
         
         # --- NEW COLOR MENU ---
@@ -4174,26 +4928,43 @@ class TimelineDiaryDialog(QDialog):
         
         if not self.parent(): return
         if action == act_open: self.parent().open_local_file_system(db_id)
+        elif action == act_v_loc: self.parent().nav_to_path(v_path)
         elif action == act_vman:
-            if typ == "folder":
-                QMessageBox.warning(self, "Viewer", "Please select a file, not a folder.")
-            else:
-                with sqlite3.connect(self.db_path) as conn:
-                    res = conn.cursor().execute("SELECT real_path, extension FROM virtual_fs WHERE id=?", (db_id,)).fetchone()
-                if not res or not res[0] or not os.path.exists(res[0]):
-                    QMessageBox.warning(self, "Viewer", "Physical file not found.")
-                else:
-                    playlist = [{'path': res[0], 'name': name, 'ext': res[1].lower() if res[1] else ''}]
-                    new_viewer = vmanViewer(playlist, 0, self.parent())
+            selected_ids = []
+            for idx in selected_rows:
+                r = idx.row()
+                if "Folder" not in self.table.item(r, 2).text():
+                    selected_ids.append((int(self.table.item(r, 8).text()), self.table.item(r, 1).text()))
                     
+            if not selected_ids:
+                QMessageBox.warning(self, "Viewer", "Please select at least one file (folders are ignored).")
+            else:
+                playlist = []
+                with sqlite3.connect(self.db_path) as conn:
+                    cur = conn.cursor()
+                    ids_only = [sid[0] for sid in selected_ids]
+                    id_to_name = {sid[0]: sid[1] for sid in selected_ids}
+                    
+                    # Batch fetch in chunks of 900 (prevents SQLite crashes on massive selections)
+                    for i in range(0, len(ids_only), 900):
+                        chunk = ids_only[i:i+900]
+                        cur.execute(f"SELECT id, real_path, extension FROM virtual_fs WHERE id IN ({','.join(['?']*len(chunk))})", chunk)
+                        for r_id, rp, ext in cur.fetchall():
+                            if rp and os.path.exists(rp):
+                                playlist.append({'path': rp, 'name': id_to_name[r_id], 'ext': ext.lower() if ext else ''})
+                                
+                if not playlist:
+                    QMessageBox.warning(self, "Viewer", "No physical files found for the selection.")
+                else:
+                    new_viewer = vmanViewer(playlist, 0, self.parent())
                     p = self.parent()
                     if p:
                         if not hasattr(p, 'active_viewers'): p.active_viewers = []
                         p.active_viewers.append(new_viewer)
-                        
                     new_viewer.show()
                     new_viewer.raise_()
                     new_viewer.activateWindow()
+                    
         elif action == act_loc: self.parent().open_file_location(db_id)
         elif action == act_copy_p: QApplication.clipboard().setText(full_v_path)
         elif action == act_props: self.parent().show_properties(typ, full_v_path, db_id)
@@ -4226,7 +4997,7 @@ class TimelineDiaryDialog(QDialog):
             with sqlite3.connect(self.db_path) as conn:
                 cur = conn.cursor()
                 for r in selected_rows:
-                    db_id = int(self.table.item(r, 5).text())
+                    db_id = int(self.table.item(r, 8).text()) # FIX: Target the correct ID column
                     old = cur.execute("SELECT custom_tags FROM virtual_fs WHERE id=?", (db_id,)).fetchone()[0]
                     new_val = f"{old}, {tags.strip()}".strip(", ") if old else tags.strip()
                     cur.execute("UPDATE virtual_fs SET custom_tags=? WHERE id=?", (new_val, db_id))
@@ -5304,11 +6075,11 @@ class vmanVirtualManager(QMainWindow):
         empty = QWidget()
         empty.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         tb.addWidget(empty)
-        tb.addWidget(self.theme_combo)
-        tb.addAction(act_help)
         
-        # Add Fast Mode as the very last item on the right
+        # Arranged left to right: Help -> Fast Mode -> Theme (Theme is rightmost)
+        tb.addAction(act_help)
         tb.addAction(self.act_fast_mode)
+        tb.addWidget(self.theme_combo)
         
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
@@ -5477,36 +6248,45 @@ class vmanVirtualManager(QMainWindow):
         st_layout.addWidget(self.lbl_stats_txt)
         self.right_tabs.addTab(stats_container, "Analytics")
 
-        charts_container = QWidget()
-        ch_layout = QVBoxLayout(charts_container)
-        ctrl_lay = QHBoxLayout()
+        self.charts_container = QWidget()
+        self.charts_container.setObjectName("ChartsContainer")
+        ch_layout = QVBoxLayout(self.charts_container)
+        ch_layout.setContentsMargins(0, 0, 0, 0) # No wasted space
+        ch_layout.setSpacing(0)
+
+        # Sleek Top Bar
+        self.ctrl_bar = QWidget()
+        ctrl_lay = QHBoxLayout(self.ctrl_bar)
+        ctrl_lay.setContentsMargins(10, 10, 10, 10)
+
         self.stat_combo = QComboBox()
         self.stat_combo.addItems(["Distribution by Extension (Size)", "Distribution by Extension (Count)", "Top 10 Largest Files", "Storage Ratio (Pie Chart)", "File Count Over Time"])
         self.stat_combo.currentIndexChanged.connect(self.update_statistics)
-        ctrl_lay.addWidget(QLabel("Investigation:"))
-        ctrl_lay.addWidget(self.stat_combo, 1)
-        ch_layout.addLayout(ctrl_lay)
 
-        self.chart_scroll = QScrollArea()
-        self.chart_scroll.setWidgetResizable(True)
-        self.chart_container = QWidget()
-        self.chart_lay = QVBoxLayout(self.chart_container)
-        
+        self.lbl_inv = QLabel("Investigation:")
+        ctrl_lay.addWidget(self.lbl_inv)
+        ctrl_lay.addWidget(self.stat_combo, 1)
+        ch_layout.addWidget(self.ctrl_bar)
+
         if MATPLOTLIB_AVAILABLE: 
-            self.figure = Figure(figsize=(5, 6))
+            # Responsive Figure (no hardcoded figsize)
+            self.figure = Figure(dpi=100)
             self.canvas = FigureCanvas(self.figure)
-            self.canvas.setMinimumHeight(500)
-            self.chart_lay.addWidget(self.canvas)
+            ch_layout.addWidget(self.canvas, stretch=1) # Expands natively
         else: 
             self.figure = self.canvas = None
-            self.chart_lay.addWidget(QLabel("Matplotlib not installed. Please pip install matplotlib."))
-            
-        self.chart_scroll.setWidget(self.chart_container)
-        ch_layout.addWidget(self.chart_scroll)
-        self.right_tabs.addTab(charts_container, "Charts")
+            self.lbl_err = QLabel("Matplotlib not installed.")
+            self.lbl_err.setAlignment(Qt.AlignCenter)
+            ch_layout.addWidget(self.lbl_err, stretch=1)
+
+        self.right_tabs.addTab(self.charts_container, "Charts")
 
         self.right_dock.setWidget(self.right_tabs)
         self.addDockWidget(Qt.RightDockWidgetArea, self.right_dock)
+        
+        # Force the Inspector to be slim by default so the main UI has room
+        self.resizeDocks([self.right_dock], [380], Qt.Horizontal)
+        
         self.status = QStatusBar()
         self.setStatusBar(self.status)
 
@@ -6728,42 +7508,85 @@ class vmanVirtualManager(QMainWindow):
         
         if not self.figure: return
         self.figure.clear(); mode = self.stat_combo.currentText(); ax = self.figure.add_subplot(111)
-        bg_c, txt_c = ('#0d1117', 'white') if self.is_dark_mode else ('#ffffff', 'black')
-        self.figure.patch.set_facecolor(bg_c); ax.set_facecolor(bg_c); ax.tick_params(colors=txt_c)
         
+        # Color definitions
+        is_dark = getattr(self, 'is_dark_mode', True)
+        bg_c, txt_c = ('#0d1117', '#c9d1d9') if is_dark else ('#ffffff', '#24292f')
+        bar_bg = '#161b22' if is_dark else '#f6f8fa'
+        border_c = '#30363d' if is_dark else '#d0d7de'
+        
+        # Apply dynamic themes and beautiful rounded corners to the UI Wrappers
+        if hasattr(self, 'charts_container'):
+            self.charts_container.setStyleSheet(f"#ChartsContainer {{ background-color: {bg_c}; border-radius: 8px; border: 1px solid {border_c}; }}")
+            self.ctrl_bar.setStyleSheet(f"background-color: {bar_bg}; border-bottom: 1px solid {border_c}; border-top-left-radius: 8px; border-top-right-radius: 8px;")
+            self.stat_combo.setStyleSheet(f"QComboBox {{ padding: 4px; border: 1px solid {border_c}; border-radius: 4px; background: {bg_c}; color: {txt_c}; }}")
+            self.lbl_inv.setStyleSheet(f"color: {txt_c}; font-weight: bold; border: none; background: transparent;")
+            if hasattr(self, 'lbl_err'): self.lbl_err.setStyleSheet(f"color: {txt_c}; background: transparent;")
+
+        # Apply to Matplotlib canvas
+        self.figure.patch.set_facecolor(bg_c); ax.set_facecolor(bg_c); ax.tick_params(colors=txt_c, labelsize=9)
+        
+        grid_color = '#30363d' if is_dark else '#e1e4e8'
+
         if "Line Chart" in mode or "Over Time" in mode:
             data = stats["time_series"]
             if not data: ax.text(0.5, 0.5, "No temporal data available", color=txt_c, ha='center')
             else:
                 dates = [datetime.strptime(d[0], "%Y-%m") for d in data if len(d[0]) == 7]
-                if "Count" in mode: vals = [d[1] for d in data if len(d[0]) == 7]; ylabel = "Total Files Modified"; color = '#00e5ff'
-                else: vals = [d[2] / (1024*1024) for d in data if len(d[0]) == 7]; ylabel = "Storage Size (MB)"; color = '#d7ba7d'
+                if "Count" in mode: vals = [d[1] for d in data if len(d[0]) == 7]; ylabel = "Files Modified"; color = '#58a6ff'
+                else: vals = [d[2] / (1024*1024) for d in data if len(d[0]) == 7]; ylabel = "Storage (MB)"; color = '#e3b341'
                 if dates and vals:
-                    ax.plot(dates, vals, marker='o', linestyle='-', color=color, linewidth=2); ax.xaxis.set_major_formatter(mdates.DateFormatter('%b %Y')); self.figure.autofmt_xdate(); ax.set_ylabel(ylabel, color=txt_c); ax.set_title(mode, color=txt_c); ax.grid(True, color='#30363d', linestyle='--')
+                    ax.plot(dates, vals, marker='o', linestyle='-', color=color, linewidth=2, markersize=5)
+                    ax.fill_between(dates, vals, color=color, alpha=0.15)
+                    ax.xaxis.set_major_formatter(mdates.DateFormatter('%b %Y'))
+                    self.figure.autofmt_xdate(rotation=30)
+                    ax.set_ylabel(ylabel, color=txt_c, fontweight='bold')
+                    ax.set_title(mode, color=txt_c, fontweight='bold', pad=15)
+                    ax.grid(True, color=grid_color, linestyle='--', alpha=0.5)
+
         elif "Distribution by Extension" in mode:
             data = stats["distribution"]
             if not data: ax.text(0.5, 0.5, "No distribution data available", color=txt_c, ha='center')
             else:
-                clean_data = [(d[0] if d[0] else 'none', d[1], d[2]) for d in data]
+                clean_data = [(str(d[0]).upper() if d[0] else 'NONE', d[1], d[2]) for d in data]
                 if "Size" in mode: 
-                    sorted_d = sorted(clean_data, key=lambda x: x[2], reverse=True)[:15]
-                    ax.bar([x[0] for x in sorted_d], [x[2] / (1024*1024) for x in sorted_d], color='#1e7145'); ax.set_ylabel("Storage Size (MB)", color=txt_c)
+                    sorted_d = sorted(clean_data, key=lambda x: x[2], reverse=True)[:10]
+                    ax.bar([x[0] for x in sorted_d], [x[2] / (1024*1024) for x in sorted_d], color='#3fb950', edgecolor=bg_c)
+                    ax.set_ylabel("Storage Size (MB)", color=txt_c, fontweight='bold')
                 else: 
-                    sorted_d = sorted(clean_data, key=lambda x: x[1], reverse=True)[:15]
-                    ax.bar([x[0] for x in sorted_d], [x[1] for x in sorted_d], color='#58a6ff'); ax.set_ylabel("Total File Count", color=txt_c)
-                ax.set_title(mode, color=txt_c); ax.tick_params(axis='x', rotation=45); ax.grid(axis='y', color='#30363d', linestyle='--')
+                    sorted_d = sorted(clean_data, key=lambda x: x[1], reverse=True)[:10]
+                    ax.bar([x[0] for x in sorted_d], [x[1] for x in sorted_d], color='#58a6ff', edgecolor=bg_c)
+                    ax.set_ylabel("File Count", color=txt_c, fontweight='bold')
+                ax.set_title(mode, color=txt_c, fontweight='bold', pad=15)
+                ax.tick_params(axis='x', rotation=30)
+                ax.grid(axis='y', color=grid_color, linestyle='--', alpha=0.5)
+
         elif "Largest Files" in mode:
             data = stats["top_files"]
             if not data: ax.text(0.5, 0.5, "No files available", color=txt_c, ha='center')
             else:
-                names = [d[0][:15] + ".." if len(d[0])>15 else d[0] for d in data]; sizes = [d[1] / (1024*1024) for d in data]
-                ax.barh(names, sizes, color='#a371f7'); ax.set_xlabel("Size (MB)", color=txt_c); ax.set_title(mode, color=txt_c); ax.invert_yaxis(); ax.grid(axis='x', color='#30363d', linestyle='--')
+                names = [d[0][:15] + ".." if len(d[0])>15 else d[0] for d in data]
+                sizes = [d[1] / (1024*1024) for d in data]
+                ax.barh(names, sizes, color='#a371f7', edgecolor=bg_c)
+                ax.set_xlabel("Size (MB)", color=txt_c, fontweight='bold')
+                ax.set_title(mode, color=txt_c, fontweight='bold', pad=15)
+                ax.invert_yaxis()
+                ax.grid(axis='x', color=grid_color, linestyle='--', alpha=0.5)
         
         elif "Ratio" in mode:
-            labels = ['Used Storage', 'Free Space']; sizes = [stats['used_bytes'], max(0, self.max_virtual_storage - stats['used_bytes'])]; colors = ['#d7ba7d', '#2ea043']         
-            ax.pie(sizes, labels=labels, autopct='%1.1f%%', startangle=140, colors=colors, textprops={'color': txt_c}); ax.set_title(mode, color=txt_c)
+            labels = ['Used Storage', 'Free Space']
+            sizes = [stats['used_bytes'], max(0, self.max_virtual_storage - stats['used_bytes'])]
+            colors = ['#e3b341', '#3fb950']         
+            ax.pie(sizes, labels=labels, autopct='%1.1f%%', startangle=140, colors=colors, textprops={'color': txt_c, 'fontweight': 'bold'}, wedgeprops={'edgecolor': bg_c, 'linewidth': 1.5})
+            ax.set_title("Simulated Storage Allocation", color=txt_c, fontweight='bold', pad=15)
 
-        self.figure.tight_layout(); self.canvas.draw()
+        # Cleanup Spines for Modern Minimalist Look
+        if "Ratio" not in mode:
+            for spine in ['top', 'right']: ax.spines[spine].set_visible(False)
+            for spine in ['bottom', 'left']: ax.spines[spine].set_color(grid_color)
+
+        self.figure.tight_layout(pad=1.5)
+        self.canvas.draw()
 
     def export_to_zip(self, items_to_export):
         zip_path, _ = QFileDialog.getSaveFileName(self, "Compile to ZIP", "", "ZIP Files (*.zip)")
