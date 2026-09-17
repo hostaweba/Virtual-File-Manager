@@ -103,6 +103,12 @@ THUMBS_DIR = DATA_DIR / "thumbnails"         # Where manual grid thumbnails get 
 MAX_VIRTUAL_STORAGE = 100 * 1024 * 1024 * 1024  
 CHUNK_SIZE = 150
 
+def get_thumb_dir_for_db(db_path: str | Path) -> Path:
+    """Isolates thumbnails by database stem in subfolders to prevent ID collisions."""
+    db_stem = Path(db_path).stem if db_path else "default"
+    d = THUMBS_DIR / db_stem
+    d.mkdir(parents=True, exist_ok=True)
+    return d
 
 FILE_CATEGORIES = {
     "Images": ['.arw', '.avif', '.bmp', '.cr2', '.gif', '.heic', '.heif', '.ico', '.jfif', '.jp2', '.jpe', '.jpeg', '.jpg', '.nef', '.pbm', '.pcx', '.pgm', '.png', '.pnm', '.ppm', '.psd', '.raw', '.svg', '.tga', '.tif', '.tiff', '.webp'],
@@ -1000,26 +1006,86 @@ class ScaledImageLabel(QLabel):
         self.setMinimumHeight(200)
         self.setAlignment(Qt.AlignCenter)
         self.setStyleSheet("background: #161b22; border-radius: 8px; color: #8b949e;")
-        self.setText("Waiting for drive...") # Visual feedback
+        self.setText("Waiting for drive...")
         self._pixmap = None
+        self.zoom_factor = 1.0
+        self.pan_offset = [0, 0]
+        self._drag_start = None
+
         self.eff = QGraphicsOpacityEffect(self)
         self.setGraphicsEffect(self.eff)
         self.anim = QPropertyAnimation(self.eff, b"opacity")
         self.anim.setDuration(400)
         self.anim.setEasingCurve(QEasingCurve.InOutQuad)
-    def setPixmap(self, pm): 
-        self._pixmap = pm; self.update()
-        self.eff.setOpacity(0.0); self.anim.setStartValue(0.0); self.anim.setEndValue(1.0); self.anim.start()
-    def clear(self): self._pixmap = None; self.update()
+
+    def setPixmap(self, pm):
+        self._pixmap = pm
+        self.zoom_factor = 1.0
+        self.pan_offset = [0, 0]
+        self.update()
+        self.eff.setOpacity(0.0)
+        self.anim.setStartValue(0.0)
+        self.anim.setEndValue(1.0)
+        self.anim.start()
+
+    def clear(self):
+        self._pixmap = None
+        self.zoom_factor = 1.0
+        self.pan_offset = [0, 0]
+        self.update()
+
+    def wheelEvent(self, event):
+        if self._pixmap and not self._pixmap.isNull():
+            angle = event.angleDelta().y()
+            if angle > 0:
+                self.zoom_factor = min(self.zoom_factor * 1.15, 12.0)
+            else:
+                self.zoom_factor = max(self.zoom_factor / 1.15, 0.3)
+            self.update()
+            event.accept()
+        else:
+            super().wheelEvent(event)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton and self.zoom_factor > 1.0:
+            self._drag_start = event.pos()
+        elif event.button() == Qt.MiddleButton:
+            # Middle click resets zoom
+            self.zoom_factor = 1.0
+            self.pan_offset = [0, 0]
+            self.update()
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._drag_start is not None:
+            delta = event.pos() - self._drag_start
+            self.pan_offset[0] += delta.x()
+            self.pan_offset[1] += delta.y()
+            self._drag_start = event.pos()
+            self.update()
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        self._drag_start = None
+        super().mouseReleaseEvent(event)
+
     def paintEvent(self, event):
         super().paintEvent(event)
         if self._pixmap and not self._pixmap.isNull() and self._pixmap.width() > 0:
             painter = QPainter(self)
             painter.setRenderHint(QPainter.Antialiasing)
             painter.setRenderHint(QPainter.SmoothPixmapTransform)
-            scaled = self._pixmap.scaled(self.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
-            painter.drawPixmap((self.width() - scaled.width()) // 2, (self.height() - scaled.height()) // 2, scaled)
 
+            base_scaled = self._pixmap.scaled(self.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            final_w = int(base_scaled.width() * self.zoom_factor)
+            final_h = int(base_scaled.height() * self.zoom_factor)
+
+            final_pix = self._pixmap.scaled(final_w, final_h, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            x = (self.width() - final_pix.width()) // 2 + self.pan_offset[0]
+            y = (self.height() - final_pix.height()) // 2 + self.pan_offset[1]
+
+            painter.drawPixmap(x, y, final_pix)
+            
 class SandboxTableView(QTableView):
     filesDroppedOS = Signal(list); internalDrop = Signal(str, bool); openRequest = Signal()
     def __init__(self, parent=None): 
@@ -5676,7 +5742,7 @@ class BulkOperationEngine(QDialog):
         super().__init__(parent)
         self.db_path = db_path
         self.setWindowTitle("Bulk Operations Engine")
-        self.resize(700, 600)
+        self.resize(750, 680)
         
         if parent and hasattr(parent, 'theme_combo'):
             self.setStyleSheet(THEMES.get(parent.theme_combo.currentText(), THEMES["Dark"]))
@@ -5685,83 +5751,82 @@ class BulkOperationEngine(QDialog):
 
         layout = QVBoxLayout(self)
         
-        # --- 1. Target Folder ---
         grp_target = QFrame()
         grp_target.setStyleSheet("border: 1px solid #30363d; border-radius: 6px; padding: 5px;")
         t_lay = QHBoxLayout(grp_target)
         self.lbl_target = QLabel("<b>Target Folder:</b> /")
         btn_target = QPushButton("📂 Change Target")
         btn_target.clicked.connect(self.select_target_folder)
-        t_lay.addWidget(self.lbl_target, stretch=1)
-        t_lay.addWidget(btn_target)
+        t_lay.addWidget(self.lbl_target, stretch=1); t_lay.addWidget(btn_target)
         self.target_path = "/"
         layout.addWidget(grp_target)
 
-        # --- 2. Filter Condition ---
         form_cond = QFormLayout()
+        
         self.combo_cond = QComboBox()
-        self.combo_cond.addItems([
-            "Extension equals (e.g., .tmp)",
-            "Name contains (e.g., copy)",
-            "Name starts with",
-            "Name ends with",
-            "Size greater than (MB)",
-            "Older than (Days)",
-            "Has Custom Tag"
-        ])
+        self.combo_cond.addItems(["All Files in Target", "Name contains", "Name starts with", "Name ends with", "Has Custom Tag"])
         self.txt_cond_val = QLineEdit()
-        self.txt_cond_val.setPlaceholderText("Enter filter value...")
-        form_cond.addRow("Match Condition:", self.combo_cond)
-        form_cond.addRow("Condition Value:", self.txt_cond_val)
+        self.txt_cond_val.setPlaceholderText("Value for primary match...")
+        
+        size_lay = QHBoxLayout()
+        self.combo_size_op = QComboBox(); self.combo_size_op.addItems(["Any Size", "Greater than (MB)", "Smaller than (KB)"])
+        self.spin_size_val = QDoubleSpinBox(); self.spin_size_val.setRange(0, 999999); self.spin_size_val.setEnabled(False)
+        self.combo_size_op.currentTextChanged.connect(lambda t: self.spin_size_val.setEnabled(t != "Any Size"))
+        size_lay.addWidget(self.combo_size_op); size_lay.addWidget(self.spin_size_val)
+        
+        self.txt_bulk_ext = QLineEdit()
+        self.txt_bulk_ext.setPlaceholderText("File Type (e.g. .jpg, .pdf)")
+        
+        len_lay = QHBoxLayout()
+        self.combo_len_op = QComboBox(); self.combo_len_op.addItems(["Any Length", "Equals", "Greater than", "Less than"])
+        self.spin_len_val = QSpinBox(); self.spin_len_val.setRange(1, 999); self.spin_len_val.setEnabled(False)
+        self.combo_len_op.currentTextChanged.connect(lambda t: self.spin_len_val.setEnabled(t != "Any Length"))
+        len_lay.addWidget(self.combo_len_op); len_lay.addWidget(self.spin_len_val)
+
+        # --- CORRECTED: Use form_cond instead of f2 ---
+        self.combo_name_pattern = QComboBox()
+        self.combo_name_pattern.addItems([
+            "Any Name Pattern", 
+            "Only Numbers (e.g. 12345)", 
+            "Hash / Frequent Numbers (e.g. a3c9f...)",
+            "Name with special symbols",
+            "Name with alphabets only"
+        ])
+        
+        form_cond.addRow("Primary Match:", self.combo_cond)
+        form_cond.addRow("Match Value:", self.txt_cond_val)
+        form_cond.addRow("Size Filter:", size_lay)
+        form_cond.addRow("Extension/Type:", self.txt_bulk_ext)
+        form_cond.addRow("Name Length (No Ext):", len_lay)
+        form_cond.addRow("Name Pattern:", self.combo_name_pattern) # <-- Fixed
         layout.addLayout(form_cond)
 
-        # --- 3. Action to Perform ---
         form_action = QFormLayout()
         self.combo_action = QComboBox()
-        self.combo_action.addItems([
-            "Send to Virtual Trash",
-            "Delete Permanently",
-            "Move to Folder",
-            "Add Custom Tag",
-            "Set Color Tag"
-        ])
+        self.combo_action.addItems(["Send to Virtual Trash", "Delete Permanently", "Move to Folder", "Add Custom Tag", "Set Color Tag"])
         self.combo_action.currentTextChanged.connect(self.on_action_changed)
         
         self.stack_action_val = QStackedWidget()
-        self.txt_action_val = QLineEdit()
-        self.txt_action_val.setPlaceholderText("Enter destination path or tag...")
-        self.combo_action_color = QComboBox()
-        self.combo_action_color.addItems(["None", "Red", "Orange", "Gold", "Green", "Cyan", "Blue", "Purple", "Pink"])
-        
-        self.stack_action_val.addWidget(self.txt_action_val)
-        self.stack_action_val.addWidget(self.combo_action_color)
+        self.txt_action_val = QLineEdit(); self.txt_action_val.setPlaceholderText("Enter destination path or tag...")
+        self.combo_action_color = QComboBox(); self.combo_action_color.addItems(["None", "Red", "Orange", "Gold", "Green", "Cyan", "Blue", "Purple", "Pink"])
+        self.stack_action_val.addWidget(self.txt_action_val); self.stack_action_val.addWidget(self.combo_action_color)
         
         form_action.addRow("Action to Apply:", self.combo_action)
         self.lbl_action_param = QLabel("Action Param:")
         form_action.addRow(self.lbl_action_param, self.stack_action_val)
         layout.addLayout(form_action)
-        self.on_action_changed(self.combo_action.currentText()) # init state
+        self.on_action_changed(self.combo_action.currentText())
 
-        # --- 4. Preview & Log ---
         self.log_box = QTextBrowser()
-        self.log_box.setPlaceholderText("Click 'Preview Matches' to see which files will be affected before committing changes...")
+        self.log_box.setPlaceholderText("Click 'Preview Matches' to see which files will be affected...")
         layout.addWidget(self.log_box, stretch=1)
 
-        # --- 5. Buttons ---
         btn_lay = QHBoxLayout()
-        self.btn_preview = QPushButton("🔍 Preview Matches")
-        self.btn_preview.clicked.connect(self.preview_matches)
-        
-        self.btn_exec = QPushButton("⚡ Execute Bulk Action")
-        self.btn_exec.setStyleSheet("background-color: #8b0000; font-weight:bold; color: white;")
-        self.btn_exec.clicked.connect(self.execute_action)
-        self.btn_exec.setEnabled(False) # Require preview first
-        
-        btn_lay.addWidget(self.btn_preview)
-        btn_lay.addStretch()
-        btn_lay.addWidget(self.btn_exec)
+        self.btn_preview = QPushButton("🔍 Preview Matches"); self.btn_preview.clicked.connect(self.preview_matches)
+        self.btn_exec = QPushButton("⚡ Execute Bulk Action"); self.btn_exec.setStyleSheet("background-color: #8b0000; font-weight:bold; color: white;")
+        self.btn_exec.clicked.connect(self.execute_action); self.btn_exec.setEnabled(False)
+        btn_lay.addWidget(self.btn_preview); btn_lay.addStretch(); btn_lay.addWidget(self.btn_exec)
         layout.addLayout(btn_lay)
-        
         self.matched_ids = []
 
     def select_target_folder(self):
@@ -5777,78 +5842,88 @@ class BulkOperationEngine(QDialog):
     def on_action_changed(self, action_text):
         if "Color" in action_text:
             self.stack_action_val.setCurrentIndex(1)
-            self.lbl_action_param.setText("Select Color:")
-            self.lbl_action_param.show()
-            self.stack_action_val.show()
+            self.lbl_action_param.setText("Select Color:"); self.lbl_action_param.show(); self.stack_action_val.show()
         elif "Trash" in action_text or "Delete" in action_text:
-            self.lbl_action_param.hide()
-            self.stack_action_val.hide()
+            self.lbl_action_param.hide(); self.stack_action_val.hide()
         else:
             self.stack_action_val.setCurrentIndex(0)
-            self.lbl_action_param.show()
-            self.stack_action_val.show()
+            self.lbl_action_param.show(); self.stack_action_val.show()
             if "Move" in action_text:
-                self.lbl_action_param.setText("Dest Path:")
-                self.txt_action_val.setPlaceholderText("e.g., /Archive/")
+                self.lbl_action_param.setText("Dest Path:"); self.txt_action_val.setPlaceholderText("e.g., /Archive/")
             else:
-                self.lbl_action_param.setText("Tag Name:")
-                self.txt_action_val.setPlaceholderText("e.g., urgent")
+                self.lbl_action_param.setText("Tag Name:"); self.txt_action_val.setPlaceholderText("e.g., urgent")
 
     def build_query(self):
-        cond_type = self.combo_cond.currentText()
-        val = self.txt_cond_val.text().strip()
-        
-        if not val:
-            return None, None, "Error: Condition value cannot be empty."
-            
         query = "SELECT id, name, parent_path, size FROM virtual_fs WHERE is_folder=0 AND in_trash=0 AND parent_path LIKE ?"
         params = [f"{self.target_path}%"]
         
-        if "Extension" in cond_type:
-            if not val.startswith('.'): val = '.' + val
-            query += " AND extension = ?"
-            params.append(val.lower())
-        elif "contains" in cond_type:
-            query += " AND name LIKE ?"
-            params.append(f"%{val}%")
+        # 1. Primary Match
+        cond_type = self.combo_cond.currentText()
+        val = self.txt_cond_val.text().strip()
+        if cond_type != "All Files in Target" and not val:
+            return None, None, "Error: Match value cannot be empty."
+            
+        if "contains" in cond_type:
+            query += " AND name LIKE ?"; params.append(f"%{val}%")
         elif "starts with" in cond_type:
-            query += " AND name LIKE ?"
-            params.append(f"{val}%")
+            query += " AND name LIKE ?"; params.append(f"{val}%")
         elif "ends with" in cond_type:
-            query += " AND name LIKE ?"
-            params.append(f"%{val}")
-        elif "Size" in cond_type:
-            try:
-                mb_val = float(val)
-                query += " AND size > ?"
-                params.append(mb_val * 1024 * 1024)
-            except ValueError:
-                return None, None, "Error: Size must be a valid number."
-        elif "Older" in cond_type:
-            try:
-                days = int(val)
-                cutoff_date = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
-                query += " AND modified < ?"
-                params.append(cutoff_date)
-            except ValueError:
-                return None, None, "Error: Days must be a valid whole number."
+            query += " AND name LIKE ?"; params.append(f"%{val}")
         elif "Tag" in cond_type:
-            query += " AND custom_tags LIKE ?"
-            params.append(f"%{val}%")
+            query += " AND custom_tags LIKE ?"; params.append(f"%{val}%")
+
+        # 2. Size Filter
+        sz_op = self.combo_size_op.currentText()
+        if sz_op == "Greater than (MB)":
+            query += " AND size > ?"; params.append(self.spin_size_val.value() * 1024 * 1024)
+        elif sz_op == "Smaller than (KB)":
+            query += " AND size < ?"; params.append(self.spin_size_val.value() * 1024)
+            
+        # 3. Extension
+        ext_val = self.txt_bulk_ext.text().strip()
+        if ext_val:
+            if not ext_val.startswith('.'): ext_val = '.' + ext_val
+            query += " AND LOWER(extension) = ?"; params.append(ext_val.lower())
             
         return query, tuple(params), None
 
     def preview_matches(self):
         query, params, error = self.build_query()
-        if error:
-            QMessageBox.warning(self, "Input Error", error)
-            return
+        if error: return QMessageBox.warning(self, "Input Error", error)
             
         with sqlite3.connect(self.db_path) as conn:
             cur = conn.cursor()
             cur.execute(query, params)
             matches = cur.fetchall()
             
+        len_op = self.combo_len_op.currentText()
+        len_val = self.spin_len_val.value()
+        pattern_op = self.combo_name_pattern.currentText()
+        
+        filtered_matches = []
+        for m in matches:
+            db_id, name, parent_path, size = m
+            base_name = name.rsplit('.', 1)[0] if '.' in name else name
+            l = len(base_name)
+            
+            # 1. Length Check
+            if len_op == "Equals" and l != len_val: continue
+            if len_op == "Greater than" and l <= len_val: continue
+            if len_op == "Less than" and l >= len_val: continue
+            
+            # 2. Pattern Check
+            if pattern_op == "Only Numbers (e.g. 12345)":
+                if not base_name.isdigit(): continue
+            elif pattern_op == "Hash / Frequent Numbers (e.g. a3c9f...)":
+                if not (len(base_name) >= 16 and re.fullmatch(r'[a-f0-9]+', base_name)): continue
+            elif pattern_op == "Name with special symbols":
+                if not re.search(r'[^a-zA-Z0-9\s_\-]', base_name): continue
+            elif pattern_op == "Name with alphabets only":
+                if not re.fullmatch(r'[a-zA-Z\s]+', base_name): continue
+
+            filtered_matches.append(m)
+            
+        matches = filtered_matches
         self.matched_ids = [m[0] for m in matches]
         
         if not matches:
@@ -5857,10 +5932,8 @@ class BulkOperationEngine(QDialog):
             return
             
         html = f"<h3 style='color:#58a6ff;'>Found {len(matches)} matching files:</h3><ul>"
-        for m in matches[:50]: # Show up to 50 in preview
-            html += f"<li>[{m[2]}] <b>{m[1]}</b></li>"
-        if len(matches) > 50:
-            html += f"<li><i>...and {len(matches) - 50} more.</i></li>"
+        for m in matches[:50]: html += f"<li>[{m[2]}] <b>{m[1]}</b></li>"
+        if len(matches) > 50: html += f"<li><i>...and {len(matches) - 50} more.</i></li>"
         html += "</ul><br><b style='color:#f85149;'>Review the list above. If correct, configure your action and click Execute.</b>"
         
         self.log_box.setHtml(html)
@@ -5872,14 +5945,11 @@ class BulkOperationEngine(QDialog):
         param_val = self.txt_action_val.text().strip() if self.stack_action_val.currentIndex() == 0 else self.combo_action_color.currentText()
         
         if "Move" in action_type or "Tag" in action_type:
-            if not param_val:
-                return QMessageBox.warning(self, "Input Error", "Please provide a destination or tag value.")
+            if not param_val: return QMessageBox.warning(self, "Input Error", "Please provide a destination or tag value.")
                 
-        # --- Pre-process Move action outside of the loop ---
         if "Move" in action_type:
             if not param_val.endswith('/'): param_val += '/'
             if not param_val.startswith('/'): param_val = '/' + param_val
-            
             parts = [p for p in param_val.split('/') if p]
             if not parts: return QMessageBox.warning(self, "Input Error", "Invalid destination path.")
             
@@ -5888,44 +5958,29 @@ class BulkOperationEngine(QDialog):
             
             with sqlite3.connect(self.db_path) as conn:
                 cur = conn.cursor()
-                # Check if the exact folder already exists
                 cur.execute("SELECT id FROM virtual_fs WHERE parent_path=? AND name=? AND is_folder=1", (parent_p, folder_name))
                 existing_folder = cur.fetchone()
-                
                 if existing_folder:
                     msg = f"The folder '{param_val}' already exists.\nDo you want to merge these {len(self.matched_ids)} files into it?"
-                    if QMessageBox.question(self, "Folder Exists", msg, QMessageBox.Yes | QMessageBox.No) != QMessageBox.Yes:
-                        return
+                    if QMessageBox.question(self, "Folder Exists", msg, QMessageBox.Yes | QMessageBox.No) != QMessageBox.Yes: return
                 else:
-                    # Create the folder exactly ONCE before starting the move loop
                     cur.execute("INSERT INTO virtual_fs (parent_path, name, is_folder, modified) VALUES (?, ?, 1, ?)", (parent_p, folder_name, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
                     conn.commit()
-        # ---------------------------------------------------------
 
         msg = f"Are you sure you want to apply '{action_type}' to {len(self.matched_ids)} files?"
-        if QMessageBox.question(self, "Confirm Bulk Action", msg, QMessageBox.Yes | QMessageBox.No) != QMessageBox.Yes:
-            return
+        if QMessageBox.question(self, "Confirm Bulk Action", msg, QMessageBox.Yes | QMessageBox.No) != QMessageBox.Yes: return
             
         prog = QProgressDialog(f"Applying {action_type}...", "Cancel", 0, len(self.matched_ids), self)
-        prog.setWindowModality(Qt.WindowModal)
-        prog.setMinimumDuration(0)
-        prog.setValue(0)
-        prog.show()
-        QApplication.processEvents()
+        prog.setWindowModality(Qt.WindowModal); prog.show(); QApplication.processEvents()
         
         success_count = 0
         with sqlite3.connect(self.db_path) as conn:
             cur = conn.cursor()
             for i, db_id in enumerate(self.matched_ids):
                 if prog.wasCanceled(): break
-                
-                if "Trash" in action_type:
-                    cur.execute("UPDATE virtual_fs SET in_trash=1 WHERE id=?", (db_id,))
-                elif "Delete Permanently" in action_type:
-                    cur.execute("DELETE FROM virtual_fs WHERE id=?", (db_id,))
-                elif "Move" in action_type:
-                    # Now we ONLY move the files, because the folder was handled safely above
-                    cur.execute("UPDATE virtual_fs SET parent_path=? WHERE id=?", (param_val, db_id))
+                if "Trash" in action_type: cur.execute("UPDATE virtual_fs SET in_trash=1 WHERE id=?", (db_id,))
+                elif "Delete Permanently" in action_type: cur.execute("DELETE FROM virtual_fs WHERE id=?", (db_id,))
+                elif "Move" in action_type: cur.execute("UPDATE virtual_fs SET parent_path=? WHERE id=?", (param_val, db_id))
                 elif "Color" in action_type:
                     color = "" if param_val == "None" else param_val
                     cur.execute("UPDATE virtual_fs SET color_tag=? WHERE id=?", (color, db_id))
@@ -5936,35 +5991,120 @@ class BulkOperationEngine(QDialog):
                 
                 success_count += 1
                 prog.setValue(i+1)
-                if i % 25 == 0: QApplication.processEvents() # <--- Keeps UI responsive
+                if i % 25 == 0: QApplication.processEvents()
             conn.commit()
             
-        self.btn_exec.setEnabled(False)
-        self.matched_ids = []
+        self.btn_exec.setEnabled(False); self.matched_ids = []
         self.log_box.setHtml(f"<h3 style='color:#3fb950;'>Success! Action applied to {success_count} files.</h3>")
-        
-        if self.parent():
-            self.parent().clear_cache()
-            self.parent().refresh_all()
+        if self.parent(): self.parent().clear_cache(); self.parent().refresh_all()
 
+    def get_thumb_dir_for_db(db_path: str | Path) -> Path:
+        """Isolates thumbnails by database stem in subfolders to prevent ID collisions."""
+        db_stem = Path(db_path).stem if db_path else "default"
+        d = THUMBS_DIR / db_stem
+        d.mkdir(parents=True, exist_ok=True)
+        return d
 
 class ThumbnailGeneratorThread(QThread):
     progress = Signal(int)
-    def __init__(self, items, parent=None):
+
+    def __init__(self, items, db_path, parent=None):
         super().__init__(parent)
         self.items = items
+        self.db_path = db_path
         self.is_cancelled = False
-    def cancel(self): self.is_cancelled = True
+
+    def cancel(self):
+        self.is_cancelled = True
+
+    def _extract_pdf_frame(self, file_path):
+        # Try PyMuPDF (fitz) or pdf2image if installed
+        try:
+            import fitz  # PyMuPDF
+            doc = fitz.open(file_path)
+            if len(doc) > 0:
+                page = doc[0]
+                pix = page.get_pixmap(dpi=100)
+                return QImage.fromData(pix.tobytes("png"))
+        except Exception:
+            pass
+        return None
+
+    def _extract_video_frame(self, file_path):
+        # Try ffmpeg via subprocess if available on system
+        try:
+            temp_thumb = str(THUMBS_DIR / "_temp_vframe.jpg")
+            res = subprocess.run(
+                ["ffmpeg", "-y", "-ss", "00:00:01", "-i", file_path, "-vframes", "1", "-vf", "scale=180:180:force_original_aspect_ratio=decrease", temp_thumb],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=4,
+                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+            )
+            if res.returncode == 0 and os.path.exists(temp_thumb):
+                img = QImage(temp_thumb)
+                try: os.remove(temp_thumb)
+                except Exception: pass
+                return img
+        except Exception:
+            pass
+        return None
+
+    def _add_category_badge(self, image: QImage, category: str, ext: str) -> QImage:
+        """Stamps category badge and icon onto the corner of the thumbnail."""
+        res_img = image.copy()
+        painter = QPainter(res_img)
+        painter.setRenderHint(QPainter.Antialiasing)
+
+        badge_color = QColor(GLOBAL_CAT_COLORS.get(category, "#8b949e"))
+        badge_color.setAlpha(220)
+
+        badge_text = f"▶ {ext.upper()}" if category == "Videos" else (f"📄 {ext.upper()}" if category == "Documents" else f"{ext.upper()}")
+        font = QFont("Segoe UI", 9, QFont.Bold)
+        painter.setFont(font)
+
+        badge_w = max(45, len(badge_text) * 8 + 10)
+        badge_h = 18
+        x = 5
+        y = res_img.height() - badge_h - 5
+
+        # Badge pill
+        painter.setBrush(QBrush(badge_color))
+        painter.setPen(Qt.NoPen)
+        painter.drawRoundedRect(x, y, badge_w, badge_h, 4, 4)
+
+        # Badge text
+        painter.setPen(QColor("#ffffff"))
+        painter.drawText(x, y, badge_w, badge_h, Qt.AlignCenter, badge_text)
+        painter.end()
+        return res_img
+
     def run(self):
+        target_dir = get_thumb_dir_for_db(self.db_path)
+        img_exts = {'.png', '.jpg', '.jpeg', '.bmp', '.webp', '.jfif', '.tif', '.tiff', '.gif'}
+        vid_exts = {'.mp4', '.mkv', '.avi', '.mov', '.wmv', '.flv', '.webm', '.m4v'}
+        doc_exts = {'.pdf'}
+
         for i, (typ, rp, db_id) in enumerate(self.items):
             if self.is_cancelled: break
-            if rp and os.path.exists(rp) and rp.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.webp')):
-                try:
+            if rp and os.path.exists(rp):
+                ext = Path(rp).suffix.lower()
+                img = None
+                cat = "Images"
+
+                if ext in img_exts:
                     img = QImage(rp)
-                    if not img.isNull():
-                        scaled = img.scaled(120, 120, Qt.KeepAspectRatio, Qt.FastTransformation)
-                        scaled.save(str(THUMBS_DIR / f"{db_id}.png"), "PNG")
-                except Exception: pass
+                    cat = "Images"
+                elif ext in vid_exts:
+                    img = self._extract_video_frame(rp)
+                    cat = "Videos"
+                elif ext in doc_exts:
+                    img = self._extract_pdf_frame(rp)
+                    cat = "Documents"
+
+                if img and not img.isNull() and img.width() > 0:
+                    scaled = img.scaled(200, 200, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                    badged = self._add_category_badge(scaled, cat, ext.lstrip('.'))
+                    badged.save(str(target_dir / f"{db_id}.png"), "PNG")
+
             self.progress.emit(i + 1)
 
 # ---------------- Main Application Window ----------------
@@ -6053,26 +6193,21 @@ class vmanVirtualManager(QMainWindow):
         self._load_custom_icons() # Load custom ext icons into RAM
         
     def clean_orphaned_thumbnails(self):
-        if not THUMBS_DIR.exists(): 
-            return QMessageBox.information(self, "Cleanup", "Thumbnails directory does not exist yet.")
-            
-        thumb_files = list(THUMBS_DIR.glob("*.png"))
+        target_dir = get_thumb_dir_for_db(self.active_db_path)
+        thumb_files = list(target_dir.glob("*.png"))
         if not thumb_files: 
-            return QMessageBox.information(self, "Cleanup", "No thumbnails found to clean.")
-        
+            return QMessageBox.information(self, "Cleanup", f"No thumbnails found for '{Path(self.active_db_path).stem}'.")
+            
         db_ids = []
         for f in thumb_files:
             try: db_ids.append(int(f.stem))
             except ValueError: pass
             
-        if not db_ids: return
-        
         valid_ids = set()
         deleted_count = 0
         try:
             with sqlite3.connect(self.db.path) as conn:
                 cur = conn.cursor()
-                # Batch in chunks of 900 to respect SQLite's variable limits
                 for i in range(0, len(db_ids), 900): 
                     chunk = db_ids[i:i+900]
                     cur.execute(f"SELECT id FROM virtual_fs WHERE id IN ({','.join('?'*len(chunk))})", chunk)
@@ -6081,15 +6216,16 @@ class vmanVirtualManager(QMainWindow):
             for f in thumb_files:
                 try:
                     if int(f.stem) not in valid_ids:
-                        f.unlink() # Delete the orphaned thumbnail
+                        f.unlink()
                         deleted_count += 1
                 except ValueError: pass
                 
-            QMessageBox.information(self, "Cleanup Complete", f"Successfully cleared {deleted_count} orphaned thumbnails from the drive.")
-            self.sys_log(f"Manual cleanup: Removed {deleted_count} orphaned thumbnails.")
+            self._icon_cache.clear()
+            QMessageBox.information(self, "Cleanup Complete", f"Removed {deleted_count} orphaned thumbnails for '{Path(self.active_db_path).stem}'.")
+            self.sys_log(f"Removed {deleted_count} orphaned thumbnails for {Path(self.active_db_path).stem}.")
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to clean thumbnails: {e}")
-
+            
     def show_breadcrumb_menu(self, pos):
         menu = QMenu(self)
         act_type = menu.addAction("📍 Type Virtual Address...")
@@ -6191,7 +6327,7 @@ class vmanVirtualManager(QMainWindow):
         tb.addSeparator()
         
  
-        tb.addActions([act_analyzer, act_bulk_del, act_timeline, act_csv_lib, act_multi_db, act_load_ext, act_set_storage])
+        tb.addActions([act_analyzer, act_bulk_del, act_timeline, act_csv_lib, act_load_ext, act_set_storage])
         tb.addSeparator()
 
         # Replaced Inspector with Search, removed Fast Mode from here
@@ -6501,9 +6637,9 @@ class vmanVirtualManager(QMainWindow):
         self.thumb_dlg.setWindowModality(Qt.WindowModal)
         self.thumb_dlg.show()
         
-        self.thumb_worker = ThumbnailGeneratorThread(items, self)
+        self.thumb_worker = ThumbnailGeneratorThread(items, self.active_db_path, self)
         self.thumb_worker.progress.connect(lambda i: self.thumb_dlg.setValue(i))
-        self.thumb_worker.finished.connect(lambda: (self.thumb_dlg.close(), self.clear_cache(), self.refresh_all()))
+        self.thumb_worker.finished.connect(lambda: (self.thumb_dlg.close(), self._icon_cache.clear(), self.clear_cache(), self.refresh_all()))
         self.thumb_dlg.canceled.connect(self.thumb_worker.cancel)
         self._register_worker(self.thumb_worker)
         self.thumb_worker.start()
@@ -6720,10 +6856,11 @@ class vmanVirtualManager(QMainWindow):
         if is_folder: 
             return self.style().standardIcon(QStyle.SP_DirIcon)
             
-        # 1. Check if a manual thumbnail was generated for this specific file
+        # 1. Check if a database-isolated manual thumbnail exists
         if db_id != -1:
-            thumb_path = THUMBS_DIR / f"{db_id}.png"
-            cache_key = f"thumb_{db_id}"
+            target_dir = get_thumb_dir_for_db(self.active_db_path)
+            thumb_path = target_dir / f"{db_id}.png"
+            cache_key = f"thumb_{Path(self.active_db_path).stem}_{db_id}"
             
             if cache_key in self._icon_cache:
                 return self._icon_cache[cache_key]
@@ -7336,6 +7473,11 @@ class vmanVirtualManager(QMainWindow):
 
         menu.addAction("☑ Select All (Ctrl+A)", self.cmd_select_all)
         
+        # --- FIXED: Added to Tools Submenu ---
+        tools_menu = menu.addMenu("🛠 Tools")
+        tools_menu.addAction("🌐 Open Multi-DB Cross-Auditor Explorer...", self.open_multi_db_explorer)
+        # -------------------------------------
+        
         all_sel_items = self._get_selected_items()
         real_sel_items = [i for i in all_sel_items if i[2] != -1]
         is_trash = self.current_prefix.startswith("trash://")
@@ -7360,8 +7502,29 @@ class vmanVirtualManager(QMainWindow):
             create_menu.addAction("📂 Create Virtual Folder (Ctrl+Shift+N)", self.create_folder)
             create_menu.addAction("📥 Import Real Files", self.import_real_files)
             create_menu.addAction("📁 Import Real Folder", self.import_real_folder)
-            menu.addAction("🖼️ Generate Thumbnails (Current Folder)", self.generate_thumbnails_current_view)
-            menu.addAction("🧹 Clean Orphaned Thumbnails", self.clean_orphaned_thumbnails)
+            
+            # --- EXPANDED THUMBNAILS CONTROL SUBMENU ---
+            thumb_menu = menu.addMenu("🖼️ Thumbnails")
+            
+            size_menu = thumb_menu.addMenu("📐 Thumbnail Size")
+            current_sz = self.settings.value("grid_thumb_size", "Medium")
+            for sz in ["Small", "Medium", "Large", "Extra Large"]:
+                act_sz = size_menu.addAction(sz)
+                act_sz.setCheckable(True)
+                act_sz.setChecked(current_sz == sz)
+                act_sz.triggered.connect(lambda chk=False, s=sz: self.set_grid_thumbnail_size(s))
+                
+            thumb_menu.addSeparator()
+            thumb_menu.addAction("⚡ Generate Thumbnails (Current View)", self.generate_thumbnails_current_view)
+            
+            if len(real_sel_items) == 1 and real_sel_items[0][0] == "folder":
+                thumb_menu.addAction(f"📁 Generate for '{real_sel_items[0][1]}' & Subfolders", lambda: self.generate_thumbnails_recursive(real_sel_items[0][1]))
+            else:
+                thumb_menu.addAction(f"📁 Generate for Current Folder & Subfolders", lambda: self.generate_thumbnails_recursive(self.current_prefix))
+                
+            thumb_menu.addSeparator()
+            thumb_menu.addAction("🧹 Clean Orphaned Thumbnails", self.clean_orphaned_thumbnails)
+            thumb_menu.addAction("🗑️ Clear All Thumbnails (Current DB)", self.clear_all_thumbnails_current_db)
 
         # --- EXPORT & CLIPBOARD (Available for EVERYTHING, including Smart Views!) ---
         if all_sel_items:
@@ -8654,7 +8817,61 @@ class vmanVirtualManager(QMainWindow):
         self.multi_db_instance.show()
         self.multi_db_instance.raise_()
         self.multi_db_instance.activateWindow()    
-        
+ 
+    def set_grid_thumbnail_size(self, size_name):
+        """Changes grid tile and icon dimensions on the fly."""
+        sizes = {
+            "Small": (QSize(100, 115), QSize(55, 55)),
+            "Medium": (QSize(140, 160), QSize(80, 80)),
+            "Large": (QSize(190, 210), QSize(125, 125)),
+            "Extra Large": (QSize(250, 275), QSize(180, 180))
+        }
+        grid_sz, icon_sz = sizes.get(size_name, sizes["Medium"])
+        self.file_grid.setGridSize(grid_sz)
+        self.file_grid.setIconSize(icon_sz)
+        self.settings.setValue("grid_thumb_size", size_name)
+        self.status.showMessage(f"Thumbnail grid size changed to: {size_name}", 2500)
+
+    def generate_thumbnails_recursive(self, target_folder_vpath):
+        """Recursively generates thumbnails for a selected folder and all its subfolders."""
+        items = []
+        with sqlite3.connect(self.db.path) as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT id, real_path FROM virtual_fs WHERE parent_path LIKE ? AND is_folder=0 AND in_trash=0", (f"{target_folder_vpath}%",))
+            for db_id, rp in cur.fetchall():
+                if rp and os.path.exists(rp):
+                    items.append(("file", rp, db_id))
+
+        if not items:
+            return QMessageBox.information(self, "Thumbnails", "No eligible files found in this folder.")
+
+        self.thumb_dlg = QProgressDialog(f"Generating thumbnails for {len(items)} items...", "Cancel", 0, len(items), self)
+        self.thumb_dlg.setWindowModality(Qt.WindowModal)
+        self.thumb_dlg.show()
+
+        self.thumb_worker = ThumbnailGeneratorThread(items, self.active_db_path, self)
+        self.thumb_worker.progress.connect(lambda i: self.thumb_dlg.setValue(i))
+        self.thumb_worker.finished.connect(lambda: (self.thumb_dlg.close(), self._icon_cache.clear(), self.clear_cache(), self.refresh_all()))
+        self.thumb_dlg.canceled.connect(self.thumb_worker.cancel)
+        self._register_worker(self.thumb_worker)
+        self.thumb_worker.start()
+
+    def clear_all_thumbnails_current_db(self):
+        """Clears all cached thumbnails for the currently active database."""
+        target_dir = get_thumb_dir_for_db(self.active_db_path)
+        files = list(target_dir.glob("*.png"))
+        if not files:
+            return QMessageBox.information(self, "Thumbnails", "No thumbnails stored for this database.")
+
+        if QMessageBox.question(self, "Clear Thumbnails", f"Permanently delete all {len(files)} cached thumbnails for '{Path(self.active_db_path).stem}'?", QMessageBox.Yes | QMessageBox.No) == QMessageBox.Yes:
+            for f in files:
+                try: f.unlink()
+                except Exception: pass
+            self._icon_cache.clear()
+            self.clear_cache()
+            self.refresh_all()
+            QMessageBox.information(self, "Cleared", "Thumbnail cache for current database emptied.")
+ 
 import time
 from PySide6.QtGui import QPalette, QColor
 
