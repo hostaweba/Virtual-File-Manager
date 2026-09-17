@@ -28,6 +28,7 @@ from PySide6.QtWidgets import (
     QFileIconProvider, QSizePolicy, QScrollArea, QPlainTextEdit, 
     QTabWidget, QButtonGroup, QRadioButton, QFileDialog, 
     QColorDialog, QInputDialog, QGroupBox, QTextBrowser, QWidgetAction,
+    QListWidget, QListWidgetItem  # <-- Added these two imports
 )
 from themes import THEMES
 
@@ -1336,176 +1337,147 @@ class SearchWorker(QThread):
         
     def run(self):
         all_results = []
-        db_path = self.p['db']
+        db_list = self.p.get('db_list') or [self.p['db']]
+        valid_dbs = [p for p in db_list if p and os.path.exists(p)]
         
-        if not os.path.exists(db_path):
+        if not valid_dbs:
             self.finished_search.emit(False)
             return
-            
-        try:
-            with sqlite3.connect(db_path) as conn:
-                cur = conn.cursor()
-                cur.execute("PRAGMA table_info(virtual_fs)")
-                cols = [row[1] for row in cur.fetchall()]
-                
-                selects = ["id", "name", "parent_path", "is_folder", "size", "extension", "modified", "real_path", "custom_tags"]
-                if "color_tag" in cols: selects.append("color_tag")
-                else: selects.append("'' as color_tag")
-                if "category" in cols: selects.append("category")
-                else: selects.append("'Others' as category")
-                
-                if "sha256" in cols: selects.append("sha256")
-                elif "hash" in cols: selects.append("hash as sha256")
-                else: selects.append("'' as sha256")
-                
-                if "creation_date" in cols: selects.append("creation_date")
-                else: selects.append("modified as creation_date")
-                
-                query = f"SELECT {', '.join(selects)} FROM virtual_fs WHERE 1=1"
-                sql_params = []
-                
-                if self.p['look_for'] == "Files Only": query += " AND is_folder=0"
-                elif self.p['look_for'] == "Folders Only": query += " AND is_folder=1"
-                
-                if self.p['name']:
-                    n_tgt = self.p['name'] if self.p['case_sensitive'] else self.p['name'].lower()
-                    target_col = "name" if self.p['case_sensitive'] else "LOWER(name)"
-                    
-                    # --- FIX: Use GLOB for case-sensitive wildcard matching, LIKE for case-insensitive ---
-                    if self.p['case_sensitive']:
-                        if self.p['match'] == "Contains": query += f" AND {target_col} GLOB ?"; sql_params.append(f"*{n_tgt}*")
-                        elif self.p['match'] == "Exact": query += f" AND {target_col} GLOB ?"; sql_params.append(n_tgt)
-                        elif self.p['match'] == "Starts With": query += f" AND {target_col} GLOB ?"; sql_params.append(f"{n_tgt}*")
-                        elif self.p['match'] == "Ends With": query += f" AND {target_col} GLOB ?"; sql_params.append(f"*{n_tgt}")
-                    else:
-                        if self.p['match'] == "Contains": query += f" AND {target_col} LIKE ?"; sql_params.append(f"%{n_tgt}%")
-                        elif self.p['match'] == "Exact": query += f" AND {target_col} = ?"; sql_params.append(n_tgt)
-                        elif self.p['match'] == "Starts With": query += f" AND {target_col} LIKE ?"; sql_params.append(f"{n_tgt}%")
-                        elif self.p['match'] == "Ends With": query += f" AND {target_col} LIKE ?"; sql_params.append(f"%{n_tgt}")
-                        
-                if self.p['path']: query += " AND parent_path LIKE ?"; sql_params.append(f"%{self.p['path']}%")
-                
-                if self.p.get('tags'):
-                    for tg in self.p['tags']:
-                        query += " AND custom_tags LIKE ?"
-                        sql_params.append(f"%{tg}%")
-                
-                target_cat = self.p.get('category', 'All')
-                
-                if self.p.get('ex_names'):
-                    for ex_n in self.p['ex_names']:
-                        query += " AND LOWER(name) NOT LIKE ?"
-                        sql_params.append(f"%{ex_n}%")
-                    
-                cur.execute(query, sql_params)
-                
-                scanned = 0
-                last_dir = "" 
-                
-                time_s_str = self.p['time_start']
-                time_e_str = self.p['time_end']
-                
-                # FIX: Properly map the day string to integer indexes (0=Monday, 6=Sunday)
-                days_map = {"Monday": 0, "Tuesday": 1, "Wednesday": 2, "Thursday": 3, "Friday": 4, "Saturday": 5, "Sunday": 6}
-                day_start_idx = days_map.get(self.p['day_start'], 0)
-                day_end_idx = days_map.get(self.p['day_end'], 6)
-                use_day_range = self.p['use_day_range']
-                
-                lvl_min = self.p['lvl_min']
-                lvl_max = self.p['lvl_max']
-                
-                seen_patterns = set()
-                
-                while True:
-                    if not self.is_running: break
-                    chunk = cur.fetchmany(10000)
-                    if not chunk: break
-                    
-                    for row_data in chunk:
-                        db_id, name, p_path, is_fldr, size, ext, modified, real_path, tags, color_tag, category_val, sha256_val, creation_date = row_data
-                        
-                        ext_val = str(ext).lower() if ext else ""
-                        size_val = size or 0
-                        
-                        cat_val = EXT_TO_CAT.get(ext_val, category_val)
-                        if target_cat != "All" and cat_val != target_cat: continue
-                            
-                        lvl = max(0, str(p_path).strip('/').count('/'))
-                        if not (lvl_min <= lvl <= lvl_max): continue
-                        
-                        if self.p.get('verbose', False) and p_path != last_dir:
-                            self.telemetry_update.emit(p_path)
-                            last_dir = p_path
-                        
-                        is_match = True
-                        if self.p['exts'] and ext_val not in self.p['exts']: is_match = False
-                        elif self.p['ex_exts'] and ext_val in self.p['ex_exts']: is_match = False
-                        elif not is_fldr and not (self.p['sz_min'] <= size_val <= self.p['sz_max']): is_match = False
-                        
-                        target_dt_str = str(creation_date) if self.p['date_type'] == "Created Date" else str(modified)
-                        
-                        if self.p['use_date']:
-                            if not target_dt_str or len(target_dt_str) < 10:
-                                is_match = False
-                            else:
+
+        for db_idx, db_path in enumerate(valid_dbs):
+            if not self.is_running: break
+            db_label = Path(db_path).stem
+            self.telemetry_update.emit(f"[{db_idx+1}/{len(valid_dbs)}] Querying {db_label}...")
+
+            try:
+                with sqlite3.connect(db_path, timeout=30) as conn:
+                    cur = conn.cursor()
+                    # Check columns for EACH database individually
+                    cur.execute("PRAGMA table_info(virtual_fs)")
+                    cols = [row[1] for row in cur.fetchall()]
+
+                    selects = ["id", "name", "parent_path", "is_folder", "size", "extension", "modified", "real_path", "custom_tags"]
+                    selects.append("color_tag" if "color_tag" in cols else "'' as color_tag")
+                    selects.append("category" if "category" in cols else "'Others' as category")
+                    if "sha256" in cols: selects.append("sha256")
+                    elif "hash" in cols: selects.append("hash as sha256")
+                    else: selects.append("'' as sha256")
+                    selects.append("creation_date" if "creation_date" in cols else "modified as creation_date")
+
+                    query = f"SELECT {', '.join(selects)} FROM virtual_fs WHERE in_trash=0"
+                    sql_params = []
+
+                    if self.p['look_for'] == "Files Only": query += " AND is_folder=0"
+                    elif self.p['look_for'] == "Folders Only": query += " AND is_folder=1"
+
+                    if self.p['name']:
+                        n_tgt = self.p['name'] if self.p['case_sensitive'] else self.p['name'].lower()
+                        target_col = "name" if self.p['case_sensitive'] else "LOWER(name)"
+                        if self.p['case_sensitive']:
+                            if self.p['match'] == "Contains": query += f" AND {target_col} GLOB ?"; sql_params.append(f"*{n_tgt}*")
+                            elif self.p['match'] == "Exact": query += f" AND {target_col} GLOB ?"; sql_params.append(n_tgt)
+                            elif self.p['match'] == "Starts With": query += f" AND {target_col} GLOB ?"; sql_params.append(f"{n_tgt}*")
+                            elif self.p['match'] == "Ends With": query += f" AND {target_col} GLOB ?"; sql_params.append(f"*{n_tgt}")
+                        else:
+                            if self.p['match'] == "Contains": query += f" AND {target_col} LIKE ?"; sql_params.append(f"%{n_tgt}%")
+                            elif self.p['match'] == "Exact": query += f" AND {target_col} = ?"; sql_params.append(n_tgt)
+                            elif self.p['match'] == "Starts With": query += f" AND {target_col} LIKE ?"; sql_params.append(f"{n_tgt}%")
+                            elif self.p['match'] == "Ends With": query += f" AND {target_col} LIKE ?"; sql_params.append(f"%{n_tgt}")
+
+                    if self.p['path']: query += " AND parent_path LIKE ?"; sql_params.append(f"%{self.p['path']}%")
+
+                    if self.p.get('tags'):
+                        for tg in self.p['tags']:
+                            query += " AND custom_tags LIKE ?"
+                            sql_params.append(f"%{tg}%")
+
+                    target_cat = self.p.get('category', 'All')
+
+                    if self.p.get('ex_names'):
+                        for ex_n in self.p['ex_names']:
+                            query += " AND LOWER(name) NOT LIKE ?"
+                            sql_params.append(f"%{ex_n}%")
+
+                    cur.execute(query, sql_params)
+
+                    days_map = {"Monday": 0, "Tuesday": 1, "Wednesday": 2, "Thursday": 3, "Friday": 4, "Saturday": 5, "Sunday": 6}
+                    day_start_idx = days_map.get(self.p['day_start'], 0)
+                    day_end_idx = days_map.get(self.p['day_end'], 6)
+                    use_day_range = self.p['use_day_range']
+                    time_s_str = self.p['time_start']
+                    time_e_str = self.p['time_end']
+                    lvl_min = self.p['lvl_min']
+                    lvl_max = self.p['lvl_max']
+                    seen_patterns = set()
+
+                    while True:
+                        if not self.is_running: break
+                        chunk = cur.fetchmany(10000)
+                        if not chunk: break
+
+                        for row_data in chunk:
+                            db_id, name, p_path, is_fldr, size, ext, modified, real_path, tags, color_tag, category_val, sha256_val, creation_date = row_data[:13]
+                            ext_val = str(ext).lower() if ext else ""
+                            size_val = size or 0
+                            cat_val = EXT_TO_CAT.get(ext_val, category_val)
+
+                            if target_cat != "All" and cat_val != target_cat: continue
+
+                            lvl = max(0, str(p_path).strip('/').count('/'))
+                            if not (lvl_min <= lvl <= lvl_max): continue
+
+                            is_match = True
+                            if self.p['exts'] and ext_val not in self.p['exts']: is_match = False
+                            elif self.p['ex_exts'] and ext_val in self.p['ex_exts']: is_match = False
+                            elif not is_fldr and not (self.p['sz_min'] <= size_val <= self.p['sz_max']): is_match = False
+
+                            target_dt_str = str(creation_date) if self.p['date_type'] == "Created Date" else str(modified)
+
+                            if self.p['use_date']:
+                                if not target_dt_str or len(target_dt_str) < 10: is_match = False
+                                else:
+                                    try:
+                                        y, m, d = map(int, target_dt_str[:10].split('-'))
+                                        dt_obj = QDate(y, m, d)
+                                        if dt_obj < self.p['date_start'] or dt_obj > self.p['date_end']: is_match = False
+                                    except: is_match = False
+
+                            if is_match and use_day_range and target_dt_str and len(target_dt_str) >= 10:
                                 try:
                                     y, m, d = map(int, target_dt_str[:10].split('-'))
-                                    dt_obj = QDate(y, m, d)
-                                    if dt_obj < self.p['date_start'] or dt_obj > self.p['date_end']: 
-                                        is_match = False
-                                except: 
-                                    is_match = False
+                                    d_idx = datetime.date(y, m, d).weekday()
+                                    if day_start_idx <= day_end_idx:
+                                        if not (day_start_idx <= d_idx <= day_end_idx): is_match = False
+                                    else:
+                                        if not (d_idx >= day_start_idx or d_idx <= day_end_idx): is_match = False
+                                except: is_match = False
 
-                        # FIX: Day Range Logic accurately bounds the week
-                        if is_match and use_day_range and target_dt_str and len(target_dt_str) >= 10:
-                            try:
-                                y, m, d = map(int, target_dt_str[:10].split('-'))
-                                d_idx = datetime.date(y, m, d).weekday() # 0 is Monday
-                                if day_start_idx <= day_end_idx:
-                                    if not (day_start_idx <= d_idx <= day_end_idx): is_match = False
-                                else:
-                                    # Handles wraparound ranges like Friday (4) to Monday (0)
-                                    if not (d_idx >= day_start_idx or d_idx <= day_end_idx): is_match = False
-                            except:
-                                is_match = False
-                                
-                        if is_match and self.p['use_time'] and target_dt_str and len(target_dt_str) >= 16:
-                            try:
-                                t_part = target_dt_str[11:16]
-                                if time_s_str <= time_e_str:
-                                    if not (time_s_str <= t_part <= time_e_str): is_match = False
-                                else:
-                                    if not (t_part >= time_s_str or t_part <= time_e_str): is_match = False
-                            except: pass
-                            
-                        # High-Speed Unique Pattern Logic (4-chars match prefix/suffix)
-                        if is_match and self.p['unique_patterns'] and not is_fldr:
-                            base_name = str(name).rsplit('.', 1)[0].lower() if '.' in str(name) else str(name).lower()
-                            if len(base_name) >= 4:
-                                pref = base_name[:4] + "_" + ext_val
-                                suff = base_name[-4:] + "_" + ext_val
-                                if pref in seen_patterns or suff in seen_patterns:
-                                    is_match = False
-                                else:
-                                    seen_patterns.add(pref)
-                                    seen_patterns.add(suff)
-                            else:
-                                pat = base_name + "_" + ext_val
-                                if pat in seen_patterns:
-                                    is_match = False
-                                else:
-                                    seen_patterns.add(pat)
+                            if is_match and self.p['use_time'] and target_dt_str and len(target_dt_str) >= 16:
+                                try:
+                                    t_part = target_dt_str[11:16]
+                                    if time_s_str <= time_e_str:
+                                        if not (time_s_str <= t_part <= time_e_str): is_match = False
+                                    else:
+                                        if not (t_part >= time_s_str or t_part <= time_e_str): is_match = False
+                                except: pass
 
-                        if is_match:
-                            all_results.append((db_id, name, p_path, ext_val, size_val, target_dt_str, is_fldr, real_path, tags, color_tag, cat_val, sha256_val))
-                            
-                        scanned += 1
-                        if scanned % 1500 == 0:
-                            self.progress_update.emit(min(99, int((scanned / max(1, scanned+10000)) * 100)))
-                            
-        except Exception as e:
-            print(f"Search Error: {e}")
-            
+                            if is_match and self.p['unique_patterns'] and not is_fldr:
+                                base_name = str(name).rsplit('.', 1)[0].lower() if '.' in str(name) else str(name).lower()
+                                if len(base_name) >= 4:
+                                    pref = base_name[:4] + "_" + ext_val
+                                    suff = base_name[-4:] + "_" + ext_val
+                                    if pref in seen_patterns or suff in seen_patterns: is_match = False
+                                    else: seen_patterns.add(pref); seen_patterns.add(suff)
+                                else:
+                                    pat = base_name + "_" + ext_val
+                                    if pat in seen_patterns: is_match = False
+                                    else: seen_patterns.add(pat)
+
+                            if is_match:
+                                all_results.append((db_id, name, p_path, ext_val, size_val, target_dt_str, is_fldr, real_path, tags, color_tag, cat_val, sha256_val, db_label))
+            except Exception as e:
+                print(f"Error querying DB {db_path}: {e}")
+
         self.progress_update.emit(100)
         self.results_ready.emit(all_results)
         self.finished_search.emit(False)
@@ -1516,6 +1488,7 @@ class AdvancedSearchWindow(QMainWindow):
         super().__init__(parent)
         self.active_db = active_db
         self.main_app = parent
+        self.active_db_list = [active_db] if isinstance(active_db, str) else list(active_db)
         self.is_searching = False
         self.is_rendering = False
         self._abort_render = False 
@@ -1594,6 +1567,10 @@ class AdvancedSearchWindow(QMainWindow):
         self.btn_type = QPushButton("📂")
         self.btn_metrics = QPushButton("⚙️")
         self.btn_reset = QPushButton("⟲")
+        self.btn_multi_db = QPushButton("🗄️")
+        self.btn_multi_db.setToolTip("Select Databases to Search Across")
+        self.btn_multi_db.setFixedSize(40, 40)
+        self.btn_multi_db.clicked.connect(self.select_search_databases)
         
         self.btn_scope.setToolTip("Target Scope & Tags")
         self.btn_type.setToolTip("File Types & Categories")
@@ -1615,6 +1592,7 @@ class AdvancedSearchWindow(QMainWindow):
         top_bar.addWidget(self.btn_scope)
         top_bar.addWidget(self.btn_type)
         top_bar.addWidget(self.btn_metrics)
+        top_bar.addWidget(self.btn_multi_db)   # <-- Added here
         top_bar.addWidget(self.btn_reset)
         top_bar.addWidget(self.btn_search)
         top_wrap_lay.addLayout(top_bar)
@@ -1746,8 +1724,18 @@ class AdvancedSearchWindow(QMainWindow):
         quick_lay.addWidget(self.local_filter_input); quick_lay.addWidget(self.local_tag_filter_input)
         tab1_layout.addLayout(quick_lay)
         
-        self.table = QTableWidget(0, 9)
-        self.table.setHorizontalHeaderLabels(["S.No.", "Name", "Virtual Path", "Type", "Size", "Date", "Labels", "SHA-256", "HiddenMeta"])
+        self.table = QTableWidget(0, 10)
+        self.table.setHorizontalHeaderLabels(["S.No.", "Name", "Database", "Virtual Path", "Type", "Size", "Date", "Labels", "SHA-256", "HiddenMeta"])
+        self.table.setColumnWidth(0, 50)
+        self.table.setColumnWidth(1, 250)
+        self.table.setColumnWidth(2, 120) # Database
+        self.table.setColumnWidth(3, 250)
+        self.table.setColumnWidth(4, 100)
+        self.table.setColumnWidth(5, 90)
+        self.table.setColumnWidth(6, 140)
+        self.table.setColumnWidth(7, 120)
+        self.table.setColumnWidth(8, 180)
+        self.table.setColumnHidden(9, True) # HiddenMeta
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         self.table.setColumnWidth(0, 50); self.table.setColumnWidth(1, 280); self.table.setColumnWidth(2, 280)
         self.table.setColumnWidth(3, 120); self.table.setColumnWidth(4, 90); self.table.setColumnWidth(5, 140); self.table.setColumnWidth(6, 120); self.table.setColumnWidth(7, 200)
@@ -1820,7 +1808,8 @@ class AdvancedSearchWindow(QMainWindow):
         c_top = QHBoxLayout()
         self.combo_chart_metric = QComboBox()
         self.combo_chart_metric.addItems([
-            "By Category (Count)", "By Category (Size MB)", 
+            "By Database (Count)", "By Database (Size MB)",   # <-- Add these two metrics
+            "By Category (Count)", "By Category (Size MB)",
             "By Extension (Count)", "By Extension (Size MB)", 
             "By Tags (Count)", "By Tags (Size MB)", "By Tags (Size MB - Flat)",
             "By Virtual Path (Count)", "By Virtual Path (Size MB)", 
@@ -1847,11 +1836,18 @@ class AdvancedSearchWindow(QMainWindow):
         c_top.addWidget(QLabel("<b>Order:</b>")); c_top.addWidget(self.combo_chart_sort, stretch=1)
         chart_lay.addLayout(c_top)
         
+        self.chart_filter = None  # Add this initialization
+
         if MATPLOTLIB_AVAILABLE:
             self.figure_chart = Figure(dpi=100)
             self.canvas_chart = FigureCanvas(self.figure_chart)
             self.canvas_chart.setContextMenuPolicy(Qt.CustomContextMenu)
             self.canvas_chart.customContextMenuRequested.connect(self.show_chart_context_menu)
+            
+            # --- ADD THESE TWO LINES FOR TOOLTIPS & CLICKS ---
+            self.canvas_chart.mpl_connect("motion_notify_event", self.on_chart_hover)
+            self.canvas_chart.mpl_connect("button_press_event", self.on_chart_click)
+            
             chart_lay.addWidget(self.canvas_chart, stretch=1)
         else:
             self.figure_chart = None
@@ -1898,6 +1894,48 @@ class AdvancedSearchWindow(QMainWindow):
             self.table.setColumnHidden(7, True) 
             self.table.setColumnHidden(8, True) 
 
+    def select_search_databases(self):
+        views_dir = Path("vman_data/compiled_views")
+        main_db = Path("vman_data/vman_vfs.db")
+        all_dbs = []
+        if main_db.exists(): all_dbs.append(str(main_db))
+        if views_dir.exists():
+            for f in sorted(list(views_dir.glob("*.db"))):
+                if str(f.resolve()) != str(main_db.resolve()):
+                    all_dbs.append(str(f))
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Select Databases to Search")
+        dlg.resize(450, 400)
+        lay = QVBoxLayout(dlg)
+        lay.addWidget(QLabel("<b>Tick databases to include in multi-search:</b>"))
+
+        list_w = QListWidget()
+        for p in all_dbs:
+            it = QListWidgetItem(Path(p).stem)
+            it.setFlags(it.flags() | Qt.ItemIsUserCheckable)
+            it.setCheckState(Qt.Checked if p in self.active_db_list else Qt.Unchecked)
+            it.setData(Qt.UserRole, p)
+            list_w.addItem(it)
+        lay.addWidget(list_w)
+
+        btn_box = QHBoxLayout()
+        btn_ok = QPushButton("Save Selection")
+        btn_ok.setStyleSheet("background-color: #2ea043; color: white; font-weight: bold; padding: 6px;")
+        btn_ok.clicked.connect(dlg.accept)
+        btn_box.addStretch(); btn_box.addWidget(btn_ok)
+        lay.addLayout(btn_box)
+
+        if dlg.exec() == QDialog.Accepted:
+            selected = []
+            for i in range(list_w.count()):
+                it = list_w.item(i)
+                if it.checkState() == Qt.Checked:
+                    selected.append(it.data(Qt.UserRole))
+            if selected:
+                self.active_db_list = selected
+                self.lbl_status.setText(f"Multi-Search configured: {len(selected)} databases selected.")
+    
     def check_lazy_load(self, value):
         if not getattr(self, '_lazy_enabled', False) or self.is_searching or self.is_rendering: return
         scrollbar = self.table.verticalScrollBar()
@@ -2015,6 +2053,7 @@ class AdvancedSearchWindow(QMainWindow):
         self._show_highlight_dialog = False
 
     def reset_filters(self):
+        self.chart_filter = None  # <-- Add this line
         self.txt_name.clear()
         self.txt_path.clear()
         self.txt_search_tags.clear()
@@ -2040,9 +2079,9 @@ class AdvancedSearchWindow(QMainWindow):
         
         for row in range(self.table.rowCount()):
             item_name = self.table.item(row, 1)
-            item_path = self.table.item(row, 2)
-            item_tags = self.table.item(row, 6)
-            item_meta = self.table.item(row, 8)
+            item_path = self.table.item(row, 3) # <-- Changed from 2 to 3
+            item_tags = self.table.item(row, 7) # <-- Changed from 6 to 7
+            item_meta = self.table.item(row, 9) # <-- Changed from 8 to 9
             
             if not item_name or not item_path or not item_tags or not item_meta: continue
             
@@ -2059,9 +2098,171 @@ class AdvancedSearchWindow(QMainWindow):
             match_np = (not name_path_text) or (name_path_text in item_name.text().lower() or name_path_text in item_path.text().lower())
             match_tag = (not tag_text) or (tag_text in item_tags.text().lower())
             
-            self.table.setRowHidden(row, not (match_np and match_tag))
+            # --- NEW: Check against Chart Selection Drill-down ---
+            match_chart = True
+            if getattr(self, 'chart_filter', None):
+                metric, label = self.chart_filter
+                is_size = "Size" in metric
+                is_flat = "Flat" in metric
+                
+                if is_size and is_fldr and not is_flat:
+                    match_chart = False
+                else:
+                    k = "Unknown"
+                    if "Extension" in metric:
+                        ext = m_data.get('ext', '')
+                        k = ext.upper() if ext else "NONE"
+                    elif "Category" in metric:
+                        cat = m_data.get('cat', 'Others')
+                        k = cat if cat else "Others"
+                    elif "By Tags" in metric:
+                        tags_str = m_data.get('tags', '')
+                        if tags_str:
+                            tags_list = [t.strip() for t in tags_str.split(',') if t.strip()]
+                            if label in tags_list: k = label
+                            else: k = "Mismatch"
+                        else:
+                            k = "Untagged"
+                    elif "Virtual Path" in metric:
+                        p = m_data.get('path', item_path.text())
+                        k = p.split('/')[1] if len(p.split('/')) > 1 else "Root"
+                    elif "Year" in metric:
+                        mod_str = str(m_data.get('mod', ''))
+                        k = mod_str[:4] if len(mod_str)>=4 else "Unknown"
+                    elif "Month" in metric:
+                        mod_str = str(m_data.get('mod', ''))
+                        k = mod_str[:7] if len(mod_str)>=7 else "Unknown"
+                    elif "Week" in metric:
+                        mod_str = str(m_data.get('mod', ''))
+                        if len(mod_str) >= 10:
+                            try:
+                                dto = datetime.datetime.strptime(mod_str[:10], "%Y-%m-%d")
+                                y, w, _ = dto.isocalendar()
+                                k = f"{y}-W{w:02d}"
+                            except: pass
+                    elif "Day" in metric:
+                        mod_str = str(m_data.get('mod', ''))
+                        if len(mod_str) >= 10:
+                            try:
+                                dto = datetime.datetime.strptime(mod_str[:10], "%Y-%m-%d")
+                                k = dto.strftime("%A")
+                            except: pass
+                    elif "By Date" in metric:
+                        mod_str = str(m_data.get('mod', ''))
+                        k = mod_str[8:10] if len(mod_str)>=10 else "Unknown"
+                    elif "24-Hour Time" in metric:
+                        dt_str = str(m_data.get('mod', ''))
+                        k = dt_str[11:13] + ":00" if len(dt_str)>=16 else "Unknown"
+                        
+                    match_chart = (k == label)
+            
+            self.table.setRowHidden(row, not (match_np and match_tag and match_chart))
             
         self.table.setUpdatesEnabled(True)
+
+    def on_chart_hover(self, event):
+        if not getattr(self, 'chart_labels', None) or not self.figure_chart: return
+        if event.inaxes != self.figure_chart.axes[0] or event.xdata is None or event.ydata is None:
+            if getattr(self, 'chart_annot', None) and self.chart_annot.get_visible():
+                self.chart_annot.set_visible(False)
+                self.canvas_chart.draw_idle()
+            return
+
+        idx = int(round(event.xdata))
+        if 0 <= idx < len(self.chart_labels) and abs(event.xdata - idx) <= 0.45:
+            lbl = self.chart_labels[idx]
+            val = self.chart_values[idx]
+            metric = self.combo_chart_metric.currentText()
+            unit = "MB" if "Size" in metric else "Files"
+            val_str = f"{val:,.2f} {unit}" if "Size" in metric else f"{int(val):,} {unit}"
+
+            if getattr(self, 'chart_annot', None):
+                self.chart_annot.xy = (idx, val)
+                self.chart_annot.set_text(f"{lbl}\n{val_str}")
+                self.chart_annot.set_visible(True)
+                self.canvas_chart.draw_idle()
+        else:
+            if getattr(self, 'chart_annot', None) and self.chart_annot.get_visible():
+                self.chart_annot.set_visible(False)
+                self.canvas_chart.draw_idle()
+
+    def on_chart_click(self, event):
+        if not getattr(self, 'chart_labels', None) or not self.figure_chart: return
+        if event.inaxes != self.figure_chart.axes[0] or event.xdata is None: return
+
+        idx = int(round(event.xdata))
+        if not (0 <= idx < len(self.chart_labels) and abs(event.xdata - idx) <= 0.45):
+            return
+
+        lbl = self.chart_labels[idx]
+        metric = self.combo_chart_metric.currentText()
+        is_size = "Size" in metric
+        is_flat = "Flat" in metric
+
+        filtered_results = []
+        for r in self.current_results:
+            db_id = r[0]; name = r[1]; p_path = r[2]; ext = r[3]; size = r[4]; mod = r[5]
+            is_fldr = r[6]; real_path = r[7]; tags = r[8]; color_tag = r[9]; cat_val = r[10]
+            sha256_val = r[11]
+            db_origin = r[12] if len(r) > 12 else Path(self.active_db).stem
+
+            if is_size and is_fldr and not is_flat: continue
+
+            k = "Unknown"
+            if "By Database" in metric:
+                k = db_origin
+            elif "Extension" in metric:
+                k = ext.upper() if ext else "NONE"
+            elif "Category" in metric:
+                k = cat_val if cat_val else "Others"
+            elif "By Tags" in metric:
+                tags_str = tags if (is_flat or not is_size) else (tags if tags else self.inherited_tags.get(db_id, ""))
+                if tags_str:
+                    tags_list = [t.strip() for t in tags_str.split(',') if t.strip()]
+                    if lbl in tags_list: k = lbl
+                    else: k = "Mismatch"
+                else:
+                    k = "Untagged"
+            elif "Virtual Path" in metric:
+                k = p_path.split('/')[1] if len(p_path.split('/')) > 1 else "Root"
+            elif "Year" in metric:
+                mod_str = str(mod)
+                k = mod_str[:4] if len(mod_str) >= 4 else "Unknown"
+            elif "Month" in metric:
+                mod_str = str(mod)
+                k = mod_str[:7] if len(mod_str) >= 7 else "Unknown"
+            elif "Week" in metric:
+                mod_str = str(mod)
+                if len(mod_str) >= 10:
+                    try:
+                        dto = datetime.datetime.strptime(mod_str[:10], "%Y-%m-%d")
+                        y, w, _ = dto.isocalendar()
+                        k = f"{y}-W{w:02d}"
+                    except: pass
+            elif "Day" in metric:
+                mod_str = str(mod)
+                if len(mod_str) >= 10:
+                    try:
+                        dto = datetime.datetime.strptime(mod_str[:10], "%Y-%m-%d")
+                        k = dto.strftime("%A")
+                    except: pass
+            elif "By Date" in metric:
+                mod_str = str(mod)
+                k = mod_str[8:10] if len(mod_str) >= 10 else "Unknown"
+            elif "24-Hour Time" in metric:
+                dt_str = str(mod)
+                k = dt_str[11:13] + ":00" if len(dt_str) >= 16 else "Unknown"
+
+            if k == lbl:
+                filtered_results.append(r)
+
+        if filtered_results:
+            self._abort_render = False
+            self.populate_table(filtered_results, len(self.current_results))
+            self.tabs.setCurrentIndex(0)
+            self.lbl_status.setText(f"Viewing {len(filtered_results)} items for Chart Selection: {metric} ➔ {lbl}")
+        else:
+            self.lbl_status.setText(f"No items found for Chart Selection: {metric} ➔ {lbl}")
 
     def _build_matrix_cache(self, files):
         self.matrix_cache = defaultdict(lambda: defaultdict(list))
@@ -2514,7 +2715,8 @@ class AdvancedSearchWindow(QMainWindow):
             'lvl_max': self.spin_lvl_max.value(),
             'unique_patterns': getattr(self.chk_unique, 'isChecked', lambda: False)(),
             'verbose': self.verbose_telemetry,
-            'db': self.active_db
+            'db': self.active_db,
+            'db_list': getattr(self, 'active_db_list', [self.active_db])  # <-- Pass selected DBs
         }
         self.worker = SearchWorker(params)
         self.worker.progress_update.connect(self.progress.setValue)
@@ -2782,8 +2984,10 @@ class AdvancedSearchWindow(QMainWindow):
         QApplication.processEvents()
         
         i = 0
-        for i, (db_id, name, p_path, ext, size, mod, is_fldr, real_path, tags, color_tag, cat_val, sha256_val) in enumerate(display_results):
+        for i, item_row in enumerate(display_results):
             if self._abort_render: break 
+            db_id, name, p_path, ext, size, mod, is_fldr, real_path, tags, color_tag, cat_val, sha256_val = item_row[:12]
+            db_origin = item_row[12] if len(item_row) > 12 else Path(self.active_db).stem
             
             self.table.insertRow(i)
             
@@ -2797,27 +3001,32 @@ class AdvancedSearchWindow(QMainWindow):
                 name_item.setForeground(QColor("#ffffff")) 
             self.table.setItem(i, 1, name_item)
             
-            self.table.setItem(i, 2, QTableWidgetItem(p_path))
+            # Col 2: Database origin
+            db_item = QTableWidgetItem(db_origin)
+            db_item.setForeground(QBrush(QColor("#58a6ff")))
+            self.table.setItem(i, 2, db_item)
+
+            self.table.setItem(i, 3, QTableWidgetItem(p_path))
             
             type_str = "Folder" if is_fldr else (ext[1:].upper() + " File" if ext.startswith(".") else (ext.upper() + " File" if ext else "File"))
-            self.table.setItem(i, 3, QTableWidgetItem(type_str))
+            self.table.setItem(i, 4, QTableWidgetItem(type_str))
             
             sz_str = "--" if is_fldr else self.human_size(size)
             sz_item = NumericTableItem(sz_str); sz_item.setData(Qt.UserRole, size if not is_fldr else -1)
-            self.table.setItem(i, 4, sz_item)
+            self.table.setItem(i, 5, sz_item)
             
-            self.table.setItem(i, 5, QTableWidgetItem(str(mod)))
+            self.table.setItem(i, 6, QTableWidgetItem(str(mod)))
             
             eff_tag = tags if tags else self.inherited_tags.get(db_id, "")
-            self.table.setItem(i, 6, QTableWidgetItem(str(eff_tag) if eff_tag else ""))
+            self.table.setItem(i, 7, QTableWidgetItem(str(eff_tag) if eff_tag else ""))
             
             sha_item = QTableWidgetItem(str(sha256_val) if sha256_val else "--")
             sha_item.setForeground(QColor("#8b949e"))
-            self.table.setItem(i, 7, sha_item)
+            self.table.setItem(i, 8, sha_item)
             
             meta_item = QTableWidgetItem("")
-            meta_item.setData(Qt.UserRole, {'id': db_id, 'is_fldr': is_fldr, 'real_path': real_path, 'tags': eff_tag, 'size': size, 'mod': mod, 'name': name})
-            self.table.setItem(i, 8, meta_item)
+            meta_item.setData(Qt.UserRole, {'id': db_id, 'is_fldr': is_fldr, 'real_path': real_path, 'tags': eff_tag, 'size': size, 'mod': mod, 'name': name, 'ext': ext, 'cat': cat_val, 'db': db_origin})
+            self.table.setItem(i, 9, meta_item)
             
             if i % 100 == 0:
                 self.progress.setValue(i)
@@ -2866,7 +3075,7 @@ class AdvancedSearchWindow(QMainWindow):
 
     def handle_double_click(self, item):
         if not item: return
-        meta_item = self.table.item(item.row(), 8)
+        meta_item = self.table.item(item.row(), 9) # <-- Changed from 8 to 9
         if not meta_item: return 
         
         meta = meta_item.data(Qt.UserRole)
@@ -2884,8 +3093,8 @@ class AdvancedSearchWindow(QMainWindow):
         row = item.row()
         
         i_name = self.table.item(row, 1)
-        i_vpath = self.table.item(row, 2)
-        i_meta = self.table.item(row, 8) 
+        i_vpath = self.table.item(row, 3) # <-- Changed from 2 to 3
+        i_meta = self.table.item(row, 9)  # <-- Changed from 8 to 9
         
         if not i_name or not i_vpath or not i_meta: return
         
@@ -2954,7 +3163,7 @@ class AdvancedSearchWindow(QMainWindow):
         elif action == act_vman:
             playlist = []
             for idx in selected_rows:
-                m = self.table.item(idx.row(), 8).data(Qt.UserRole)
+                m = self.table.item(idx.row(), 9).data(Qt.UserRole) # <-- Changed from 8 to 9
                 if not m or not m.get('is_fldr', True) and m.get('real_path') and os.path.exists(m['real_path']):
                     n = self.table.item(idx.row(), 1).text()
                     e = os.path.splitext(m['real_path'])[1].lower()
@@ -2989,11 +3198,11 @@ class AdvancedSearchWindow(QMainWindow):
         with sqlite3.connect(self.active_db) as conn:
             cur = conn.cursor()
             for idx in selected_rows:
-                meta = self.table.item(idx.row(), 8).data(Qt.UserRole)
+                meta = self.table.item(idx.row(), 9).data(Qt.UserRole) # <-- Changed from 8 to 9
                 if not meta: continue
                 
                 # Fetch Virtual Path from Table
-                v_path = self.table.item(idx.row(), 2).text()
+                v_path = self.table.item(idx.row(), 3).text() # <-- Changed from 2 to 3
                 
                 if meta.get('is_fldr'):
                     fldr_name = self.table.item(idx.row(), 1).text()
@@ -3021,11 +3230,11 @@ class AdvancedSearchWindow(QMainWindow):
         try:
             with open(path, 'w', newline='', encoding='utf-8') as f:
                 writer = csv.writer(f)
-                headers = [self.table.horizontalHeaderItem(c).text() for c in range(1, 8)]
+                headers = [self.table.horizontalHeaderItem(c).text() for c in range(1, 9)] # <-- Change to 9
                 writer.writerow(headers)
                 for idx in selected_rows:
                     r = idx.row()
-                    writer.writerow([self.table.item(r, c).text() for c in range(1, 8)])
+                    writer.writerow([self.table.item(r, c).text() for c in range(1, 9)]) # <-- Change to 9
             QMessageBox.information(self, "Success", "Exported successfully.")
         except Exception as e:
             QMessageBox.critical(self, "Error", str(e))
@@ -3083,8 +3292,8 @@ class AdvancedSearchWindow(QMainWindow):
                     conn.cursor().execute("UPDATE virtual_fs SET custom_tags=? WHERE id=?", (new_tags.strip(), meta['id']))
                     conn.commit()
                 meta['tags'] = new_tags.strip()
-                self.table.item(row, 8).setData(Qt.UserRole, meta)
-                self.table.item(row, 6).setText(meta['tags'])
+                self.table.item(row, 9).setData(Qt.UserRole, meta) # <-- Changed from 8 to 9
+                self.table.item(row, 7).setText(meta['tags'])      # <-- Changed from 6 to 7
                 if self.main_app: self.main_app.refresh_all()
             except Exception as e: QMessageBox.critical(self, "Error", str(e))
 
@@ -3901,6 +4110,10 @@ class AdvancedSearchWindow(QMainWindow):
             
             if is_size and is_fldr and not is_flat: continue 
             
+            if "By Database" in metric:
+                db_name = r[12] if len(r) > 12 else Path(self.active_db).stem
+                data_map[db_name] += val
+            
             if "Extension" in metric:
                 k = r[3].upper() if r[3] else "NONE"
                 data_map[k] += val
@@ -4006,7 +4219,18 @@ class AdvancedSearchWindow(QMainWindow):
             elif "Tags" in metric: colors.append(saved_colors.get(f"Tag_{lab}", f"#{min(255, max(100, int(hashlib.md5(lab.encode()).hexdigest()[:6], 16) & 0xFFFFFF)):06x}"))
             else: colors.append("#58a6ff")
         
-        ax.bar(labels, values, color=colors, edgecolor=bg_c)
+        # --- REPLACE ax.bar(...) with this block ---
+        self.chart_bars = ax.bar(labels, values, color=colors, edgecolor=bg_c)
+        self.chart_labels = labels
+        self.chart_values = values
+        
+        # Create Tooltip Annotation
+        self.chart_annot = ax.annotate("", xy=(0,0), xytext=(0, 10), textcoords="offset points",
+                                       bbox=dict(boxstyle="round,pad=0.5", fc=bg_c, ec=txt_c, lw=1.5, alpha=0.95),
+                                       arrowprops=dict(arrowstyle="->", color=txt_c),
+                                       color=txt_c, zorder=10, fontsize=10, fontweight='bold', ha='center')
+        self.chart_annot.set_visible(False)
+        # ---------------------------------------------
         
         ax.set_title(f"Search Results Analytics {metric}", color=txt_c, fontweight='bold', pad=15)
         ax.set_ylabel("Size (MB)" if is_size else "Count", color=txt_c, fontweight='bold')
