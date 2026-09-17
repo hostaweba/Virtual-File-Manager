@@ -6018,38 +6018,32 @@ class ThumbnailGeneratorThread(QThread):
         self.is_cancelled = True
 
     def _extract_pdf_frame(self, file_path):
-        # Try PyMuPDF (fitz) or pdf2image if installed
         try:
-            import fitz  # PyMuPDF
+            import fitz
             doc = fitz.open(file_path)
             if len(doc) > 0:
-                page = doc[0]
-                pix = page.get_pixmap(dpi=100)
+                pix = doc[0].get_pixmap(dpi=150)
                 return QImage.fromData(pix.tobytes("png"))
-        except Exception:
-            pass
+        except Exception: pass
         return None
 
     def _extract_video_frame(self, file_path):
-        # Try ffmpeg via subprocess if available on system
         try:
             temp_thumb = str(THUMBS_DIR / "_temp_vframe.jpg")
             res = subprocess.run(
-                ["ffmpeg", "-y", "-ss", "00:00:01", "-i", file_path, "-vframes", "1", "-vf", "scale=180:180:force_original_aspect_ratio=decrease", temp_thumb],
+                ["ffmpeg", "-y", "-ss", "00:00:01", "-i", file_path, "-vframes", "1", "-vf", "scale=400:400:force_original_aspect_ratio=decrease", temp_thumb],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=4,
                 creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
             )
             if res.returncode == 0 and os.path.exists(temp_thumb):
                 img = QImage(temp_thumb)
                 try: os.remove(temp_thumb)
-                except Exception: pass
+                except: pass
                 return img
-        except Exception:
-            pass
+        except Exception: pass
         return None
 
     def _add_category_badge(self, image: QImage, category: str, ext: str) -> QImage:
-        """Stamps category badge and icon onto the corner of the thumbnail."""
         res_img = image.copy()
         painter = QPainter(res_img)
         painter.setRenderHint(QPainter.Antialiasing)
@@ -6058,20 +6052,18 @@ class ThumbnailGeneratorThread(QThread):
         badge_color.setAlpha(220)
 
         badge_text = f"▶ {ext.upper()}" if category == "Videos" else (f"📄 {ext.upper()}" if category == "Documents" else f"{ext.upper()}")
-        font = QFont("Segoe UI", 9, QFont.Bold)
+        font = QFont("Segoe UI", 12, QFont.Bold)
         painter.setFont(font)
 
-        badge_w = max(45, len(badge_text) * 8 + 10)
-        badge_h = 18
+        badge_w = max(60, len(badge_text) * 10 + 20)
+        badge_h = 24
         x = 5
         y = res_img.height() - badge_h - 5
 
-        # Badge pill
         painter.setBrush(QBrush(badge_color))
         painter.setPen(Qt.NoPen)
-        painter.drawRoundedRect(x, y, badge_w, badge_h, 4, 4)
+        painter.drawRoundedRect(x, y, badge_w, badge_h, 6, 6)
 
-        # Badge text
         painter.setPen(QColor("#ffffff"))
         painter.drawText(x, y, badge_w, badge_h, Qt.AlignCenter, badge_text)
         painter.end()
@@ -6082,26 +6074,42 @@ class ThumbnailGeneratorThread(QThread):
         img_exts = {'.png', '.jpg', '.jpeg', '.bmp', '.webp', '.jfif', '.tif', '.tiff', '.gif'}
         vid_exts = {'.mp4', '.mkv', '.avi', '.mov', '.wmv', '.flv', '.webm', '.m4v'}
         doc_exts = {'.pdf'}
+        
+        # High Quality Resolution Base
+        thumb_res = 400
 
         for i, (typ, rp, db_id) in enumerate(self.items):
             if self.is_cancelled: break
             if rp and os.path.exists(rp):
                 ext = Path(rp).suffix.lower()
                 img = None
-                cat = "Images"
+                cat = "Others"
+                for c, exts in FILE_CATEGORIES.items():
+                    if ext in exts: cat = c; break
 
-                if ext in img_exts:
-                    img = QImage(rp)
-                    cat = "Images"
-                elif ext in vid_exts:
-                    img = self._extract_video_frame(rp)
-                    cat = "Videos"
-                elif ext in doc_exts:
-                    img = self._extract_pdf_frame(rp)
-                    cat = "Documents"
+                if ext in img_exts: img = QImage(rp)
+                elif ext in vid_exts: img = self._extract_video_frame(rp)
+                elif ext in doc_exts: img = self._extract_pdf_frame(rp)
+
+                # --- IF NO IMAGE, GENERATE A BEAUTIFUL COLORED TILE ---
+                if not img or img.isNull() or img.width() == 0:
+                    img = QImage(thumb_res, thumb_res, QImage.Format_ARGB32)
+                    img.fill(Qt.transparent)
+                    painter = QPainter(img)
+                    painter.setRenderHint(QPainter.Antialiasing)
+                    bg_color = QColor(GLOBAL_CAT_COLORS.get(cat, "#8b949e"))
+                    painter.setBrush(QBrush(bg_color))
+                    painter.setPen(Qt.NoPen)
+                    painter.drawRoundedRect(10, 10, thumb_res-20, thumb_res-20, 40, 40)
+                    
+                    painter.setPen(QColor("#ffffff"))
+                    font = QFont("Segoe UI", thumb_res // 5, QFont.Bold)
+                    painter.setFont(font)
+                    painter.drawText(10, 10, thumb_res-20, thumb_res-20, Qt.AlignCenter, ext.upper().strip('.'))
+                    painter.end()
 
                 if img and not img.isNull() and img.width() > 0:
-                    scaled = img.scaled(200, 200, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                    scaled = img.scaled(thumb_res, thumb_res, Qt.KeepAspectRatio, Qt.SmoothTransformation)
                     badged = self._add_category_badge(scaled, cat, ext.lstrip('.'))
                     badged.save(str(target_dir / f"{db_id}.png"), "PNG")
 
@@ -6398,6 +6406,14 @@ class vmanVirtualManager(QMainWindow):
 
         self.file_grid = SandboxListView()
         self.file_grid.setModelColumn(1)
+        # --- ADDED: Transparent Modern Cards ---
+        self.file_grid.setStyleSheet("""
+            QListView { background: transparent; border: none; outline: none; }
+            QListView::item { background: rgba(33, 38, 45, 0.4); border: 1px solid #30363d; border-radius: 8px; padding: 5px; margin: 5px; }
+            QListView::item:hover { background: rgba(88, 166, 255, 0.1); border: 1px solid #58a6ff; }
+            QListView::item:selected { background: rgba(88, 166, 255, 0.25); border: 2px solid #58a6ff; }
+        """)
+        # ---------------------------------------
         self.file_grid.filesDroppedOS.connect(self.on_files_dropped)
         self.file_grid.internalDrop.connect(self.execute_internal_drop)
         self.file_grid.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -8044,6 +8060,22 @@ class vmanVirtualManager(QMainWindow):
         html = f"<h3 style='color:#58a6ff;'>System Analytics ({Path(self.active_db_path).name})</h3><hr><b>Total Virtual Files:</b> {stats['files']}<br><b>Total Virtual Folders:</b> {stats['folders']}<br><b>Simulated Storage Used:</b> {human_size(stats['used_bytes'])}<br><b>Average File Size:</b> {human_size(stats['avg_bytes'])}<br><b>System Allocation:</b> {usage_pct:.4f}%<br><hr><b>Oldest Mod Date:</b> {stats['oldest']}<br><b>Newest Mod Date:</b> {stats['newest']}<br><hr><h4 style='color:#58a6ff;'>Top Largest Managed Files:</h4><ul style='list-style-type: square; margin-left: -20px;'>"
         for f in stats['top_files'][:5]: html += f"<li>{f[0]} <span style='color:#8b949e;'>({human_size(f[1])})</span></li>"
         html += "</ul>"
+        
+        # --- ADDED: Dynamic Category Breakdown in Inspector ---
+        with sqlite3.connect(self.db.path) as conn:
+            c_cur = conn.cursor()
+            prefix_sql = self.current_prefix if not self._is_smart_path(self.current_prefix) else ""
+            c_cur.execute("SELECT category, COUNT(id), SUM(size) FROM virtual_fs WHERE parent_path LIKE ? AND is_folder=0 AND in_trash=0 GROUP BY category", (f"{prefix_sql}%",))
+            cat_data = c_cur.fetchall()
+            
+            if cat_data:
+                html += "<hr><h4 style='color:#58a6ff;'>Available Categories:</h4><ul style='list-style-type: none; margin-left: -20px;'>"
+                for cat, cnt, sz in sorted(cat_data, key=lambda x: x[2] or 0, reverse=True):
+                    c_color = GLOBAL_CAT_COLORS.get(cat, "#8b949e")
+                    html += f"<li style='margin-bottom: 5px;'><span style='display:inline-block; width:12px; height:12px; background-color:{c_color}; border-radius:6px; margin-right:5px;'></span> <b>{cat}</b>: {cnt} items <span style='color:#8b949e;'>({human_size(sz or 0)})</span></li>"
+                html += "</ul>"
+        # ------------------------------------------------------
+        
         self.lbl_stats_txt.setHtml(html)
         
         if not self.figure: return
