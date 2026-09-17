@@ -43,17 +43,39 @@ except Exception:
 
 
 CAT_MAP = {
-    'Images': ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.jfif', '.svg', '.tiff', '.ico'],
-    'Videos': ['.mp4', '.mkv', '.avi', '.mov', '.wmv', '.flv', '.webm', '.m4v', '.mpg', '.mpeg'],
-    'Audio': ['.mp3', '.wav', '.aac', '.flac', '.ogg', '.m4a', '.opus', '.wma', '.alac'],
-    'Documents': ['.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx', '.txt', '.rtf', '.csv', '.md'],
-    'Code': ['.py', '.js', '.html', '.css', '.java', '.cpp', '.c', '.cs', '.php', '.sh', '.bat', '.cmd', '.exe', '.json', '.xml', '.yaml'],
-    'Archives': ['.zip', '.rar', '.7z', '.tar', '.gz', '.bz2', '.xz', '.iso']
+    "Images": ['.arw', '.avif', '.bmp', '.cr2', '.gif', '.heic', '.heif', '.ico', '.jfif', '.jp2', '.jpe', '.jpeg', '.jpg', '.nef', '.pbm', '.pcx', '.pgm', '.png', '.pnm', '.ppm', '.psd', '.raw', '.svg', '.tga', '.tif', '.tiff', '.webp'],
+    "Videos": ['.3gp', '.3gpp', '.avi', '.flv', '.m2ts', '.m4v', '.mkv', '.mng', '.mov', '.mp4', '.ogv', '.swf', '.vob', '.webm', '.wmv'],
+    "Audio": ['.aac', '.aif', '.aifc', '.aiff', '.alac', '.amr', '.au', '.bnk', '.flac', '.m4a', '.mid', '.midi', '.mp3', '.ogg', '.opus', '.wav', '.wma'],
+    "Design": ['.ai', '.cur', '.eps', '.exr', '.fla', '.fon', '.gpl'],
+    "Documents": ['.adoc', '.chm', '.doc', '.docs', '.docx', '.dot', '.dotx', '.epub', '.fodt', '.md', '.mobi', '.odp', '.ods', '.odt', '.pdf', '.ppsx', '.ppt', '.pptx', '.rtf', '.tex', '.text', '.txt'],
+    "Data": ['.accda', '.accdb', '.accde', '.accdu', '.arff', '.bib', '.csv', '.db', '.db-journal', '.db-shm', '.db-wal', '.dbf', '.dic', '.dict', '.fdb', '.frm', '.h5', '.ibd', '.mat', '.mdb', '.npz', '.parquet', '.pkl', '.sqlite', '.sqlite3', '.sqlitedb', '.tsv'],
+    "Code": ['.a', '.asm', '.asp', '.aspx', '.awk', '.bash', '.bash_logout', '.bashrc', '.bat', '.c', '.cc', '.class', '.cmake', '.cmd', '.coffeescript', '.cpp', '.cs', '.css', '.cu', '.cxx', '.d', '.diff', '.el', '.erl', '.es', '.f', '.f90', '.fs', '.g4', '.go', '.groovy', '.h', '.hpp', '.htm', '.html', '.java', '.js', '.jsx', '.less', '.lua', '.php', '.pl', '.ps1', '.pug', '.py', '.rb', '.rs', '.sass', '.scss', '.sh', '.shx', '.sql', '.swift', '.ts', '.tsx', '.vbs', '.wasm'],
+    "Configs": ['.apache', '.apache2', '.cfg', '.conf', '.dtd', '.env', '.fish', '.ini', '.json', '.manifest', '.plist', '.properties', '.toml', '.xml', '.yaml', '.yml'],
+    "Python": ['.egg', '.egg-info'],
+    "Apps": ['.apk', '.apks', '.app', '.appimage', '.asar', '.bin', '.com', '.command', '.cpl', '.deb', '.desktop', '.dmg', '.efi', '.exe', '.jar', '.msi', '.rpm', '.run', '.whl', '.xapk'],
+    "System": ['.dat', '.dll', '.drv', '.dylib', '.inf', '.kext', '.pid', '.reg', '.so', '.sys', '.sysk'],
+    "Archives": ['.7z', '.apkzstd', '.bz2', '.cab', '.gz', '.iso', '.lz4', '.lzma', '.rar', '.tar', '.tgz', '.xz', '.z', '.zip'],
+    "Forensics": ['.crash', '.dmp', '.evtx', '.har', '.mem', '.pcap', '.pcapng', '.ulog'],
+    "Security": ['.asc', '.cer', '.certs', '.crl', '.crt', '.der', '.gpg', '.key', '.p12', '.pem', '.pfx', '.pub', '.rsa'],
+    "VMs": ['.ova', '.ovf', '.qcow2', '.vdi', '.vhd', '.vhdx', '.vmdk'],
+    "3D": ['.blend', '.dae', '.dwg', '.dxf', '.fbx', '.obj', '.step', '.stl'],
+    "GIS": ['.geojson', '.gpx', '.kml', '.kmz', '.shp'],
+    "Fonts": ['.afm', '.eot', '.otf', '.pfb', '.ttf', '.woff', '.woff2'],
+    "Chats": ['.crypt1', '.crypt12', '.crypt14', '.crypt15', '.vcf', '.wa'],
+    "Temp": ['.~', '.backup', '.bak', '.cache', '.chk', '.clean', '.crdownload', '.download', '.dthumb', '.exo', '.log', '.nomedia', '.old', '.part', '.swatch', '.swp', '.temp', '.thumb', '.thumbnails', '.tmp', '.trashed']
 }
 EXT_TO_CAT = {}
 for cat, exts in CAT_MAP.items():
-    for ext in exts:
-        EXT_TO_CAT[ext] = cat
+    for ext in exts: EXT_TO_CAT[ext] = cat
+
+# Provides instant UI mapping for the 20 categories to prevent KeyErrors
+GLOBAL_CAT_COLORS = {
+    "Images": "#a371f7", "Videos": "#f85149", "Audio": "#ff7b72", "Design": "#ff9ade",
+    "Documents": "#d2a8ff", "Data": "#58a6ff", "Code": "#79c0ff", "Configs": "#7ee787",
+    "Python": "#e3b341", "Apps": "#ff9429", "System": "#8b949e", "Archives": "#e3b341",
+    "Forensics": "#ff7b72", "Security": "#f0883e", "VMs": "#8b949e", "3D": "#a371f7",
+    "GIS": "#3fb950", "Fonts": "#c9d1d9", "Chats": "#2ea043", "Temp": "#484f58", "Others": "#8b949e"
+}
 
 
 class ExtFilterDialog(QDialog):
@@ -975,45 +997,34 @@ class TimestampCorrectorDialog(QDialog):
                     
                     if mode in ["os", "both"]:
                         if real_path and os.path.exists(real_path):
-                            
                             # --- NATIVE WINDOWS API BYPASS ---
-                            # Bypasses the os.utime [Errno 22] bug by ignoring the corrupt Access Time natively
                             if sys.platform == "win32":
                                 import ctypes
                                 from ctypes import wintypes
                                 
-                                # Clamp timestamp to valid Windows bounds to prevent underflow crashes
                                 safe_ts = max(0.0, min(ts, 32535215999.0)) 
                                 wintime = int((safe_ts + 11644473600) * 10000000)
                                 
                                 class FILETIME(ctypes.Structure):
                                     _fields_ = [("dwLowDateTime", wintypes.DWORD), ("dwHighDateTime", wintypes.DWORD)]
-                                
                                 filetime = FILETIME(wintime & 0xFFFFFFFF, wintime >> 32)
                                 
-                                # 256 = FILE_WRITE_ATTRIBUTES (Bypasses "File in Use" locks)
+                                # 256 = FILE_WRITE_ATTRIBUTES (Bypasses OS locks)
                                 handle = ctypes.windll.kernel32.CreateFileW(real_path, 256, 0, None, 3, 0x02000000, None)
                                 if handle != -1 and handle != 0xFFFFFFFF:
-                                    c_time = ctypes.byref(filetime) if "Created" in target_prop or "Both" in target_prop else None
-                                    m_time = ctypes.byref(filetime) if "Modified" in target_prop or "Both" in target_prop else None
-                                    
-                                    # Passing None for a_time preserves the existing access time, preventing Errno 22
+                                    c_time = ctypes.byref(filetime) if "Created Date" in target_prop or "Both" in target_prop else None
+                                    m_time = ctypes.byref(filetime) if "Both" in target_prop else None
+                                    # Passing None for a_time ignores the broken access time entirely
                                     res = ctypes.windll.kernel32.SetFileTime(handle, c_time, None, m_time)
                                     ctypes.windll.kernel32.CloseHandle(handle)
-                                    
-                                    if res == 0:
-                                        raise Exception("Windows rejected the timestamp modification.")
-                                else:
-                                    raise Exception("Could not lock file attributes for modification.")
-                                    
+                                    if res == 0: raise Exception("Windows rejected timestamp.")
+                                else: raise Exception("Could not lock file attributes.")
                             else:
-                                # Mac / Linux Standard Fallback
+                                # Mac/Linux Fallback
                                 stat = os.stat(real_path)
-                                # Clamp values to safely prevent out-of-bounds Epoch crashes
                                 safe_atime = max(0.0, stat.st_atime)
-                                safe_mtime = max(0.0, ts if "Modified" in target_prop or "Both" in target_prop else stat.st_mtime)
+                                safe_mtime = max(0.0, ts if "Both" in target_prop else stat.st_mtime)
                                 os.utime(real_path, (safe_atime, safe_mtime))
-                                
                                 if sys.platform == "darwin" and ("Created Date" in target_prop or "Both" in target_prop):
                                     date_str = datetime.datetime.fromtimestamp(ts).strftime('%m/%d/%Y %H:%M:%S')
                                     subprocess.run(['SetFile', '-d', date_str, real_path])
@@ -1124,11 +1135,10 @@ class MapColorConfigDialog(QDialog):
         self.container_layout.addWidget(QLabel(" "))
         
         self.container_layout.addWidget(QLabel("<b style='color:#58a6ff; font-size:14px;'>Category Colors</b>"))
-        cats = ["Images", "Videos", "Audio", "Documents", "Code", "Archives", "Others"]
-        default_cat_colors = {"Images": "#a371f7", "Videos": "#f85149", "Audio": "#ff7b72", "Documents": "#d2a8ff", "Code": "#79c0ff", "Archives": "#e3b341", "Others": "#8b949e"}
+        cats = list(CAT_MAP.keys()) + ["Others"]
         for c in cats:
             key = f"Category_{c}"
-            self.add_row(c, key, self.custom_colors.get(key, default_cat_colors.get(c, "#8b949e")), False)
+            self.add_row(c, key, self.custom_colors.get(key, GLOBAL_CAT_COLORS.get(c, "#8b949e")), False)
             
         self.container_layout.addWidget(QLabel(" "))
         self.container_layout.addWidget(QLabel("<b style='color:#58a6ff; font-size:14px;'>Extension Colors</b>"))
@@ -1643,7 +1653,7 @@ class AdvancedSearchWindow(QMainWindow):
         self.card_type.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         f2 = QFormLayout(self.card_type); f2.setContentsMargins(15, 15, 15, 15); f2.setVerticalSpacing(10)
         self.combo_category = QComboBox()
-        self.combo_category.addItems(["All", "Images", "Videos", "Audio", "Documents", "Code", "Archives", "Others"])
+        self.combo_category.addItems(["All"] + list(CAT_MAP.keys()) + ["Others"])
         self.txt_ext = QLineEdit(); self.txt_ext.setPlaceholderText(".jpg, .pdf")
         self.txt_exclude_ext = QLineEdit(); self.txt_exclude_ext.setPlaceholderText(".tmp, .bak")
         self.txt_exclude_name = QLineEdit(); self.txt_exclude_name.setPlaceholderText("e.g. backup, temp")
@@ -3306,7 +3316,7 @@ class AdvancedSearchWindow(QMainWindow):
         intensity = math.pow(float(val) / float(max_val), 0.5) if (max_val > 0 and is_gradient) else 1.0
         intensity = max(0.15, min(1.0, intensity)) 
         
-        default_cat_colors = {"Images": "#a371f7", "Videos": "#f85149", "Audio": "#ff7b72", "Documents": "#d2a8ff", "Code": "#79c0ff", "Archives": "#e3b341", "Others": "#8b949e"}
+        default_cat_colors = GLOBAL_CAT_COLORS
         
         if "Category" in color_mode:
             base_hex = saved_colors.get(f"Category_{dom}", default_cat_colors.get(dom, "#8b949e"))
@@ -3953,7 +3963,7 @@ class AdvancedSearchWindow(QMainWindow):
         day_order = {"Monday": 1, "Tuesday": 2, "Wednesday": 3, "Thursday": 4, "Friday": 5, "Saturday": 6, "Sunday": 7}
         
         # Exact Custom Category Sorting implementation
-        cat_order = {"Images": 1, "Videos": 2, "Audio": 3, "Documents": 4, "Code": 5, "Archives": 6, "Others": 7}
+        cat_order = {cat: i for i, cat in enumerate(list(CAT_MAP.keys()) + ["Others"])}
         
         if "Category" in metric:
             if sort_mode == "Sort: Name/Time (Descending)":
@@ -3987,7 +3997,7 @@ class AdvancedSearchWindow(QMainWindow):
         
         saved_colors = QSettings("vmanOS", "HeatmapColors").value("custom_colors", {})
         if not isinstance(saved_colors, dict): saved_colors = {}
-        default_cat_colors = {"Images": "#a371f7", "Videos": "#f85149", "Audio": "#ff7b72", "Documents": "#d2a8ff", "Code": "#79c0ff", "Archives": "#e3b341", "Others": "#8b949e"}
+        default_cat_colors = GLOBAL_CAT_COLORS
         
         colors = []
         for lab in labels:
