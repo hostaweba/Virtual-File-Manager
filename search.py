@@ -18,13 +18,17 @@ os.environ["QT_LOGGING_RULES"] = "qt.qpa.fonts.warning=false;qt.gui.imageio.warn
 
 from PySide6.QtCore import Qt, QDate, QTime, QDateTime, QThread, Signal, QSize, QFileInfo, QSettings
 from PySide6.QtGui import QAction, QFont, QIcon, QColor, QBrush, QTextCursor, QCursor, QShortcut, QKeySequence
-from PySide6.QtWidgets import (QMainWindow, QVBoxLayout, QHBoxLayout, QGridLayout, 
-                               QLabel, QPushButton, QWidget, QLineEdit, QComboBox, 
-                               QCheckBox, QDoubleSpinBox, QSpinBox, QDateEdit, QTimeEdit, QTableWidget, 
-                               QTableWidgetItem, QHeaderView, QMessageBox, QMenu, QDateTimeEdit,
-                               QApplication, QProgressBar, QProgressDialog, QStyle, QFrame, 
-                               QFormLayout, QDialog, QFileIconProvider, QSizePolicy, 
-                               QScrollArea, QPlainTextEdit, QTabWidget, QButtonGroup, QRadioButton, QFileDialog, QColorDialog, QInputDialog, QGroupBox)
+from PySide6.QtWidgets import (
+    QMainWindow, QVBoxLayout, QHBoxLayout, QGridLayout, 
+    QLabel, QPushButton, QWidget, QLineEdit, QComboBox, 
+    QCheckBox, QDoubleSpinBox, QSpinBox, QDateEdit, QTimeEdit, 
+    QTableWidget, QTableWidgetItem, QHeaderView, QMessageBox, 
+    QMenu, QDateTimeEdit, QApplication, QProgressBar, 
+    QProgressDialog, QStyle, QFrame, QFormLayout, QDialog, 
+    QFileIconProvider, QSizePolicy, QScrollArea, QPlainTextEdit, 
+    QTabWidget, QButtonGroup, QRadioButton, QFileDialog, 
+    QColorDialog, QInputDialog, QGroupBox, QTextBrowser, QWidgetAction,
+)
 from themes import THEMES
 
 try:
@@ -133,6 +137,13 @@ class ExtFilterDialog(QDialog):
         
         btn_ok = QPushButton("Apply Filters & Render")
         btn_ok.setStyleSheet("background-color: #2ea043; color: white; font-weight: bold; padding: 12px; border-radius: 6px;")
+        
+        # --- FIX: Enable Enter key to trigger Apply ---
+        btn_ok.setAutoDefault(True)
+        btn_ok.setDefault(True)
+        QShortcut(QKeySequence("Return"), self).activated.connect(self.accept)
+        QShortcut(QKeySequence("Enter"), self).activated.connect(self.accept)
+        
         btn_ok.clicked.connect(self.accept)
         layout.addWidget(btn_ok)
         
@@ -185,142 +196,289 @@ class ExtFilterDialog(QDialog):
     def get_allowed(self):
         return set(ext for ext, cb in self.checkboxes.items() if cb.isChecked())
 
+#from PySide6.QtWidgets import QTextBrowser, QWidgetAction
+
+class ClickableMenuLabel(QLabel):
+    clicked = Signal()
+    def mouseReleaseEvent(self, ev):
+        if ev.button() == Qt.LeftButton:
+            self.clicked.emit()
+        super().mouseReleaseEvent(ev)
+        
+    def enterEvent(self, ev):
+        self.setStyleSheet(self.styleSheet() + "background-color: #30363d;")
+        super().enterEvent(ev)
+        
+    def leaveEvent(self, ev):
+        self.setStyleSheet(self.styleSheet().replace("background-color: #30363d;", ""))
+        super().leaveEvent(ev)
+
+class TemplateBuilderDialog(QDialog):
+    def __init__(self, sample_path, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("🏗️ Exact Template Builder")
+        self.resize(800, 250)
+        
+        # Match parent theme
+        if parent and hasattr(parent, 'styleSheet'): self.setStyleSheet(parent.styleSheet())
+        
+        layout = QVBoxLayout(self)
+        
+        lbl_info = QLabel(
+            "<b>1. Your Sample Path:</b><br>"
+            "<span style='color:#8b949e;'>This is the exact full path of the file you clicked.</span>"
+        )
+        layout.addWidget(lbl_info)
+        
+        self.txt_sample = QLineEdit(sample_path)
+        self.txt_sample.setReadOnly(True)
+        self.txt_sample.setStyleSheet("background-color: #0d1117; color: #8b949e; padding: 6px; border: 1px solid #30363d;")
+        layout.addWidget(self.txt_sample)
+        
+        lbl_inst = QLabel(
+            "<br><b>2. Build Your Template:</b><br>"
+            "• Replace the exact numbers you want to extract with <b>[YYYY]</b>, <b>[YY]</b>, <b>[MM]</b>, <b>[DD]</b>, <b>[HH]</b>, <b>[mm]</b>, <b>[ss]</b>.<br>"
+            "• Replace any folder names or text that changes between files with <b>*</b><br>"
+            "<span style='color:#e3b341;'>Example:</span> <code>*/Private/[YY]/*/[MM]/[DD]/Screenshot_[YYYY][MM][DD]_[HH][mm][ss].*</code>"
+        )
+        layout.addWidget(lbl_inst)
+        
+        self.txt_template = QLineEdit(sample_path)
+        self.txt_template.setStyleSheet("background-color: #0d1117; color: #58a6ff; font-weight: bold; padding: 6px; border: 1px solid #58a6ff;")
+        layout.addWidget(self.txt_template)
+        
+        layout.addSpacing(10)
+        btn_apply = QPushButton("Apply Exact Template to Highlighted Files")
+        btn_apply.setStyleSheet("background-color: #2ea043; color: white; font-weight: bold; padding: 10px; border-radius: 4px;")
+        btn_apply.clicked.connect(self.accept)
+        layout.addWidget(btn_apply)
+
+    def get_template(self):
+        return self.txt_template.text()
 
 # --- Advanced Forensic Timestamp Corrector Engine ---
 class TimestampCorrectorDialog(QDialog):
     def __init__(self, selected_items, db_path, parent=None):
         super().__init__(parent)
         self.setWindowTitle("🕰️ Forensic Programmable Timestamp Corrector")
-        self.resize(1200, 750)
+        self.resize(1150, 650)
+        self.setWindowFlags(self.windowFlags() | Qt.WindowMinimizeButtonHint | Qt.WindowMaximizeButtonHint | Qt.WindowCloseButtonHint)
         self.setWindowModality(Qt.NonModal) 
         if parent and hasattr(parent, 'styleSheet'): self.setStyleSheet(parent.styleSheet())
         self.db_path = db_path
         self.selected_items = selected_items
+        self.main_app = parent
+        self.items_to_fix = []
         
         layout = QVBoxLayout(self)
+        self.tabs = QTabWidget()
+        layout.addWidget(self.tabs)
+        
+        # ==========================================
+        # TAB 1: SYNTAX, EXAMPLES & CONFIGURATION
+        # ==========================================
+        tab_config = QWidget()
+        conf_main_lay = QHBoxLayout(tab_config) 
         
         guide_txt = (
-            "<b style='color:#e3b341; font-size:14px;'>Ultimate Extraction Commands & Syntax Guide:</b><br>"
-            "Match fragmented dates across <i>millions of folders and filenames</i> simultaneously. Unmatched components (e.g., Year) keep the file's original data!<br>"
-            "• <b style='color:#58a6ff;'>YYYY, YY</b>: Year | <b style='color:#58a6ff;'>MMM</b>: Month Name (Jan, February, may) | <b style='color:#58a6ff;'>MM, M</b>: Numeric Month | <b style='color:#58a6ff;'>DD, D</b>: Day | <b style='color:#58a6ff;'>HH, mm, ss</b>: Time<br>"
-            "• <b style='color:#e3b341;'>*</b>: Skip any characters/folders | <b style='color:#e3b341;'>&lt;dir&gt;</b>: Skip exactly one folder<br>"
-            "• <b style='color:#e3b341;'>?TOKEN?</b>: Fuzzy optional wrappers (e.g., ?YYYYMMDD? finds a block anywhere)<br><br>"
-            "<i>Path & Folder Examples:</i><br>"
-            "  1. <code>*/video YYYY M/D.*</code> → Extracts from: <span style='color:#8b949e;'>/video <b>2023 03</b>/<b>01</b>.mp4</span><br>"
-            "  2. <code>*/YY/MMM/* D.*</code> → Extracts from: <span style='color:#8b949e;'>/docs/<b>23</b>/<b>February</b>/my files <b>20</b>.py</span><br>"
-            "  3. <code>*/YYYY.M_D/*</code> → Extracts from: <span style='color:#8b949e;'>/spiderman <b>2023.8_2</b>/sp.mp4</span><br>"
-            "  4. <code>*DMMM*YYYY*</code> → Extracts from: <span style='color:#8b949e;'>/data/<b>29may</b>_<b>2025</b>/photo.jpg</span><br>"
+            "<div style='line-height: 1.4; padding-right: 10px; font-size: 13px;'>"
+            "<h3 style='color:#58a6ff; margin-top: 0; margin-bottom: 5px;'>📖 How To Use</h3>"
+            "<b>1. Auto-Scan:</b> Write a pattern below and click 'Auto-Scan'. It tests the pattern against the Scope (Path, Name, or Both).<br>"
+            "<b>2. Manual Mode:</b> Click 'Load Files' to skip scanning. Go to 'Review & Apply', highlight files, right-click, and force-extract dates from specific text.<br>"
+            "<b>3. Apply:</b> <span style='color:#58a6ff;'>Blue</span> rows are identical. <span style='color:#3fb950;'>Green</span> rows have newly extracted dates. <span style='color:#f85149;'>Red</span> failed. Highlight rows, right-click, and Apply.<br><br>"
+            
+            "<h3 style='color:#e3b341; margin-top: 10px; margin-bottom: 5px;'>⚙️ Token Syntax</h3>"
+            "• <b style='color:#58a6ff;'>YYYY, YY</b>: Year | <b style='color:#58a6ff;'>MMM</b>: Month Name (Jan) | <b style='color:#58a6ff;'>MM, M</b>: Month<br>"
+            "• <b style='color:#58a6ff;'>DD, D</b>: Day | <b style='color:#58a6ff;'>HH, mm, ss</b>: Time<br>"
+            "• <b style='color:#3fb950;'>**</b>: Greedy Skip (Jumps across multiple folders/slashes)<br>"
+            "• <b style='color:#3fb950;'>*</b>: Local Skip (Skips text inside the current folder/file only)<br>"
+            "• <b style='color:#3fb950;'>&lt;dir&gt;</b>: Skips exactly one folder level<br><br>"
+            
+            "<h3 style='color:#c9d1d9; margin-top: 10px; margin-bottom: 5px;'>💡 Advanced Examples</h3>"
+            "<b>1. Standard YYYYMMDD anywhere:</b><br>"
+            "<code>**/*YYYYMMDD_HHmmss*</code> ➔ <span style='color:#8b949e;'>/A/B/IMG_<b>20240101_153000</b>.jpg</span><br>"
+            "<b>2. Year/Month in Path, Day in File:</b><br>"
+            "<code>**/YY/&lt;dir&gt;/MM/DD/**</code> ➔ <span style='color:#8b949e;'>/docs/<b>23</b>/work/<b>12</b>/<b>05</b>.png</span><br>"
+            "<b>3. Target Specific Level (Ignore subfolders):</b><br>"
+            "<code>*/YYYY.MM.DD/*/**</code> ➔ <span style='color:#8b949e;'>/drive/<b>2024.01.05</b>/sub/file.txt</span><br>"
+            "<b>4. Months as Words:</b><br>"
+            "<code>**/YY/MMM/** D.*</code> ➔ <span style='color:#8b949e;'>/docs/<b>23</b>/<b>February</b>/my files <b>20</b>.py</span><br>"
+            "</div>"
         )
-        lbl_guide = QLabel(guide_txt); lbl_guide.setTextFormat(Qt.RichText); layout.addWidget(lbl_guide)
+        self.guide_browser = QTextBrowser()
+        self.guide_browser.setHtml(guide_txt)
+        self.guide_browser.setStyleSheet("""
+            QTextBrowser { background-color: transparent; border: none; }
+            QScrollBar:vertical { width: 6px; background: transparent; }
+            QScrollBar::handle:vertical { background: #58a6ff; border-radius: 3px; }
+        """)
+        conf_main_lay.addWidget(self.guide_browser, stretch=1)
         
-        conf_lay = QGridLayout()
+        right_panel = QWidget()
+        right_lay = QVBoxLayout(right_panel)
+        right_lay.setContentsMargins(10, 0, 0, 0)
         
         self.txt_patterns = QPlainTextEdit()
-        self.txt_patterns.setPlainText("*/video YYYY M/D.*\n*/YY/MMM/* D.*\n*/YYYY.M_D/*\n*DMMM*YYYY*\n*MMM*D,*YYYY*\n*MM.YYYY*\n*?YYYYMMDD?*")
-        self.txt_patterns.setFixedHeight(110)
-        self.txt_patterns.setStyleSheet("color: #e3b341; font-family: Consolas; font-weight: bold; font-size: 14px; background-color: #0d1117; padding: 5px;")
+        # FIX: Advanced Defaults that automatically catch YYYYMMDD schemas and deep nested paths
+        self.txt_patterns.setPlainText("**/*YYYYMMDD_HHmmss*\n**/*YYYY-MM-DD HH-mm-ss*\n**/YY/<dir>/MM/DD/**\n**/YY/<dir>/MM/<dir>/DD/**\n**/*YYYY.MM.DD*/**\n**/YY/MMM/** D.*\n*DMMM*YYYY*\n*?YYYYMMDD?*")
+        self.txt_patterns.setStyleSheet("color: #e3b341; font-family: Consolas; font-weight: bold; font-size: 13px; background-color: #0d1117; padding: 5px; border: 1px solid #30363d; border-radius: 4px;")
         
         self.combo_modify_target = QComboBox()
         self.combo_modify_target.addItems(["Modified Date (Default)", "Created Date", "Both (Modified & Created)"])
-        self.combo_modify_target.setStyleSheet("font-weight: bold; padding: 5px; font-size: 13px;")
+        self.combo_modify_target.setStyleSheet("font-weight: bold; padding: 6px; font-size: 13px;")
         
-        conf_lay.addWidget(QLabel("<b>Custom Regex Patterns:</b><br>(Scans Path + Filename)"), 0, 0)
-        conf_lay.addWidget(self.txt_patterns, 0, 1)
-        conf_lay.addWidget(QLabel("<b>Target OS Property:</b>"), 1, 0)
-        conf_lay.addWidget(self.combo_modify_target, 1, 1)
-        layout.addLayout(conf_lay)
+        # --- NEW: Target Scope (Allows user to prioritize File vs Path) ---
+        self.combo_scan_scope = QComboBox()
+        self.combo_scan_scope.addItems(["Scan: Full Virtual Path + Filename", "Scan: Filename Only", "Scan: Virtual Path Only"])
+        self.combo_scan_scope.setStyleSheet("font-weight: bold; padding: 6px; font-size: 13px; color: #58a6ff;")
         
-        scan_lay = QHBoxLayout()
+        right_lay.addWidget(QLabel("<b>Custom Regex Patterns:</b><br>(Scans top-to-bottom)"))
+        right_lay.addWidget(self.txt_patterns, stretch=1)
+        right_lay.addWidget(QLabel("<b>Extraction Scope:</b>"))
+        right_lay.addWidget(self.combo_scan_scope)
+        right_lay.addWidget(QLabel("<b>Target OS Property:</b>"))
+        right_lay.addWidget(self.combo_modify_target)
+        right_lay.addSpacing(15)
+        
         btn_load_manual = QPushButton("📋 Load Files (Manual / Context Edit Mode)")
-        btn_load_manual.setStyleSheet("padding: 8px;")
+        btn_load_manual.setStyleSheet("padding: 10px; font-weight: bold;")
         btn_load_manual.clicked.connect(self.load_manual_files)
         
         btn_scan = QPushButton("🔍 Auto-Scan & Suggest from Patterns")
-        btn_scan.setStyleSheet("background-color: #1f6feb; color: white; font-weight: bold; padding: 8px;")
+        btn_scan.setStyleSheet("background-color: #1f6feb; color: white; font-weight: bold; padding: 10px;")
         btn_scan.clicked.connect(self.scan_files)
         
-        scan_lay.addWidget(btn_load_manual); scan_lay.addWidget(btn_scan)
-        layout.addLayout(scan_lay)
+        right_lay.addWidget(btn_load_manual)
+        right_lay.addWidget(btn_scan)
+        
+        conf_main_lay.addWidget(right_panel, stretch=1)
+        self.tabs.addTab(tab_config, "⚙️ Configuration & Syntax")
+        
+        # ==========================================
+        # TAB 2: RESULTS TABLE
+        # ==========================================
+        tab_table = QWidget()
+        lay_table = QVBoxLayout(tab_table)
         
         self.progress = QProgressBar(); self.progress.setVisible(False)
-        self.progress.setFixedHeight(15); self.progress.setAlignment(Qt.AlignCenter)
-        layout.addWidget(self.progress)
+        self.progress.setFixedHeight(24); self.progress.setAlignment(Qt.AlignCenter)
+        self.progress.setStyleSheet("""
+            QProgressBar { border: 1px solid #30363d; border-radius: 4px; background: #0d1117; color: #ffffff; font-weight: bold; text-align: center; }
+            QProgressBar::chunk { background: #2ea043; border-radius: 3px; }
+        """)
+        lay_table.addWidget(self.progress)
         
         self.table = QTableWidget(0, 5)
-        self.table.setHorizontalHeaderLabels(["Filename", "Original Date", "Select Correct Date", "Match Pattern", "Full Physical Path"])
+        self.table.setHorizontalHeaderLabels(["Filename", "Original Date", "Select Correct Date", "Match Pattern", "Virtual Path Used"])
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.horizontalHeader().setStretchLastSection(True)
-        self.table.setColumnWidth(0, 250); self.table.setColumnWidth(1, 140); self.table.setColumnWidth(2, 180)
-        self.table.setColumnWidth(3, 160)
+        self.table.setColumnWidth(0, 250); self.table.setColumnWidth(1, 140); self.table.setColumnWidth(2, 190)
+        self.table.setColumnWidth(3, 200)
         self.table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self.show_context_menu)
-        layout.addWidget(self.table)
+        self.table.setSortingEnabled(True)
+        lay_table.addWidget(self.table)
         
-        btn_box = QHBoxLayout()
-        self.btn_apply_db = QPushButton("💾 Modify Database Only")
-        self.btn_apply_db.setStyleSheet("background-color: #8957e5; color: white; font-weight: bold; padding: 10px;")
-        self.btn_apply_db.clicked.connect(lambda: self.apply_fixes("db"))
+        self.tabs.addTab(tab_table, "📋 Review & Apply")
         
-        self.btn_apply_os = QPushButton("📂 Modify Physical File Only")
-        self.btn_apply_os.setStyleSheet("background-color: #d29922; color: white; font-weight: bold; padding: 10px;")
-        self.btn_apply_os.clicked.connect(lambda: self.apply_fixes("os"))
+        # ==========================================
+        # TAB 3: HELP & OPERATIONS
+        # ==========================================
+        tab_help = QWidget()
+        lay_help = QVBoxLayout(tab_help)
+        help_browser = QTextBrowser()
+        help_browser.setStyleSheet("background-color: transparent; border: none; font-size: 14px; color: #c9d1d9;")
         
-        self.btn_apply_both = QPushButton("🚀 Modify Both (DB + Physical)")
-        self.btn_apply_both.setStyleSheet("background-color: #2ea043; color: white; font-weight: bold; padding: 10px;")
-        self.btn_apply_both.clicked.connect(lambda: self.apply_fixes("both"))
+        help_html = """
+        <h2 style='color:#58a6ff;'>🚀 Fast Workflow Guide</h2>
+        <p><b>1. Auto-Scan vs Manual:</b> Use Auto-Scan for common patterns (like standard YYYYMMDD). Use <b>Manual Mode</b> to load files directly into the grid and use the right-click Context Menu for absolute precision.</p>
+        <p><b>2. 🏗️ Exact Template Builder:</b> Right-click any file -> <i>Mix & Match -> Build Exact Template</i>. Replace numbers with <b>[YYYY]</b>, <b>[MM]</b>, <b>[DD]</b>, <b>[HH]</b>, etc., and replace changing folder/file names with <b>*</b>. The engine will instantly parse all table files using that exact mapping.</p>
         
-        for b in [self.btn_apply_db, self.btn_apply_os, self.btn_apply_both]:
-            b.setEnabled(False); btn_box.addWidget(b)
-        layout.addLayout(btn_box)
+        <h2 style='color:#e3b341;'>🎨 Row Color Legend</h2>
+        <ul>
+            <li><b style='color:#46a043;'>Green (Success - Corrected):</b> The date was extracted successfully and is DIFFERENT from the original database date.</li>
+            <li><b style='color:#e3b341;'>Light Orange (Success - Unchanged):</b> The date was extracted successfully, but it is EXACTLY THE SAME as the original database date.</li>
+            <li><b style='color:#f85149;'>Red (Failed):</b> The extraction failed to find a valid date.</li>
+        </ul>
         
+        <h2 style='color:#58a6ff;'>🖱️ Table Operations & Context Menu</h2>
+        <ul>
+            <li><b>Highlighting:</b> Click and drag, or hold Shift/Ctrl to highlight multiple rows before right-clicking to apply bulk extractions.</li>
+            <li><b>Targeted Extraction:</b> If only the Year is wrong, highlight the files -> right-click -> <i>Extract Specific Parts -> Extract Year -> From Folder Name</i>. It will update the Year but leave the Month, Day, and Time completely untouched!</li>
+            <li><b>Custom Highlight:</b> Use the Visibility menu to apply a custom transparent color to your highlighted rows to easily see what you are working on.</li>
+        </ul>
+        """
+        help_browser.setHtml(help_html)
+        lay_help.addWidget(help_browser)
+        self.tabs.addTab(tab_help, "💡 Help & Operations")
+        
+        
+ 
+ 
     def _parse_custom_syntax(self, raw_pat):
         p = raw_pat.strip()
         if not p: return None
         
-        # 1. Protect specific syntax symbols
-        p = p.replace('.', r'\.')
-        p = p.replace('*', r'.*?') # Wildcard
-        p = p.replace('<dir>', r'[^/\\]+[/\\]+') # Folder skip
-        p = p.replace('<ext>', r'\.[^./\\]+') # Ext skip
-        p = p.replace('<file>', r'[^/\\]+') # Generic File Name Skip
+        p = p.replace('\\', '/')
+        safe_p = ""
+        special_chars = r"()[]{}.^$|+" 
+        for char in p:
+            if char in special_chars: safe_p += "\\" + char
+            else: safe_p += char
+        p = safe_p
         
-        # 2. Swap tokens for safe placeholders (prevents overlapping replacement bugs & re.sub crashes)
-        p = re.sub(r'(?<![A-Za-z])YYYY(?![A-Za-z])', '@@Y4@@', p)
-        p = re.sub(r'(?<![A-Za-z])YY(?![A-Za-z])', '@@Y2@@', p)
-        p = re.sub(r'(?<![A-Za-z])MMM(?![A-Za-z])', '@@M3@@', p)
-        p = re.sub(r'(?<![A-Za-z])MM(?![A-Za-z])', '@@M2@@', p)
-        p = re.sub(r'(?<![A-Za-z])M(?![A-Za-z])', '@@M1@@', p)
-        p = re.sub(r'(?<![A-Za-z])DD(?![A-Za-z])', '@@D2@@', p)
-        p = re.sub(r'(?<![A-Za-z])D(?![A-Za-z])', '@@D1@@', p)
-        p = re.sub(r'(?<![A-Za-z])HH(?![A-Za-z])', '@@H2@@', p)
-        p = re.sub(r'(?<![A-Za-z])mm(?![A-Za-z])', '@@m2@@', p)
-        p = re.sub(r'(?<![A-Za-z])ss(?![A-Za-z])', '@@s2@@', p)
+        # 3. Robust Translators
+        p = p.replace(' ', r'\s+')     
+        p = p.replace('**', r'.*')         # Cross-directory greedy skip
+        p = p.replace('*', r'[^/]*')       # In-directory skip (forces exact path locking)
+        p = p.replace('<dir>', r'[^/]+')   # Skip exactly one folder name
+        p = p.replace('<ext>', r'\.[^./]+$') 
+        p = p.replace('<file>', r'[^/]+') 
+        p = p.replace('/', r'/+')   
         
-        # 3. Handle Fuzzy Optionals
+        counters = defaultdict(int)
+        def repl(t_type, reg):
+            counters[t_type] += 1
+            return f"(?P<{t_type}_{counters[t_type]}>{reg})"
+            
+        # FIX: Removed negative lookarounds so YYYYMMDD compiles directly
+        p = re.sub(r'YYYY', lambda m: repl('Y4', r'\d{4}'), p)
+        p = re.sub(r'YY', lambda m: repl('Y2', r'\d{2}'), p)
+        p = re.sub(r'MMM', lambda m: repl('M3', r'jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?'), p, flags=re.IGNORECASE)
+        p = re.sub(r'MM', lambda m: repl('M2', r'0[1-9]|1[0-2]|\d{2}'), p)
+        p = re.sub(r'\bM\b', lambda m: repl('M1', r'[1-9]|1[0-2]|\d{1,2}'), p)
+        p = re.sub(r'DD', lambda m: repl('D2', r'0[1-9]|[12]\d|3[01]|\d{2}'), p)
+        p = re.sub(r'\bD\b', lambda m: repl('D1', r'[1-9]|[12]\d|3[01]|\d{1,2}'), p)
+        p = re.sub(r'HH', lambda m: repl('H2', r'[0-1]\d|2[0-3]|\d{2}'), p)
+        p = re.sub(r'mm', lambda m: repl('m2', r'[0-5]\d|\d{2}'), p)
+        p = re.sub(r'ss', lambda m: repl('s2', r'[0-5]\d|\d{2}'), p)
         p = re.sub(r'\?(.*?)\?', lambda m: f"(?:{m.group(1)})?", p) 
-        
-        # 4. Inject Crash-Proof Python Regex Groups (safely injecting literal \d using .replace)
-        p = p.replace('@@Y4@@', r'(?P<Y>\d{4})')
-        p = p.replace('@@Y2@@', r'(?P<y>\d{2})')
-        p = p.replace('@@M3@@', r'(?P<M_name>jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)')
-        p = p.replace('@@M2@@', r'(?P<M>0[1-9]|1[0-2]|\d{2})')
-        p = p.replace('@@M1@@', r'(?P<M_s>[1-9]|1[0-2]|\d{1,2})')
-        p = p.replace('@@D2@@', r'(?P<D>0[1-9]|[12]\d|3[01]|\d{2})')
-        p = p.replace('@@D1@@', r'(?P<D_s>[1-9]|[12]\d|3[01]|\d{1,2})')
-        p = p.replace('@@H2@@', r'(?P<h>[0-1]\d|2[0-3]|\d{2})')
-        p = p.replace('@@m2@@', r'(?P<m_m>[0-5]\d|\d{2})')
-        p = p.replace('@@s2@@', r'(?P<s>[0-5]\d|\d{2})')
         
         try: return re.compile(p, re.IGNORECASE)
         except Exception: return None
-
+            
     def load_manual_files(self):
+        self.tabs.setCurrentIndex(1)
+        self.table.setSortingEnabled(False)
         self.table.setRowCount(0)
         self.items_to_fix = []
+        
+        self.progress.setVisible(True)
+        self.progress.setMaximum(len(self.selected_items))
+        self.progress.setFormat("Loading: %p% (%v/%m)")
+        QApplication.processEvents()
+        
         for i, item in enumerate(self.selected_items):
             self.add_item_to_table(i, item, None, "Manual Mode")
+            if i % 20 == 0:
+                self.progress.setValue(i); QApplication.processEvents()
+                
+        self.progress.setVisible(False)
+        self.table.setSortingEnabled(True)
 
     def scan_files(self):
+        self.tabs.setCurrentIndex(1)
+        self.table.setSortingEnabled(False)
         self.table.setRowCount(0)
         self.items_to_fix = []
         patterns_text = self.txt_patterns.toPlainText().split('\n')
@@ -331,47 +489,61 @@ class TimestampCorrectorDialog(QDialog):
             comp = self._parse_custom_syntax(line)
             if comp: regex_list.append((line.strip(), comp))
             
-        if not regex_list: return QMessageBox.warning(self, "No Patterns", "Could not compile valid extraction patterns.")
+        if not regex_list: 
+            self.table.setSortingEnabled(True)
+            return QMessageBox.warning(self, "No Patterns", "Could not compile valid extraction patterns.")
             
         self.progress.setVisible(True)
         self.progress.setMaximum(len(self.selected_items))
+        self.progress.setFormat("Scanning: %p% (%v/%m)")
         QApplication.processEvents()
         
         MONTH_MAP = {'jan': 1, 'feb': 2, 'mar': 3, 'apr': 4, 'may': 5, 'jun': 6, 'jul': 7, 'aug': 8, 'sep': 9, 'oct': 10, 'nov': 11, 'dec': 12}
         
-        row_idx = 0
         for i, item in enumerate(self.selected_items):
             match_found = False; best_dt = None; best_pat = ""
             
-            # Use original date metadata as a fallback if the pattern only extracts partial info (like Month/Day)
             try: orig_dt = datetime.datetime.strptime(str(item['mod']), "%Y-%m-%d %H:%M:%S")
             except: orig_dt = datetime.datetime.now()
             
-            # Combine path and filename for the ultimate fragmented scan target
-            full_target = item['real_path'] if item['real_path'] else item['name']
+            # Combine Virtual Path and Filename to seamlessly support OS independent path parsing
+            v_path = item.get('p_path', '')
+            filename = item['name']
+            scope = self.combo_scan_scope.currentText()
+            
+            # --- FIX: Apply user extraction scope ---
+            if "Filename Only" in scope:
+                full_target = filename
+            elif "Virtual Path Only" in scope:
+                full_target = v_path.replace('\\', '/')
+            else:
+                full_target = f"{v_path}{filename}".replace('\\', '/')
             
             for pat_str, regex in regex_list:
                 m = regex.search(full_target)
                 if m:
                     gd = m.groupdict()
+                    y_str = m_str = d_str = h_str = mm_str = s_str = m_name_str = None
                     
-                    y_str = gd.get('Y') or ('20' + gd['y'] if gd.get('y') else None)
-                    m_str = gd.get('M') or gd.get('M_s')
-                    d_str = gd.get('D') or gd.get('D_s')
-                    
-                    y_val = int(y_str) if y_str else orig_dt.year
-                    
-                    if gd.get('M_name'):
-                        m_prefix = gd['M_name'][:3].lower()
-                        m_val = MONTH_MAP.get(m_prefix, 1)
-                    else:
-                        m_val = int(m_str) if m_str else (orig_dt.month if not y_str else 1)
+                    for k, v in gd.items():
+                        if v is None: continue
+                        # FIX: Added 'not x_str' to ensure stronger tokens (YYYY) aren't overwritten by weaker ones (YY)
+                        if k.startswith('Y4_'): y_str = v
+                        elif k.startswith('Y2_') and not y_str: y_str = '20' + v
+                        elif k.startswith('M3_'): m_name_str = v
+                        elif (k.startswith('M2_') or k.startswith('M1_')) and not m_name_str: m_str = v
+                        elif (k.startswith('D2_') or k.startswith('D1_')) and not d_str: d_str = v
+                        elif k.startswith('H2_') and not h_str: h_str = v
+                        elif k.startswith('m2_') and not mm_str: mm_str = v
+                        elif k.startswith('s2_') and not s_str: s_str = v
                         
+                    y_val = int(y_str) if y_str else orig_dt.year
+                    if m_name_str: m_val = MONTH_MAP.get(m_name_str[:3].lower(), 1)
+                    else: m_val = int(m_str) if m_str else (orig_dt.month if not y_str else 1)
                     d_val = int(d_str) if d_str else (orig_dt.day if not y_str and not m_str else 1)
-                    
-                    h_val = int(gd.get('h') or orig_dt.hour)
-                    mm_val = int(gd.get('m_m') or orig_dt.minute)
-                    s_val = int(gd.get('s') or orig_dt.second)
+                    h_val = int(h_str) if h_str else orig_dt.hour
+                    mm_val = int(mm_str) if mm_str else orig_dt.minute
+                    s_val = int(s_str) if s_str else orig_dt.second
                     
                     try:
                         best_dt = datetime.datetime(y_val, m_val, d_val, h_val, mm_val, s_val)
@@ -380,25 +552,38 @@ class TimestampCorrectorDialog(QDialog):
                     except: pass
                 if match_found: break
                         
-            if match_found:
-                self.add_item_to_table(row_idx, item, best_dt, best_pat)
-                row_idx += 1
+            self.add_item_to_table(i, item, best_dt, best_pat)
             if i % 10 == 0:
                 self.progress.setValue(i); QApplication.processEvents()
                 
         self.progress.setVisible(False)
-        if row_idx == 0: QMessageBox.information(self, "No Matches", "No dates extracted using patterns. Use Manual Load.")
+        self.table.setSortingEnabled(True)
+
+    def _apply_row_color(self, r, cur_dt, is_fail=False):
+        if is_fail:
+            bg_color = QColor(248, 81, 73, 40) # Transparent Red (No Match / Failed)
+        else:
+            cur_ts = cur_dt.toSecsSinceEpoch()
+            orig_str = self.table.item(r, 1).text()
+            try: orig_dt = QDateTime.fromString(orig_str, "yyyy-MM-dd HH:mm:ss")
+            except: orig_dt = QDateTime.currentDateTime()
+            
+            orig_ts = orig_dt.toSecsSinceEpoch()
+            if cur_ts == orig_ts: 
+                bg_color = QColor(227, 179, 65, 40) # Light Orange (Extracted Successfully, but Date is the Same)
+            else: 
+                bg_color = QColor(46, 160, 67, 40) # Green (Extracted Successfully AND Date is Different/Corrected)
+                
+        for c in [0, 1, 3, 4]: 
+            if self.table.item(r, c):
+                self.table.item(r, c).setBackground(bg_color)
 
     def add_item_to_table(self, row_idx, item, extracted_dt, pat_str):
         self.table.insertRow(row_idx)
         self.table.setItem(row_idx, 0, QTableWidgetItem(item['name']))
         
         t_prop = self.combo_modify_target.currentText()
-        if "Created" in t_prop and 'creation_date' in item:
-            disp_date = item['creation_date']
-        else:
-            disp_date = item['mod']
-            
+        disp_date = item.get('creation_date', item['mod']) if "Created" in t_prop else item['mod']
         self.table.setItem(row_idx, 1, QTableWidgetItem(str(disp_date)))
         
         dt_edit = QDateTimeEdit()
@@ -406,89 +591,308 @@ class TimestampCorrectorDialog(QDialog):
         dt_edit.setCalendarPopup(True)
         dt_edit.setStyleSheet("background-color: #0d1117; color: #58a6ff; font-weight: bold; border: 1px solid #3fb950; padding: 2px;")
         
-        if extracted_dt: dt_edit.setDateTime(extracted_dt)
+        is_fail = False
+        if extracted_dt: 
+            dt_edit.setDateTime(extracted_dt)
         else:
+            is_fail = True
             try: dt_edit.setDateTime(QDateTime.fromString(str(disp_date), "yyyy-MM-dd HH:mm:ss"))
             except: dt_edit.setDateTime(QDateTime.currentDateTime())
+            pat_str = "Unmatched / Failed" if pat_str == "" else pat_str
             
         self.table.setCellWidget(row_idx, 2, dt_edit)
         self.table.setItem(row_idx, 3, QTableWidgetItem(pat_str))
         
-        path_item = QTableWidgetItem(str(item['real_path']))
-        path_item.setData(Qt.UserRole, {'id': item['id'], 'old_date': str(item['mod']), 'tags': item.get('tags', '')})
+        v_path = item.get('p_path', '')
+        full_v_path = f"{v_path}{item['name']}".replace('\\', '/')
+        path_item = QTableWidgetItem(full_v_path)
+        path_item.setData(Qt.UserRole, {'id': item['id'], 'old_date': str(item['mod']), 'tags': item.get('tags', ''), 'p_path': v_path, 'real_path': item.get('real_path', '')})
         self.table.setItem(row_idx, 4, path_item)
         
-        self.items_to_fix.append({'id': item['id'], 'real_path': item['real_path'], 'old_date': str(item['mod']), 'tags': item.get('tags', ''), 'dt_widget': dt_edit})
-        for b in [self.btn_apply_db, self.btn_apply_os, self.btn_apply_both]: b.setEnabled(True)
+        self._apply_row_color(row_idx, dt_edit.dateTime(), is_fail)
+        self.items_to_fix.append({'id': item['id'], 'real_path': item.get('real_path', ''), 'old_date': str(item['mod']), 'tags': item.get('tags', ''), 'v_path': v_path, 'dt_widget': dt_edit})
+
+    def show_properties(self, row):
+        item = self.items_to_fix[row]
+        msg = f"<b>Filename:</b> {self.table.item(row, 0).text()}<br><br>" \
+              f"<b>Virtual Scanned Path:</b> {self.table.item(row, 4).text()}<br><br>" \
+              f"<b>Physical OS Path:</b> {item['real_path']}<br><br>" \
+              f"<b>Original Database Date:</b> {item['old_date']}<br><br>" \
+              f"<b>VMan Tags:</b> {item['tags']}"
+        dlg = QMessageBox(self)
+        dlg.setWindowTitle("File Properties")
+        dlg.setText(msg)
+        dlg.exec()
+
+
+    def _add_glow_action(self, menu, label, source, f_type, callback):
+        selected_rows = self.table.selectionModel().selectedRows()
+        count = 0
+        for idx in selected_rows:
+            r = idx.row()
+            name = self.table.item(r, 0).text()
+            v_path = self.items_to_fix[r]['v_path'].strip('/')
+            folder = v_path.split('/')[-1] if v_path else ""
+            path = self.table.item(r, 4).text()
+            
+            target_text = name if source == "name" else (folder if source == "folder" else path)
+            if self._has_fragment(target_text, f_type):
+                count += 1
+                
+        detected = count > 0
+        display_label = f"🌟 {label} ({count} files)" if detected else f"   {label}"
+        
+        act = QWidgetAction(menu)
+        lbl = ClickableMenuLabel(display_label)
+        if detected:
+            lbl.setStyleSheet("color: #e3b341; font-weight: bold; font-size: 13px; background: transparent; padding: 4px 10px;")
+        else:
+            lbl.setStyleSheet("color: #c9d1d9; font-size: 13px; background: transparent; padding: 4px 10px;")
+            
+        act.setDefaultWidget(lbl)
+        lbl.clicked.connect(callback)
+        lbl.clicked.connect(menu.close)
+        menu.addAction(act)
+
+    def toggle_highlight_color(self):
+        from PySide6.QtWidgets import QColorDialog
+        from PySide6.QtGui import QColor
+        color = QColorDialog.getColor(QColor(227, 179, 65, 100), self, "Select Highlight Color", QColorDialog.ShowAlphaChannel)
+        if color.isValid():
+            rgba = f"rgba({color.red()}, {color.green()}, {color.blue()}, {color.alpha()})"
+            self.table.setStyleSheet(f"QTableWidget::item:selected {{ background-color: {rgba}; color: #ffffff; }}")
+            
+    def reset_highlight_color(self):
+        self.table.setStyleSheet("")
 
     def show_context_menu(self, pos):
         row = self.table.rowAt(pos.y())
         if row < 0: return
         menu = QMenu(self)
         
-        m_full = menu.addMenu("📅 Extract Full Date")
-        m_full.addAction("From Filename").triggered.connect(lambda: self.extract_part("full", "name"))
-        m_full.addAction("From Full Path").triggered.connect(lambda: self.extract_part("full", "path"))
+        # --- 1. Apply Actions ---
+        m_apply = menu.addMenu("🚀 Apply Modifications (Highlighted Rows)")
+        m_apply.addAction("💾 Modify Database Only").triggered.connect(lambda: self.apply_fixes("db"))
+        m_apply.addAction("📂 Modify Physical File Only").triggered.connect(lambda: self.apply_fixes("os"))
+        m_apply.addAction("🚀 Modify Both (DB + Physical)").triggered.connect(lambda: self.apply_fixes("both"))
         menu.addSeparator()
+
+        # --- 2. Visibility & Selection Tools ---
+        m_vis = menu.addMenu("👁️ Visibility & Selection")
+        m_vis.addAction("🎨 Set Custom Transparent Highlight...").triggered.connect(self.toggle_highlight_color)
+        m_vis.addAction("🧹 Reset Highlight to Default").triggered.connect(self.reset_highlight_color)
+        menu.addSeparator()
+
+        # --- 3. Full Date Extraction ---
+        m_full = menu.addMenu("📅 Extract Full Date")
+        self._add_glow_action(m_full, "From Path + Filename", "full_path", "full", lambda: self.extract_part("full", "full_path"))
+        self._add_glow_action(m_full, "From Filename", "name", "full", lambda: self.extract_part("full", "name"))
+        self._add_glow_action(m_full, "From Folder Name", "folder", "full", lambda: self.extract_part("full", "folder"))
+        self._add_glow_action(m_full, "From Virtual Path", "path", "full", lambda: self.extract_part("full", "path"))
         
+        # --- 4. Mixed & Fragmented Extraction ---
         m_mix = menu.addMenu("🧩 Mix & Match Extraction")
+        
+        # ADD THIS LINE RIGHT HERE:
+        m_mix.addAction("🏗️ Build Exact Template from this File...").triggered.connect(lambda: self.open_template_builder(row))
+        
+        m_mix.addSeparator()
         m_mix.addAction("Year from Path + Month/Day from File").triggered.connect(lambda: self.extract_mixed("Y_path_MD_file"))
         m_mix.addAction("Year/Month from Path + Day from File").triggered.connect(lambda: self.extract_mixed("YM_path_D_file"))
         m_mix.addAction("Date from File + Time from Path").triggered.connect(lambda: self.extract_mixed("D_file_T_path"))
         menu.addSeparator()
         
-        m_yr = menu.addMenu("📆 Extract Year")
-        m_yr.addAction("From Filename").triggered.connect(lambda: self.extract_part("year", "name"))
-        m_yr.addAction("From Full Path").triggered.connect(lambda: self.extract_part("year", "path"))
+        # --- 5. Individual Parts Extraction ---
+        m_parts = menu.addMenu("✂️ Extract Specific Parts")
         
-        m_mo = menu.addMenu("🗓 Extract Month")
-        m_mo.addAction("From Filename").triggered.connect(lambda: self.extract_part("month", "name"))
-        m_mo.addAction("From Full Path").triggered.connect(lambda: self.extract_part("month", "path"))
+        m_yr = m_parts.addMenu("📆 Extract Year")
+        self._add_glow_action(m_yr, "From Path + Filename", "full_path", "year", lambda: self.extract_part("year", "full_path"))
+        self._add_glow_action(m_yr, "From Filename", "name", "year", lambda: self.extract_part("year", "name"))
+        self._add_glow_action(m_yr, "From Folder Name", "folder", "year", lambda: self.extract_part("year", "folder"))
+        self._add_glow_action(m_yr, "From Virtual Path", "path", "year", lambda: self.extract_part("year", "path"))
         
-        m_dy = menu.addMenu("📆 Extract Day")
-        m_dy.addAction("From Filename").triggered.connect(lambda: self.extract_part("day", "name"))
-        m_dy.addAction("From Full Path").triggered.connect(lambda: self.extract_part("day", "path"))
+        m_mo = m_parts.addMenu("🗓 Extract Month")
+        self._add_glow_action(m_mo, "From Path + Filename", "full_path", "month", lambda: self.extract_part("month", "full_path"))
+        self._add_glow_action(m_mo, "From Filename", "name", "month", lambda: self.extract_part("month", "name"))
+        self._add_glow_action(m_mo, "From Folder Name", "folder", "month", lambda: self.extract_part("month", "folder"))
+        self._add_glow_action(m_mo, "From Virtual Path", "path", "month", lambda: self.extract_part("month", "path"))
         
-        m_tm = menu.addMenu("⏱ Extract Time")
-        m_tm.addAction("From Filename").triggered.connect(lambda: self.extract_part("time", "name"))
-        m_tm.addAction("From Full Path").triggered.connect(lambda: self.extract_part("time", "path"))
+        m_dy = m_parts.addMenu("📆 Extract Day")
+        self._add_glow_action(m_dy, "From Path + Filename", "full_path", "day", lambda: self.extract_part("day", "full_path"))
+        self._add_glow_action(m_dy, "From Filename", "name", "day", lambda: self.extract_part("day", "name"))
+        self._add_glow_action(m_dy, "From Folder Name", "folder", "day", lambda: self.extract_part("day", "folder"))
+        self._add_glow_action(m_dy, "From Virtual Path", "path", "day", lambda: self.extract_part("day", "path"))
+        
+        m_tm = m_parts.addMenu("⏱ Extract Time")
+        self._add_glow_action(m_tm, "From Path + Filename", "full_path", "time", lambda: self.extract_part("time", "full_path"))
+        self._add_glow_action(m_tm, "From Filename", "name", "time", lambda: self.extract_part("time", "name"))
+        self._add_glow_action(m_tm, "From Folder Name", "folder", "time", lambda: self.extract_part("time", "folder"))
+        self._add_glow_action(m_tm, "From Virtual Path", "path", "time", lambda: self.extract_part("time", "path"))
+        
+        menu.addSeparator()
+        menu.addAction("ℹ️ Properties").triggered.connect(lambda: self.show_properties(row))
         
         menu.exec(self.table.viewport().mapToGlobal(pos))
+ 
+    def open_template_builder(self, row):
+        v_path = self.items_to_fix[row]['v_path']
+        filename = self.table.item(row, 0).text()
+        full_path = f"{v_path}{filename}".replace('\\', '/')
         
+        dlg = TemplateBuilderDialog(full_path, self)
+        if dlg.exec() == QDialog.Accepted:
+            template = dlg.get_template()
+            
+            # --- FIX: Ask to apply to ALL files if user only right-clicked one row ---
+            selected_rows = self.table.selectionModel().selectedRows()
+            if len(selected_rows) <= 1:
+                ans = QMessageBox.question(self, "Apply Template", "Do you want to apply this exact template to ALL files in the table?\n\n(Click 'Yes' for ALL files, 'No' for just this specific file).", QMessageBox.Yes | QMessageBox.No)
+                if ans == QMessageBox.Yes:
+                    target_rows = [self.table.model().index(i, 0) for i in range(self.table.rowCount())]
+                else:
+                    target_rows = selected_rows if selected_rows else [self.table.model().index(row, 0)]
+            else:
+                target_rows = selected_rows
+                
+            self.apply_exact_template(template, target_rows)
+
+    def apply_exact_template(self, template, selected_rows):
+        # 1. Escape regex specials safely
+        safe_p = ""
+        for char in template:
+            if char in r"().^$|+?\{}": safe_p += "\\" + char
+            else: safe_p += char
+            
+        # 2. Convert user syntax to Regex
+        safe_p = safe_p.replace('*', r'.*?')
+        safe_p = safe_p.replace('[YYYY]', r'(?P<Y4>\d{4})')
+        safe_p = safe_p.replace('[YY]', r'(?P<Y2>\d{2})')
+        safe_p = safe_p.replace('[MM]', r'(?P<M2>0[1-9]|1[0-2]|\d{2})')
+        safe_p = safe_p.replace('[DD]', r'(?P<D2>0[1-9]|[12]\d|3[01]|\d{2})')
+        safe_p = safe_p.replace('[HH]', r'(?P<H2>[0-1]\d|2[0-3]|\d{2})')
+        safe_p = safe_p.replace('[mm]', r'(?P<m2>[0-5]\d|\d{2})')
+        safe_p = safe_p.replace('[ss]', r'(?P<s2>[0-5]\d|\d{2})')
+        
+        try:
+            rx = re.compile(safe_p, re.IGNORECASE)
+        except Exception as e:
+            return QMessageBox.warning(self, "Template Error", f"Invalid template generated:\n{e}")
+            
+        count = 0
+        for idx in selected_rows:
+            r = idx.row()
+            dt_widget = self.items_to_fix[r]['dt_widget']
+            cur_dt = dt_widget.dateTime()
+            
+            v_path = self.items_to_fix[r]['v_path']
+            filename = self.table.item(r, 0).text()
+            full_path = f"{v_path}{filename}".replace('\\', '/')
+            
+            m = rx.search(full_path)
+            if m:
+                gd = m.groupdict()
+                
+                # Default to existing values so optional extraction works perfectly
+                y_val = cur_dt.date().year()
+                m_val = cur_dt.date().month()
+                d_val = cur_dt.date().day()
+                h_val = cur_dt.time().hour()
+                mm_val = cur_dt.time().minute()
+                s_val = cur_dt.time().second()
+                
+                if 'Y4' in gd and gd['Y4']: y_val = int(gd['Y4'])
+                elif 'Y2' in gd and gd['Y2']: y_val = 2000 + int(gd['Y2'])
+                if 'M2' in gd and gd['M2']: m_val = int(gd['M2'])
+                if 'D2' in gd and gd['D2']: d_val = int(gd['D2'])
+                if 'H2' in gd and gd['H2']: h_val = int(gd['H2'])
+                if 'm2' in gd and gd['m2']: mm_val = int(gd['m2'])
+                if 's2' in gd and gd['s2']: s_val = int(gd['s2'])
+                
+                cur_dt.setDate(QDate(y_val, m_val, d_val))
+                cur_dt.setTime(QTime(h_val, mm_val, s_val))
+                
+                dt_widget.setDateTime(cur_dt)
+                self.table.item(r, 3).setText("Exact Visual Template")
+                self._apply_row_color(r, cur_dt, is_fail=False)
+                count += 1
+                
+        if count == 0:
+            QMessageBox.information(self, "No Match", "The template did not match any of the selected files.\nMake sure you used '*' for changing text.")
+ 
+    def _get_text_for_source(self, r, source):
+        v_path = self.items_to_fix[r]['v_path'].strip('/')
+        folder_text = v_path.split('/')[-1] if v_path else ""
+        name = self.table.item(r, 0).text()
+        full_path = self.table.item(r, 4).text()
+        
+        if source == "name": return name
+        elif source == "folder": return folder_text
+        elif source == "path": return v_path
+        elif source == "full_path": return full_path
+        return ""
+
+    def _has_fragment(self, text, f_type):
+        if not text: return False
+        # FIX: The exact same regex is now used for both the yellow glow and the extraction, preventing false positives
+        if f_type == 'year': return bool(re.search(r'(?<!\d)(19[8-9]\d|20[0-3]\d)(?!\d)', text))
+        if f_type == 'month': return bool(re.search(r'\b(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\b', text, re.I))
+        if f_type == 'time': return bool(re.search(r'(?<!\d)([0-1]\d|2[0-3])[-_.:]([0-5]\d)(?:[-_.:]([0-5]\d))?(?!\d)', text))
+        if f_type == 'full': 
+            if re.search(r'(?<!\d)(19[8-9]\d|20[0-3]\d)(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])(?!\d)', text): return True
+            return bool(re.search(r'(19\d{2}|20\d{2}|\d{2})[-_./\s]+(0?[1-9]|1[0-2]|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*[-_./\s]+(0?[1-9]|[12]\d|3[01])', text, re.I))
+        if f_type == 'day': return False 
+        return False
+
     def extract_part(self, part, source):
         selected_rows = self.table.selectionModel().selectedRows()
         if not selected_rows: return
         
-        rx_yr = re.compile(r'(?<!\d)(19[7-9]\d|20[0-2]\d)(?!\d)')
-        rx_mo = re.compile(r'(?:^|[-_./\s])(0[1-9]|1[0-2])(?:[-_./\s]|$)')
-        rx_dy = re.compile(r'(?:^|[-_./\s])(0[1-9]|[12]\d|3[01])(?:[-_./\s]|$)')
-        rx_tm = re.compile(r'(?<!\d)([0-1]\d|2[0-3])[:_-]?([0-5]\d)(?:[:_-]?([0-5]\d))?(?!\d)')
-        rx_full = re.compile(r'(?P<Y>19[7-9]\d|20[0-2]\d)[-_./\s]?(?P<M>0[1-9]|1[0-2])[-_./\s]?(?P<D>0[1-9]|[12]\d|3[01])')
+        rx_yr = re.compile(r'(?<!\d)(19[8-9]\d|20[0-3]\d)(?!\d)')
+        rx_mo = re.compile(r'\b(0?[1-9]|1[0-2])\b|\b(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\b', re.I)
+        rx_dy = re.compile(r'(?<!\d)(0?[1-9]|[12]\d|3[01])(?!\d)')
+        rx_tm = re.compile(r'(?<!\d)([0-1]\d|2[0-3])[-_.:]([0-5]\d)(?:[-_.:]([0-5]\d))?(?!\d)')
+        rx_full = re.compile(r'(?<!\d)(?P<Y>19[8-9]\d|20[0-3]\d)(?P<M>0[1-9]|1[0-2])(?P<D>0[1-9]|[12]\d|3[01])(?!\d)|(?P<Y2>19\d{2}|20\d{2}|\d{2})[-_./\s]+(?P<M2>0?[1-9]|1[0-2]|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*[-_./\s]+(?P<D2>0?[1-9]|[12]\d|3[01])', re.I)
+        MONTH_MAP = {'jan': 1, 'feb': 2, 'mar': 3, 'apr': 4, 'may': 5, 'jun': 6, 'jul': 7, 'aug': 8, 'sep': 9, 'oct': 10, 'nov': 11, 'dec': 12}
         
         count = 0
         for idx in selected_rows:
             r = idx.row()
             dt_widget = self.items_to_fix[r]['dt_widget']
             cur_dt = dt_widget.dateTime()
-            text = self.table.item(r, 0).text() if source == "name" else self.table.item(r, 4).text()
+            
+            text = self._get_text_for_source(r, source)
+            row_matched = False
             
             if part == "year":
                 m = rx_yr.search(text)
-                if m: cur_dt.setDate(QDate(int(m.group(1)), cur_dt.date().month(), cur_dt.date().day())); count+=1
+                if m: cur_dt.setDate(QDate(int(m.group(1)), cur_dt.date().month(), cur_dt.date().day())); row_matched = True
             elif part == "month":
                 m = rx_mo.search(text)
-                if m: cur_dt.setDate(QDate(cur_dt.date().year(), int(m.group(1)), cur_dt.date().day())); count+=1
+                if m: 
+                    val_str = m.group(1) or m.group(2)
+                    m_val = MONTH_MAP.get(val_str[:3].lower()) if val_str.isalpha() else int(val_str)
+                    cur_dt.setDate(QDate(cur_dt.date().year(), m_val, cur_dt.date().day())); row_matched = True
             elif part == "day":
                 m = rx_dy.search(text)
-                if m: cur_dt.setDate(QDate(cur_dt.date().year(), cur_dt.date().month(), int(m.group(1)))); count+=1
+                if m: cur_dt.setDate(QDate(cur_dt.date().year(), cur_dt.date().month(), int(m.group(1)))); row_matched = True
             elif part == "time":
                 m = rx_tm.search(text)
-                if m: cur_dt.setTime(QTime(int(m.group(1)), int(m.group(2)), int(m.group(3) or 0))); count+=1
+                if m: cur_dt.setTime(QTime(int(m.group(1)), int(m.group(2)), int(m.group(3) or 0))); row_matched = True
             elif part == "full":
                 m = rx_full.search(text)
-                if m: cur_dt.setDate(QDate(int(m.group('Y')), int(m.group('M')), int(m.group('D')))); count+=1
+                if m: 
+                    y_str = m.group('Y') or m.group('Y2')
+                    m_str = m.group('M') or m.group('M2')
+                    d_str = m.group('D') or m.group('D2')
+                    m_val = MONTH_MAP.get(m_str[:3].lower()) if m_str.isalpha() else int(m_str)
+                    y_val = int(y_str) if len(y_str) == 4 else 2000 + int(y_str)
+                    cur_dt.setDate(QDate(y_val, m_val, int(d_str))); row_matched = True
                 
-            dt_widget.setDateTime(cur_dt)
+            if row_matched:
+                count += 1
+                dt_widget.setDateTime(cur_dt)
+                self.table.item(r, 3).setText(f"Manual ({part} from {source})")
+                self._apply_row_color(r, cur_dt, is_fail=False)
             
         if count == 0: QMessageBox.information(self, "No Match", f"Could not find valid {part} data in {source}.")
 
@@ -496,10 +900,11 @@ class TimestampCorrectorDialog(QDialog):
         selected_rows = self.table.selectionModel().selectedRows()
         if not selected_rows: return
         
-        rx_yr = re.compile(r'(?<!\d)(19[7-9]\d|20[0-2]\d)(?!\d)')
-        rx_mo = re.compile(r'(?:^|[-_./\s])(0[1-9]|1[0-2])(?:[-_./\s]|$)')
-        rx_dy = re.compile(r'(?:^|[-_./\s])(0[1-9]|[12]\d|3[01])(?:[-_./\s]|$)')
-        rx_tm = re.compile(r'(?<!\d)([0-1]\d|2[0-3])[:_-]?([0-5]\d)(?:[:_-]?([0-5]\d))?(?!\d)')
+        rx_yr = re.compile(r'(?<!\d)(19\d{2}|20\d{2})(?!\d)')
+        rx_mo = re.compile(r'(?<!\d)(0?[1-9]|1[0-2])(?!\d)|(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)', re.I)
+        rx_dy = re.compile(r'(?<!\d)(0?[1-9]|[12]\d|3[01])(?!\d)')
+        rx_tm = re.compile(r'(?<!\d)([0-1]?\d|2[0-3])[-_.:]([0-5]\d)(?:[-_.:]([0-5]\d))?(?!\d)')
+        MONTH_MAP = {'jan': 1, 'feb': 2, 'mar': 3, 'apr': 4, 'may': 5, 'jun': 6, 'jul': 7, 'aug': 8, 'sep': 9, 'oct': 10, 'nov': 11, 'dec': 12}
         
         count = 0
         for idx in selected_rows:
@@ -509,33 +914,45 @@ class TimestampCorrectorDialog(QDialog):
             
             name = self.table.item(r, 0).text()
             path = self.table.item(r, 4).text()
+            row_matched = False
             
             if mix_type == "Y_path_MD_file":
                 m_y = rx_yr.search(path); m_m = rx_mo.search(name); m_d = rx_dy.search(name)
                 if m_y and m_m and m_d:
-                    cur_dt.setDate(QDate(int(m_y.group(1)), int(m_m.group(1)), int(m_d.group(1))))
-                    count+=1
+                    val_str = m_m.group(1) or m_m.group(2)
+                    m_val = MONTH_MAP.get(val_str[:3].lower()) if val_str.isalpha() else int(val_str)
+                    cur_dt.setDate(QDate(int(m_y.group(1)), m_val, int(m_d.group(1))))
+                    row_matched = True
             elif mix_type == "YM_path_D_file":
                 m_y = rx_yr.search(path); m_m = rx_mo.search(path); m_d = rx_dy.search(name)
                 if m_y and m_m and m_d:
-                    cur_dt.setDate(QDate(int(m_y.group(1)), int(m_m.group(1)), int(m_d.group(1))))
-                    count+=1
+                    val_str = m_m.group(1) or m_m.group(2)
+                    m_val = MONTH_MAP.get(val_str[:3].lower()) if val_str.isalpha() else int(val_str)
+                    cur_dt.setDate(QDate(int(m_y.group(1)), m_val, int(m_d.group(1))))
+                    row_matched = True
             elif mix_type == "D_file_T_path":
                 m_d = rx_dy.search(name); m_t = rx_tm.search(path)
                 if m_d and m_t:
                     cur_dt.setDate(QDate(cur_dt.date().year(), cur_dt.date().month(), int(m_d.group(1))))
                     cur_dt.setTime(QTime(int(m_t.group(1)), int(m_t.group(2)), int(m_t.group(3) or 0)))
-                    count+=1
+                    row_matched = True
                     
-            dt_widget.setDateTime(cur_dt)
+            if row_matched:
+                count += 1
+                dt_widget.setDateTime(cur_dt)
+                self.table.item(r, 3).setText("Manual (Mixed Extraction)")
+                self._apply_row_color(r, cur_dt, is_fail=False)
+                
         if count == 0: QMessageBox.information(self, "No Match", "Could not satisfy the mixed pattern criteria.")
 
     def apply_fixes(self, mode):
-        rows = self.table.rowCount()
-        if rows == 0: return
+        selected_rows = self.table.selectionModel().selectedRows()
+        if not selected_rows: 
+            return QMessageBox.warning(self, "No Selection", "Please highlight the rows you want to apply modifications to.")
         
         self.progress.setVisible(True)
-        self.progress.setMaximum(rows)
+        self.progress.setMaximum(len(selected_rows))
+        self.progress.setFormat("Modifying: %p% (%v/%m)")
         QApplication.processEvents()
         
         success_count = 0; error_log = []
@@ -545,50 +962,64 @@ class TimestampCorrectorDialog(QDialog):
             conn = sqlite3.connect(self.db_path)
             cur = conn.cursor()
             
-            for row in range(rows):
+            for i, idx in enumerate(selected_rows):
+                row = idx.row()
                 dt_widget = self.table.cellWidget(row, 2)
                 new_date = dt_widget.dateTime().toString("yyyy-MM-dd HH:mm:ss")
                 meta = self.table.item(row, 4).data(Qt.UserRole)
-                real_path = self.table.item(row, 4).text()
+                real_path = self.items_to_fix[row]['real_path']
                 
                 try:
                     dt_obj = datetime.datetime.strptime(new_date, "%Y-%m-%d %H:%M:%S")
                     ts = dt_obj.timestamp()
                     
                     if mode in ["os", "both"]:
-                        if os.path.exists(real_path):
-                            stat = os.stat(real_path)
-                            atime = stat.st_atime
-                            mtime = ts if "Modified Date" in target_prop or "Both" in target_prop else stat.st_mtime
+                        if real_path and os.path.exists(real_path):
                             
-                            # 1. Update Access and Modified Dates
-                            os.utime(real_path, (atime, mtime))
-                            
-                            # 2. Native Windows API for Created Date
-                            if sys.platform == "win32" and ("Created Date" in target_prop or "Both" in target_prop):
+                            # --- NATIVE WINDOWS API BYPASS ---
+                            # Bypasses the os.utime [Errno 22] bug by ignoring the corrupt Access Time natively
+                            if sys.platform == "win32":
                                 import ctypes
                                 from ctypes import wintypes
                                 
-                                wintime = int((ts + 11644473600) * 10000000)
+                                # Clamp timestamp to valid Windows bounds to prevent underflow crashes
+                                safe_ts = max(0.0, min(ts, 32535215999.0)) 
+                                wintime = int((safe_ts + 11644473600) * 10000000)
+                                
                                 class FILETIME(ctypes.Structure):
                                     _fields_ = [("dwLowDateTime", wintypes.DWORD), ("dwHighDateTime", wintypes.DWORD)]
                                 
                                 filetime = FILETIME(wintime & 0xFFFFFFFF, wintime >> 32)
-                                # OPEN_EXISTING=3, FILE_FLAG_BACKUP_SEMANTICS=0x02000000 (Required for Folders)
-                                handle = ctypes.windll.kernel32.CreateFileW(
-                                    real_path, 0x40000000, 0, None, 3, 0x02000000, None)
                                 
-                                if handle != -1:
-                                    ctypes.windll.kernel32.SetFileTime(handle, ctypes.byref(filetime), None, None)
+                                # 256 = FILE_WRITE_ATTRIBUTES (Bypasses "File in Use" locks)
+                                handle = ctypes.windll.kernel32.CreateFileW(real_path, 256, 0, None, 3, 0x02000000, None)
+                                if handle != -1 and handle != 0xFFFFFFFF:
+                                    c_time = ctypes.byref(filetime) if "Created" in target_prop or "Both" in target_prop else None
+                                    m_time = ctypes.byref(filetime) if "Modified" in target_prop or "Both" in target_prop else None
+                                    
+                                    # Passing None for a_time preserves the existing access time, preventing Errno 22
+                                    res = ctypes.windll.kernel32.SetFileTime(handle, c_time, None, m_time)
                                     ctypes.windll.kernel32.CloseHandle(handle)
                                     
-                            # macOS Creation Date fallback
-                            elif sys.platform == "darwin" and ("Created Date" in target_prop or "Both" in target_prop):
-                                date_str = datetime.datetime.fromtimestamp(ts).strftime('%m/%d/%Y %H:%M:%S')
-                                subprocess.run(['SetFile', '-d', date_str, real_path])
+                                    if res == 0:
+                                        raise Exception("Windows rejected the timestamp modification.")
+                                else:
+                                    raise Exception("Could not lock file attributes for modification.")
+                                    
+                            else:
+                                # Mac / Linux Standard Fallback
+                                stat = os.stat(real_path)
+                                # Clamp values to safely prevent out-of-bounds Epoch crashes
+                                safe_atime = max(0.0, stat.st_atime)
+                                safe_mtime = max(0.0, ts if "Modified" in target_prop or "Both" in target_prop else stat.st_mtime)
+                                os.utime(real_path, (safe_atime, safe_mtime))
+                                
+                                if sys.platform == "darwin" and ("Created Date" in target_prop or "Both" in target_prop):
+                                    date_str = datetime.datetime.fromtimestamp(ts).strftime('%m/%d/%Y %H:%M:%S')
+                                    subprocess.run(['SetFile', '-d', date_str, real_path])
                         else:
-                            error_log.append(f"Physical file missing: {meta['id']}")
-                            continue
+                            error_log.append(f"Physical file missing for: {meta['id']}")
+                            if mode == "os": continue
                             
                     if mode in ["db", "both"]:
                         new_tag = f"ts_revert:{meta['old_date']}"
@@ -604,9 +1035,8 @@ class TimestampCorrectorDialog(QDialog):
                 except Exception as ex:
                     error_log.append(f"Row {row+1} Error: {ex}")
                     
-                if row % 10 == 0:
-                    self.progress.setValue(row)
-                    QApplication.processEvents()
+                if i % 10 == 0:
+                    self.progress.setValue(i); QApplication.processEvents()
                     
             if mode in ["db", "both"]: conn.commit()
             conn.close()
@@ -617,11 +1047,12 @@ class TimestampCorrectorDialog(QDialog):
                 msg += f"\n\nEncountered {len(error_log)} errors. See console."
                 for e in error_log: print(e)
             QMessageBox.information(self, "Operation Complete", msg)
-            self.accept()
+            if self.main_app and hasattr(self.main_app, 'trigger_search'): 
+                self.main_app.trigger_search()
         except Exception as e:
             self.progress.setVisible(False)
             QMessageBox.critical(self, "Fatal Error", f"Failed to apply modifications:\n{e}")
-
+            
 # ... (MapColorConfigDialog identical to previous) ...
 class MapColorConfigDialog(QDialog):
     def __init__(self, current_results, parent=None):
@@ -927,10 +1358,20 @@ class SearchWorker(QThread):
                 elif self.p['look_for'] == "Folders Only": query += " AND is_folder=1"
                 
                 if self.p['name']:
-                    if self.p['match'] == "Contains": query += " AND name LIKE ?"; sql_params.append(f"%{self.p['name']}%")
-                    elif self.p['match'] == "Exact": query += " AND name = ?"; sql_params.append(self.p['name'])
-                    elif self.p['match'] == "Starts With": query += " AND name LIKE ?"; sql_params.append(f"{self.p['name']}%")
-                    elif self.p['match'] == "Ends With": query += " AND name LIKE ?"; sql_params.append(f"%{self.p['name']}")
+                    n_tgt = self.p['name'] if self.p['case_sensitive'] else self.p['name'].lower()
+                    target_col = "name" if self.p['case_sensitive'] else "LOWER(name)"
+                    
+                    # --- FIX: Use GLOB for case-sensitive wildcard matching, LIKE for case-insensitive ---
+                    if self.p['case_sensitive']:
+                        if self.p['match'] == "Contains": query += f" AND {target_col} GLOB ?"; sql_params.append(f"*{n_tgt}*")
+                        elif self.p['match'] == "Exact": query += f" AND {target_col} GLOB ?"; sql_params.append(n_tgt)
+                        elif self.p['match'] == "Starts With": query += f" AND {target_col} GLOB ?"; sql_params.append(f"{n_tgt}*")
+                        elif self.p['match'] == "Ends With": query += f" AND {target_col} GLOB ?"; sql_params.append(f"*{n_tgt}")
+                    else:
+                        if self.p['match'] == "Contains": query += f" AND {target_col} LIKE ?"; sql_params.append(f"%{n_tgt}%")
+                        elif self.p['match'] == "Exact": query += f" AND {target_col} = ?"; sql_params.append(n_tgt)
+                        elif self.p['match'] == "Starts With": query += f" AND {target_col} LIKE ?"; sql_params.append(f"{n_tgt}%")
+                        elif self.p['match'] == "Ends With": query += f" AND {target_col} LIKE ?"; sql_params.append(f"%{n_tgt}")
                         
                 if self.p['path']: query += " AND parent_path LIKE ?"; sql_params.append(f"%{self.p['path']}%")
                 
@@ -1183,9 +1624,19 @@ class AdvancedSearchWindow(QMainWindow):
         self.txt_path = QLineEdit(); self.txt_path.setPlaceholderText("e.g. /Documents/")
         self.txt_search_tags = QLineEdit(); self.txt_search_tags.setPlaceholderText("e.g. holiday, work")
         self.chk_unique = QCheckBox("Show Unique Name Patterns Only")
+        
+        # FIX: Added Case Sensitive Checkbox
+        self.chk_case_sensitive = QCheckBox("Case Sensitive Match") 
+        
         f1.addRow("Match Mode:", self.combo_match); f1.addRow("Data Type:", self.combo_look_for)
         f1.addRow("Virtual Path:", self.txt_path); f1.addRow("Search Tags:", self.txt_search_tags)
-        f1.addRow("", self.chk_unique)
+        
+        # Add both checkboxes cleanly
+        chk_lay = QHBoxLayout()
+        chk_lay.addWidget(self.chk_unique)
+        chk_lay.addWidget(self.chk_case_sensitive)
+        f1.addRow("", chk_lay)
+        
         filters_h_layout.addWidget(self.card_scope)
 
         self.card_type = QFrame(); self.card_type.setObjectName("FilterCard"); self.card_type.setVisible(False)
@@ -2035,6 +2486,7 @@ class AdvancedSearchWindow(QMainWindow):
             'name': self.txt_name.text().strip(), 'path': self.txt_path.text().strip(),
             'tags': [t.strip().lower() for t in self.txt_search_tags.text().split(',') if t.strip()],
             'match': self.combo_match.currentText(), 'look_for': self.combo_look_for.currentText(),
+            'case_sensitive': self.chk_case_sensitive.isChecked(), # <-- ADDED THIS
             'exts': [e.strip().lower() for e in self.txt_ext.text().split(',') if e.strip()],
             'ex_exts': [e.strip().lower() for e in self.txt_exclude_ext.text().split(',') if e.strip()],
             'ex_names': [n.strip().lower() for n in self.txt_exclude_name.text().split(',') if n.strip()],
@@ -2530,15 +2982,18 @@ class AdvancedSearchWindow(QMainWindow):
                 meta = self.table.item(idx.row(), 8).data(Qt.UserRole)
                 if not meta: continue
                 
+                # Fetch Virtual Path from Table
+                v_path = self.table.item(idx.row(), 2).text()
+                
                 if meta.get('is_fldr'):
-                    v_path = self.table.item(idx.row(), 2).text()
                     fldr_name = self.table.item(idx.row(), 1).text()
                     full_v_path = f"{v_path}{fldr_name}/"
                     
-                    cur.execute("SELECT id, name, modified, real_path, custom_tags, creation_date FROM virtual_fs WHERE is_folder=0 AND parent_path LIKE ?", (f"{full_v_path}%",))
+                    cur.execute("SELECT id, name, modified, real_path, custom_tags, creation_date, parent_path FROM virtual_fs WHERE is_folder=0 AND parent_path LIKE ?", (f"{full_v_path}%",))
                     for r in cur.fetchall():
-                        items_data.append({'id': r[0], 'name': r[1], 'mod': r[2], 'real_path': r[3], 'tags': r[4], 'creation_date': r[5] or r[2]})
+                        items_data.append({'id': r[0], 'name': r[1], 'mod': r[2], 'real_path': r[3], 'tags': r[4], 'creation_date': r[5] or r[2], 'p_path': r[6]})
                 else:
+                    meta['p_path'] = v_path
                     items_data.append(meta)
                     
         unique_items = {item['id']: item for item in items_data}.values()
