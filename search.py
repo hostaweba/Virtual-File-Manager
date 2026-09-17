@@ -28,7 +28,7 @@ from PySide6.QtWidgets import (
     QFileIconProvider, QSizePolicy, QScrollArea, QPlainTextEdit, 
     QTabWidget, QButtonGroup, QRadioButton, QFileDialog, 
     QColorDialog, QInputDialog, QGroupBox, QTextBrowser, QWidgetAction,
-    QListWidget, QListWidgetItem  # <-- Added these two imports
+    QListWidget, QListWidgetItem , QStackedWidget  # <-- Added these two imports
 )
 from themes import THEMES
 
@@ -1761,6 +1761,12 @@ class AdvancedSearchWindow(QMainWindow):
         quick_lay.addWidget(self.local_filter_input); quick_lay.addWidget(self.local_tag_filter_input)
         tab1_layout.addLayout(quick_lay)
         
+        # Add after quick_lay.addWidget(self.local_tag_filter_input):
+        self.btn_search_view_mode = QPushButton("🖼️ Grid View")
+        self.btn_search_view_mode.setFixedHeight(28)
+        self.btn_search_view_mode.clicked.connect(self.toggle_search_view_mode)
+        quick_lay.addWidget(self.btn_search_view_mode)
+        
         self.table = QTableWidget(0, 10)
         self.table.setHorizontalHeaderLabels(["S.No.", "Name", "Database", "Virtual Path", "Type", "Size", "Date", "Labels", "SHA-256", "HiddenMeta"])
         self.table.setColumnWidth(0, 50)
@@ -1785,7 +1791,26 @@ class AdvancedSearchWindow(QMainWindow):
         self.table.customContextMenuRequested.connect(self.show_context_menu)
         self.table.horizontalHeader().setContextMenuPolicy(Qt.CustomContextMenu)
         self.table.horizontalHeader().customContextMenuRequested.connect(self.show_header_menu)
-        tab1_layout.addWidget(self.table); self.tabs.addTab(tab1_container, "📋 Search Results")
+        
+        self.search_view_stack = QStackedWidget()
+        self.search_view_stack.addWidget(self.table)
+        
+        self.search_grid = QListWidget()
+        self.search_grid.setViewMode(QListWidget.IconMode)
+        self.search_grid.setGridSize(QSize(140, 160))
+        self.search_grid.setIconSize(QSize(80, 80))
+        self.search_grid.setResizeMode(QListWidget.Adjust)
+        self.search_grid.setUniformItemSizes(True)
+        self.search_grid.setWordWrap(True)
+        self.search_grid.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.search_grid.customContextMenuRequested.connect(self.show_grid_context_menu)
+        self.search_grid.itemDoubleClicked.connect(lambda item: self.handle_double_click_meta(item.data(Qt.UserRole)))
+        
+        self.search_view_stack.addWidget(self.search_grid)
+        tab1_layout.addWidget(self.search_view_stack)
+
+
+        self.tabs.addTab(tab1_container, "📋 Search Results")
 
         # --- TAB 2: VISUAL GRID MAP ---
         map_tab_container = QWidget(); map_tab_layout = QVBoxLayout(map_tab_container); map_tab_layout.setContentsMargins(0, 0, 0, 0); map_tab_layout.setSpacing(5)
@@ -1930,6 +1955,65 @@ class AdvancedSearchWindow(QMainWindow):
             self.table.setColumnHidden(0, True) 
             self.table.setColumnHidden(7, True) 
             self.table.setColumnHidden(8, True) 
+
+    def toggle_search_view_mode(self):
+        new_idx = 1 if self.search_view_stack.currentIndex() == 0 else 0
+        self.search_view_stack.setCurrentIndex(new_idx)
+        self.btn_search_view_mode.setText("📄 List View" if new_idx == 1 else "🖼️ Grid View")
+
+    def set_search_grid_size(self, size_name):
+        sizes = {
+            "Small": (QSize(100, 115), QSize(55, 55)),
+            "Medium": (QSize(140, 160), QSize(80, 80)),
+            "Large": (QSize(190, 210), QSize(125, 125)),
+            "Extra Large": (QSize(250, 275), QSize(180, 180))
+        }
+        grid_sz, icon_sz = sizes.get(size_name, sizes["Medium"])
+        self.search_grid.setGridSize(grid_sz)
+        self.search_grid.setIconSize(icon_sz)
+        self.settings.setValue("search_grid_size", size_name)
+
+    def generate_thumbnails_search_results(self):
+        items = []
+        for r in self.current_results:
+            db_id = r[0]
+            real_p = r[7]
+            is_fldr = r[6]
+            if not is_fldr and real_p and os.path.exists(real_p):
+                items.append(("file", real_p, db_id))
+
+        if not items:
+            return QMessageBox.information(self, "Thumbnails", "No physical files found to thumbnail.")
+
+        from main import ThumbnailGeneratorThread
+        self.thumb_dlg = QProgressDialog(f"Extracting thumbnails for {len(items)} files...", "Cancel", 0, len(items), self)
+        self.thumb_dlg.setWindowModality(Qt.WindowModal)
+        self.thumb_dlg.show()
+
+        self.thumb_worker = ThumbnailGeneratorThread(items, self.active_db, self)
+        self.thumb_worker.progress.connect(self.thumb_dlg.setValue)
+        self.thumb_worker.finished.connect(lambda: (self.thumb_dlg.close(), self.icon_cache.clear(), self.trigger_search()))
+        self.thumb_dlg.canceled.connect(self.thumb_worker.cancel)
+        self.thumb_worker.start()
+
+    def show_grid_context_menu(self, pos):
+        item = self.search_grid.itemAt(pos)
+        if not item: return
+        meta = item.data(Qt.UserRole)
+        # Find matching row in table to route to standard context menu
+        for r in range(self.table.rowCount()):
+            row_meta = self.table.item(r, 9).data(Qt.UserRole)
+            if row_meta and row_meta.get('id') == meta.get('id'):
+                self.table.selectRow(r)
+                rect = self.search_grid.visualItemRect(item)
+                self.show_context_menu(self.table.viewport().mapFromGlobal(self.search_grid.mapToGlobal(rect.center())))
+                break
+
+    def handle_double_click_meta(self, meta):
+        if meta and meta.get('real_path') and os.path.exists(meta['real_path']):
+            self.open_in_os(meta['real_path'])
+        else:
+            QMessageBox.warning(self, "Missing", "Physical file not found.")
 
     def show_multi_properties(self, selected_rows):
         total_size = 0
@@ -3038,9 +3122,12 @@ class AdvancedSearchWindow(QMainWindow):
         if is_folder: return self.style().standardIcon(QStyle.SP_DirIcon)
         
         if db_id != -1:
-            cache_key = f"thumb_{db_id}"
+            from main import get_thumb_dir_for_db
+            target_dir = get_thumb_dir_for_db(self.active_db)
+            thumb_path = target_dir / f"{db_id}.png"
+            cache_key = f"thumb_{Path(self.active_db).stem}_{db_id}"
+            
             if cache_key in self.icon_cache: return self.icon_cache[cache_key]
-            thumb_path = self.THUMBS_DIR / f"{db_id}.png"
             if thumb_path.exists():
                 self.icon_cache[cache_key] = QIcon(str(thumb_path))
                 return self.icon_cache[cache_key]
@@ -3075,6 +3162,19 @@ class AdvancedSearchWindow(QMainWindow):
         self.table.setRowCount(0)
         
         if not display_results:
+            
+            # Sync Grid View
+            self.search_grid.clear()
+            for item_row in display_results:
+                db_id, name, p_path, ext, size, mod, is_fldr, real_path, tags, color_tag, cat_val, sha256_val = item_row[:12]
+                db_label = item_row[12] if len(item_row) > 12 else Path(self.active_db).stem
+                
+                icon = self.get_icon(is_fldr, name, ext, db_id)
+                g_item = QListWidgetItem(name)
+                g_item.setIcon(icon)
+                g_item.setData(Qt.UserRole, {'id': db_id, 'is_fldr': is_fldr, 'real_path': real_path, 'tags': tags, 'size': size, 'mod': mod, 'name': name, 'ext': ext, 'cat': cat_val, 'db': db_label})
+                self.search_grid.addItem(g_item)
+            
             self.table.setUpdatesEnabled(True)
             self.table.setSortingEnabled(True)
             self.lbl_status.setText(f"Search complete. 0 rows loaded into Table. ({total_matches} available in Maps).")
@@ -3219,7 +3319,20 @@ class AdvancedSearchWindow(QMainWindow):
             act.triggered.connect(lambda checked=False, m=mode: self.set_table_view_mode(m))
         menu.addSeparator()
         # ----------------------------
-        
+        # --- THUMBNAILS SUBMENU IN SEARCH RESULTS ---
+        thumb_menu = menu.addMenu("🖼️ Thumbnails")
+        sz_menu = thumb_menu.addMenu("📐 Thumbnail Size")
+        current_sz = self.settings.value("search_grid_size", "Medium")
+        for sz in ["Small", "Medium", "Large", "Extra Large"]:
+            act_sz = sz_menu.addAction(sz)
+            act_sz.setCheckable(True)
+            act_sz.setChecked(current_sz == sz)
+            act_sz.triggered.connect(lambda chk=False, s=sz: self.set_search_grid_size(s))
+            
+        thumb_menu.addSeparator()
+        thumb_menu.addAction("⚡ Generate Thumbnails for Search Results", self.generate_thumbnails_search_results)
+        # --------------------------------------------
+               
         act_open_os = menu.addAction("🚀 Open Native OS Default")
         act_show_os = menu.addAction("📂 Show in OS Explorer")
         
