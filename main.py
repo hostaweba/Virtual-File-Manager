@@ -57,20 +57,37 @@ import re
 def natural_sort_key(s):
     return [int(text) if text.isdigit() else text.lower() for text in re.split('([0-9]+)', str(s))]
 
+import sys
 import matplotlib
 matplotlib.use('QtAgg')
+# Safely prioritize fonts based on OS to prevent missing font errors in Linux terminal
+if sys.platform == "win32":
+    matplotlib.rcParams['font.family'] = ['Segoe UI', 'Nirmala UI', 'sans-serif']
+elif sys.platform == "darwin":
+    matplotlib.rcParams['font.family'] = ['San Francisco', 'Helvetica Neue', 'sans-serif']
+else:
+    matplotlib.rcParams['font.family'] = ['DejaVu Sans', 'Liberation Sans', 'sans-serif']
+matplotlib.rcParams['axes.unicode_minus'] = False
+
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
-from PySide6.QtWidgets import QSplitter 
 
+
+from PySide6.QtWidgets import QSplitter, QRadioButton, QColorDialog, QButtonGroup
 from PySide6.QtCore import QTimer, Qt
-from PySide6.QtWidgets import QRadioButton
+import colorsys #colorsys and QColorDialog for HeatmapColorConfigDialog
+import datetime as dt_lib # for render_heatmap
+# QButtonGroup for class RowLimitDialog
+
 
 #--------my modules
 from themes import THEMES
 from help_dialog import VManHelpDialog
 from media_viewer import vmanViewer, ImageLoader
 from database import vmanDB, SMART_PROTOCOLS
+from splash import PremiumSplash  
+from console import VManConsole
+from jobs import ExtraFeaturesDialog
 
 # ---------------- Constants & Themes ----------------
 APP_TITLE = "VMan"
@@ -82,12 +99,14 @@ THUMBS_DIR = DATA_DIR / "thumbnails"         # Where manual grid thumbnails get 
 MAX_VIRTUAL_STORAGE = 100 * 1024 * 1024 * 1024  
 CHUNK_SIZE = 150
 
+
 FILE_CATEGORIES = {
     "Images": ['.png', '.jpg', '.jpeg', '.bmp', '.gif', '.webp', '.svg'],
     "Videos": ['.mp4', '.avi', '.mkv', '.mov', '.wmv', '.flv'],
-    "Audio": ['.mp3', '.wav', '.ogg', '.flac', '.aac'],
+    "Audio": ['.mp3', '.wav', '.ogg', '.flac', '.aac', '.m4a', '.amr', '.arm'], # Added new formats
     "Documents": ['.pdf', '.doc', '.docx', '.txt', '.csv', '.xlsx', '.xls', '.ppt', '.pptx', '.md'],
-    "Code": ['.py', '.js', '.html', '.css', '.cpp', '.c', '.java', '.json', '.xml', '.sh']
+    "Code": ['.py', '.js', '.html', '.css', '.cpp', '.c', '.java', '.json', '.xml', '.sh'],
+    "Archives": ['.zip', '.rar', '.7z', '.tar', '.gz']
 }
 
 
@@ -196,9 +215,18 @@ class MaterializeThread(QThread):
 
                     elif path_val.startswith("/"):
                         res = cur.execute("SELECT parent_path, name, real_path FROM virtual_fs WHERE parent_path LIKE ? AND is_folder=0 AND in_trash=0", (f"{path_val}%",)).fetchall()
+                        
+                        # Get the selected folder's base name to wrap the contents inside it
+                        base_folder_name = self.sanitize_filename(path_val.strip('/').split('/')[-1]) if path_val.strip('/') else ""
+                        
                         for pp, n, rp in res:
                             rel_p = pp[len(path_val):].lstrip('/') 
                             safe_parts = [self.sanitize_filename(p) for p in rel_p.split('/') if p]
+                            
+                            # Prepend the base folder so it is created in the destination
+                            if base_folder_name:
+                                safe_parts.insert(0, base_folder_name)
+                            
                             safe_rel_p = os.path.join(*safe_parts) if safe_parts else ""
                             dest = os.path.join(safe_rel_p, self.sanitize_filename(n))
                             all_exports.append((dest, rp))
@@ -230,6 +258,166 @@ class MaterializeThread(QThread):
                     print(f"Materialize Error on {final_dest}: {e}")
 
             conn.close()
+            self.finished.emit(count)
+        except Exception as e:
+            self.error.emit(str(e))
+
+class DummyReplicaThread(QThread):
+    progress = Signal(int, int, str)
+    finished = Signal(int)
+    error = Signal(str)
+
+    def __init__(self, db_path, items, dest_dir, zero_byte_mode=False, parent=None):
+        super().__init__(parent)
+        self.db_path = db_path
+        self.items = items
+        self.dest_dir = dest_dir
+        self.zero_byte_mode = zero_byte_mode
+        self.is_cancelled = False
+
+    def cancel(self): self.is_cancelled = True
+
+    def sanitize_filename(self, name):
+        return re.sub(r'[\\/*?:"<>|]', '_', str(name))
+
+    def _parse_size(self, size_val):
+        """Aggressively parses raw DB sizes or strings (e.g. '5.4 MB', '1024') into strict byte integers."""
+        if not size_val: return 0
+        if isinstance(size_val, (int, float)): return int(size_val)
+        
+        s = str(size_val).strip().upper().replace(',', '')
+        
+        # 1. Try direct conversion first (if it's just a raw number string)
+        try:
+            return int(float(s))
+        except ValueError:
+            pass
+            
+        # 2. Extract unit-based text (e.g., "15.4 MB")
+        m = re.search(r'([\d\.]+)\s*([A-Z]+)', s)
+        if m:
+            val = float(m.group(1))
+            unit = m.group(2)
+            if unit in ['B', 'BYTE', 'BYTES']: return int(val)
+            elif unit in ['KB', 'K', 'KIB']: return int(val * 1024)
+            elif unit in ['MB', 'M', 'MIB']: return int(val * 1024**2)
+            elif unit in ['GB', 'G', 'GIB']: return int(val * 1024**3)
+            elif unit in ['TB', 'T', 'TIB']: return int(val * 1024**4)
+            return int(val)
+            
+        return 0
+
+    def run(self):
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cur = conn.cursor()
+                all_exports = []
+
+                for typ, path_val, db_id in self.items:
+                    if self.is_cancelled: return
+
+                    if typ == "file" and db_id != -1:
+                        res = cur.execute("SELECT name, size FROM virtual_fs WHERE id=?", (db_id,)).fetchone()
+                        if res: all_exports.append((self.sanitize_filename(res[0]), res[1]))
+                    
+                    elif typ == "folder":
+                        if "://" in path_val:
+                            prefix, data = path_val.split("://", 1)
+                            parts = [p for p in data.split('/') if p]
+
+                            if prefix == "y_m_f":
+                                if len(parts) == 0:
+                                    res = cur.execute("SELECT year, month, name, size FROM virtual_fs WHERE is_folder=0 AND in_trash=0").fetchall()
+                                    for y, m, n, sz in res:
+                                        dest = os.path.join(self.sanitize_filename(y or "Unknown_Year"), self.sanitize_filename(m or "Unknown_Month"), self.sanitize_filename(n))
+                                        all_exports.append((dest, sz))
+                                elif len(parts) == 1: 
+                                    yr = parts[0]
+                                    res = cur.execute("SELECT month, name, size FROM virtual_fs WHERE year=? AND is_folder=0 AND in_trash=0", (yr,)).fetchall()
+                                    for m, n, sz in res:
+                                        dest = os.path.join(self.sanitize_filename(yr), self.sanitize_filename(m or "Unknown_Month"), self.sanitize_filename(n))
+                                        all_exports.append((dest, sz))
+                                elif len(parts) >= 2: 
+                                    yr, mo = parts[0], parts[1]
+                                    res = cur.execute("SELECT name, size FROM virtual_fs WHERE year=? AND month=? AND is_folder=0 AND in_trash=0", (yr, mo)).fetchall()
+                                    for n, sz in res:
+                                        dest = os.path.join(self.sanitize_filename(yr), self.sanitize_filename(mo), self.sanitize_filename(n))
+                                        all_exports.append((dest, sz))
+
+                            elif prefix == "tags":
+                                tag = parts[0] if parts else ""
+                                if tag:
+                                    res = cur.execute("SELECT name, size FROM virtual_fs WHERE custom_tags LIKE ? AND is_folder=0 AND in_trash=0", (f"%{tag}%",)).fetchall()
+                                    for n, sz in res: all_exports.append((os.path.join(self.sanitize_filename(tag), self.sanitize_filename(n)), sz))
+                                else:
+                                    res = cur.execute("SELECT custom_tags, name, size FROM virtual_fs WHERE custom_tags IS NOT NULL AND custom_tags != '' AND is_folder=0 AND in_trash=0").fetchall()
+                                    for tags, n, sz in res:
+                                        for t in [x.strip() for x in tags.split(',') if x.strip()]:
+                                            all_exports.append((os.path.join(self.sanitize_filename(t), self.sanitize_filename(n)), sz))
+                            
+                            elif prefix == "category":
+                                cat = parts[0] if parts else ""
+                                if cat:
+                                    res = cur.execute("SELECT name, size FROM virtual_fs WHERE category=? AND is_folder=0 AND in_trash=0", (cat,)).fetchall()
+                                    for n, sz in res: all_exports.append((os.path.join(self.sanitize_filename(cat), self.sanitize_filename(n)), sz))
+                                else:
+                                    res = cur.execute("SELECT category, name, size FROM virtual_fs WHERE category IS NOT NULL AND category != '' AND is_folder=0 AND in_trash=0").fetchall()
+                                    for c, n, sz in res: all_exports.append((os.path.join(self.sanitize_filename(c), self.sanitize_filename(n)), sz))
+                                    
+                            elif prefix == "search":
+                                term = parts[0] if parts else ""
+                                res = cur.execute("SELECT name, size FROM virtual_fs WHERE (name LIKE ? OR secondary_name LIKE ? OR custom_tags LIKE ?) AND is_folder=0 AND in_trash=0", (f"%{term}%", f"%{term}%", f"%{term}%")).fetchall()
+                                for n, sz in res: all_exports.append((os.path.join("Search_Results", self.sanitize_filename(n)), sz))
+
+                        elif path_val.startswith("/"):
+                            res = cur.execute("SELECT parent_path, name, size FROM virtual_fs WHERE parent_path LIKE ? AND is_folder=0 AND in_trash=0", (f"{path_val}%",)).fetchall()
+                            base_folder_name = self.sanitize_filename(path_val.strip('/').split('/')[-1]) if path_val.strip('/') else ""
+                            
+                            for pp, n, sz in res:
+                                rel_p = pp[len(path_val):].lstrip('/') 
+                                safe_parts = [self.sanitize_filename(p) for p in rel_p.split('/') if p]
+                                if base_folder_name:
+                                    safe_parts.insert(0, base_folder_name)
+                                safe_rel_p = os.path.join(*safe_parts) if safe_parts else ""
+                                dest = os.path.join(safe_rel_p, self.sanitize_filename(n))
+                                all_exports.append((dest, sz))
+
+            total = len(all_exports)
+            if total == 0:
+                self.error.emit("No files found to replicate.")
+                return
+
+            count = 0
+            for i, (rel_dest, f_size) in enumerate(all_exports):
+                if self.is_cancelled: return
+                
+                safe_rel_dest = rel_dest.replace('\\', '/').strip('/')
+                final_dest = os.path.join(self.dest_dir, os.path.normpath(safe_rel_dest))
+                
+                os.makedirs(os.path.dirname(final_dest), exist_ok=True)
+                self.progress.emit(i+1, total, f"Creating Sparse Replica: {safe_rel_dest}")
+
+                try:
+                    # Parse guaranteed pure byte integer
+                    sz = self._parse_size(f_size)
+                    
+                    # 1. Create the base empty file
+                    with open(final_dest, "wb") as f:
+                        pass
+                    
+                    if not self.zero_byte_mode and sz > 0:
+                        # 2. Flag as sparse to ensure OS knows NOT to write physical sectors
+                        if sys.platform == "win32":
+                            subprocess.run(["fsutil", "sparse", "setflag", final_dest], creationflags=subprocess.CREATE_NO_WINDOW)
+                            
+                        # 3. Native Truncation expands logical footprint size with ZERO SSD wear
+                        with open(final_dest, "r+b") as f:
+                            f.truncate(sz)
+                            
+                    count += 1
+                except Exception as e:
+                    print(f"Dummy Replica Error on {final_dest}: {e}")
+
             self.finished.emit(count)
         except Exception as e:
             self.error.emit(str(e))
@@ -288,14 +476,27 @@ class TagLibraryLoaderThread(QThread):
         tag_cache = {}
         try:
             with sqlite3.connect(self.db_path, timeout=10) as conn:
+                conn.execute("PRAGMA journal_mode=WAL;")
+                conn.execute("PRAGMA synchronous=NORMAL;")
+                conn.execute("PRAGMA cache_size=-64000;")
                 cur = conn.cursor()
-                cur.execute("SELECT parent_path, name, custom_tags, is_folder FROM virtual_fs WHERE parent_path LIKE ?", (f"{self.base_v_path}%",))
+                
+                # --- CPU OPTIMIZATION: Only fetch files that actually have tags! ---
+                # Reduces Linux RAM/CPU usage by 99% on massive databases
+                cur.execute("SELECT parent_path, name, custom_tags, is_folder FROM virtual_fs WHERE parent_path LIKE ? AND custom_tags IS NOT NULL AND custom_tags != '' AND in_trash=0", (f"{self.base_v_path}%",))
+                
                 for pp, name, tags, is_folder in cur.fetchall():
                     full_path = f"{pp}{name}/" if is_folder else f"{pp}{name}"
                     full_path = full_path.replace("//", "/")
-                    
-                    # Store ALL files and folders so the columns explore completely
                     tag_cache[full_path] = [t.strip() for t in str(tags).split(',')] if tags else []
+                    
+                    # Reconstruct parent folder tree purely from tagged items
+                    parts = [p for p in pp.split('/') if p]
+                    curr = "/"
+                    for p in parts:
+                        curr += p + "/"
+                        if curr not in tag_cache: tag_cache[curr] = []
+                        
         except Exception as e: 
             print(f"DB Load Error: {e}")
             
@@ -313,6 +514,11 @@ class DataLoaderThread(QThread):
     def cancel(self): self.is_cancelled = True
     def run(self):
         conn = sqlite3.connect(str(self.db_path))
+        # --- LINUX OPTIMIZATION ---
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA synchronous=NORMAL;")
+        conn.execute("PRAGMA cache_size=-64000;")
+        
         cur = conn.cursor()
         h_q = "AND is_hidden = 0" if not self.show_hidden else ""
         folders, files = [], []
@@ -433,13 +639,14 @@ class SizeTableWidgetItem(QTableWidgetItem):
 
 class SpaceScannerThread(QThread):
     progress = Signal(int, int, str)
-    found = Signal(str, str, str, str, int, str, str, int) 
+    found = Signal(str, str, str, str, object, str, str, str, str, object) 
     finished_scan = Signal()
     
-    def __init__(self, db_path, scan_roots=["/"], parent=None):
+    def __init__(self, db_path, scan_roots=["/"], huge_threshold=524288000, parent=None):
         super().__init__(parent)
         self.db_path = db_path
         self.scan_roots = scan_roots
+        self.huge_threshold = huge_threshold
         self.is_cancelled = False
         
     def cancel(self): self.is_cancelled = True
@@ -448,36 +655,33 @@ class SpaceScannerThread(QThread):
         try:
             with sqlite3.connect(self.db_path, timeout=30) as conn:
                 cur = conn.cursor()
-                
                 path_cond = " OR ".join(["parent_path LIKE ?"] * len(self.scan_roots))
                 path_params = tuple(f"{p}%" for p in self.scan_roots)
             
                 self.progress.emit(10, 100, "Scanning for Junk...")
-                cur.execute(f"SELECT id, name, parent_path, extension, size, modified, sha256 FROM virtual_fs WHERE is_folder=0 AND in_trash=0 AND hash_verified=0 AND ({path_cond}) AND (extension IN ('.tmp', '.bak', '.log', '.cache') OR name LIKE '%cache%')", path_params)
+                cur.execute(f"SELECT id, name, parent_path, extension, size, modified, custom_tags, color_tag, sha256 FROM virtual_fs WHERE is_folder=0 AND in_trash=0 AND hash_verified=0 AND ({path_cond}) AND (extension IN ('.tmp', '.bak', '.log', '.cache') OR name LIKE '%cache%')", path_params)
                 for r in cur.fetchall():
                     if self.is_cancelled: return
-                    self.found.emit("Junk File", r[1], r[2], r[3] or "", r[4] or 0, r[5] or "Unknown", r[6] or "", r[0])
+                    self.found.emit("Junk File", r[1], r[2], r[3] or "", r[4] or 0, r[5] or "Unknown", r[6] or "", r[7] or "", r[8] or "", r[0])
                 
                 self.progress.emit(40, 100, "Scanning for Huge Files...")
-                cur.execute(f"SELECT id, name, parent_path, extension, size, modified, sha256 FROM virtual_fs WHERE is_folder=0 AND in_trash=0 AND hash_verified=0 AND ({path_cond}) AND size > 524288000 ORDER BY size DESC", path_params)
+                cur.execute(f"SELECT id, name, parent_path, extension, size, modified, custom_tags, color_tag, sha256 FROM virtual_fs WHERE is_folder=0 AND in_trash=0 AND hash_verified=0 AND ({path_cond}) AND size > ? ORDER BY size DESC", path_params + (self.huge_threshold,))
                 for r in cur.fetchall():
                     if self.is_cancelled: return
-                    self.found.emit("Huge File (>500MB)", r[1], r[2], r[3] or "", r[4] or 0, r[5] or "Unknown", r[6] or "", r[0])
+                    self.found.emit(f"Huge File (>{self.huge_threshold//1024//1024}MB)", r[1], r[2], r[3] or "", r[4] or 0, r[5] or "Unknown", r[6] or "", r[7] or "", r[8] or "", r[0])
                 
                 self.progress.emit(70, 100, "Scanning for Duplicates...")
                 cur.execute(f"SELECT size, extension, COUNT(*) as c FROM virtual_fs WHERE is_folder=0 AND in_trash=0 AND hash_verified=0 AND ({path_cond}) AND size > 0 GROUP BY size, extension HAVING c > 1", path_params)
                 for size, ext, count in cur.fetchall():
                     if self.is_cancelled: return
-                    cur.execute(f"SELECT id, name, parent_path, extension, modified, sha256 FROM virtual_fs WHERE size=? AND extension=? AND is_folder=0 AND in_trash=0 AND hash_verified=0 AND ({path_cond})", (size, ext) + path_params)
+                    cur.execute(f"SELECT id, name, parent_path, extension, modified, custom_tags, color_tag, sha256 FROM virtual_fs WHERE size=? AND extension=? AND is_folder=0 AND in_trash=0 AND hash_verified=0 AND ({path_cond})", (size, ext) + path_params)
                     files = cur.fetchall()
                     for f in files[1:]: 
-                        self.found.emit("Duplicate File", f[1], f[2], f[3] or "", size or 0, f[4] or "Unknown", f[5] or "", f[0])
+                        self.found.emit("Duplicate File", f[1], f[2], f[3] or "", size or 0, f[4] or "Unknown", f[5] or "", f[6] or "", f[7] or "", f[0])
                 
                 self.progress.emit(100, 100, "Scan Complete.")
-        except Exception as e:
-            print(f"Space Scanner Error: {e}")
-        finally:
-            self.finished_scan.emit()
+        except Exception as e: print(f"Space Scanner Error: {e}")
+        finally: self.finished_scan.emit()
 
 class ImportFilesThread(QThread):
     progress = Signal(int, int, str)
@@ -757,7 +961,13 @@ class vmanTableModel(QAbstractTableModel):
     def __init__(self, headers: List[str], rows: List[Dict], parent=None):
         super().__init__(parent)
         self.headers, self.all_rows, self.display_limit = headers, rows, CHUNK_SIZE
-        self.colors = {"Red": QColor("#5c2121"), "Blue": QColor("#213c5c"), "Green": QColor("#215c2b"), "Gold": QColor("#5c4c21")}
+        self.colors = {
+            "Red": QColor("#5c2121"), "Orange": QColor("#663c14"),
+            "Gold": QColor("#5c4c21"), "Green": QColor("#215c2b"), 
+            "Cyan": QColor("#1b5e5e"), "Blue": QColor("#213c5c"), 
+            "Purple": QColor("#43215c"), "Pink": QColor("#5c2144")
+        }
+        
     def rowCount(self, parent=QModelIndex()): return min(len(self.all_rows), self.display_limit)
     def columnCount(self, parent=QModelIndex()): return len(self.headers)
     def data(self, index: QModelIndex, role=Qt.DisplayRole):
@@ -767,9 +977,15 @@ class vmanTableModel(QAbstractTableModel):
         if role == Qt.DisplayRole: return row["display"][col]
         elif role == Qt.UserRole: return row.get("user_data")
         elif role == Qt.UserRole + 1: return row.get("color_tag")
-        elif role == Qt.DecorationRole and col == 0: return row.get("icon")
+        
+        # ---> FIXED: Icons now dynamically follow the "Name" column! <---
+        elif role == Qt.DecorationRole and self.headers[col] == "Name": return row.get("icon") 
+        
         elif role == Qt.TextAlignmentRole: return int(Qt.AlignRight | Qt.AlignVCenter) if self.headers[col] == "Size" else int(Qt.AlignLeft | Qt.AlignVCenter)
-        elif role == Qt.ForegroundRole: return QBrush(QColor("#888888")) if row.get("is_hidden") else None
+        elif role == Qt.ForegroundRole: 
+            if row.get("is_hidden"): return QBrush(QColor("#888888"))
+            if row.get("color_tag") in self.colors: return QBrush(QColor("#ffffff"))
+            return None
         elif role == Qt.BackgroundRole: return QBrush(self.colors[row.get("color_tag")]) if row.get("color_tag") in self.colors else None
         return None
     def headerData(self, section: int, orientation, role=Qt.DisplayRole): 
@@ -1157,7 +1373,7 @@ class DriveComparatorDialog(QDialog):
             QMessageBox.warning(self, "Export Error", str(e))
 
 class PhysicalDeleteWarningDialog(QDialog):
-    def __init__(self, count, parent=None):
+    def __init__(self, target_str, parent=None):
         super().__init__(parent)
         self.setWindowTitle("CRITICAL WARNING: Physical Deletion")
         self.setFixedSize(550, 300)
@@ -1166,18 +1382,19 @@ class PhysicalDeleteWarningDialog(QDialog):
         self.layout = QVBoxLayout(self)
         self.layout.setAlignment(Qt.AlignCenter)
         
-        self.lbl_warning = QLabel(f"⚠️ YOU ARE ABOUT TO PERMANENTLY DELETE {count} FILES FROM YOUR OS HARD DRIVE! ⚠️")
+        # Uses the smart string (e.g., "3 FILES AND 1 FOLDER")
+        self.lbl_warning = QLabel(f"⚠️ YOU ARE ABOUT TO PERMANENTLY DELETE {target_str.upper()} FROM YOUR OS HARD DRIVE! ⚠️")
         self.lbl_warning.setWordWrap(True)
         self.lbl_warning.setAlignment(Qt.AlignCenter)
         font = QFont("Segoe UI", 16, QFont.Bold)
         self.lbl_warning.setFont(font)
         self.layout.addWidget(self.lbl_warning)
         
-        self.lbl_sub = QLabel("This action CANNOT be undone. Files will NOT go to the Recycle Bin.")
+        self.lbl_sub = QLabel("This action CANNOT be undone. Items will NOT go to the Recycle Bin.")
         self.lbl_sub.setAlignment(Qt.AlignCenter)
         self.layout.addWidget(self.lbl_sub)
         
-        self.btn_confirm = QPushButton("I Understand, Delete Files")
+        self.btn_confirm = QPushButton("I Understand, Delete Everything")
         self.btn_confirm.setFixedHeight(50)
         self.btn_confirm.setFont(QFont("Segoe UI", 12, QFont.Bold))
         self.btn_confirm.setEnabled(False) # Disabled initially
@@ -1216,7 +1433,7 @@ class PhysicalDeleteWarningDialog(QDialog):
             self.btn_confirm.setText(f"Wait {self.countdown} seconds...")
             self.countdown -= 1
         else:
-            self.btn_confirm.setText("I Understand, Delete Files")
+            self.btn_confirm.setText("I Understand, Delete Everything")
             self.btn_confirm.setStyleSheet("background-color: black; color: red; border: 2px solid red;")
             self.btn_confirm.setEnabled(True)
             self.enable_timer.stop()
@@ -1518,10 +1735,10 @@ class vmanTagLibraryDialog(QDialog):
         self.resize(1300, 800)
         self.setWindowFlags(self.windowFlags() | Qt.WindowMaximizeButtonHint | Qt.WindowMinimizeButtonHint)
         
-        if self.main_app and hasattr(self.main_app, 'theme_combo'):
-            self.setStyleSheet(THEMES.get(self.main_app.theme_combo.currentText(), THEMES["Dark"]))
+        # FORCE DARK MODE ALWAYS
+        self.setStyleSheet(THEMES["Dark"])
 
-        self._build_toolbar() 
+        self._build_toolbar()
         self.main_layout = QVBoxLayout(self)
         self.main_layout.addLayout(self.top_toolbar)
         
@@ -1925,6 +2142,13 @@ class vmanTagLibraryDialog(QDialog):
                 if remainder: items.add(remainder.split('/')[0])
         return items
 
+    def _get_icon_for_node(self, name, is_folder):
+        # Hooks directly into the Main App's zero-lag RAM cache!
+        if self.main_app and hasattr(self.main_app, '_get_native_icon'):
+            ext = os.path.splitext(name)[1].lower() if not is_folder else ""
+            return self.main_app._get_native_icon(name, is_folder, ext, -1)
+        return self.style().standardIcon(QStyle.SP_DirIcon if is_folder else QStyle.SP_FileIcon)
+
     def _populate_level(self, level_index, prefix_path):
         if level_index >= len(self.dynamic_lists): return
         items = self._get_children(prefix_path)
@@ -1940,12 +2164,11 @@ class vmanTagLibraryDialog(QDialog):
             test_folder = f"{prefix_path}{name}/"
             test_file = f"{prefix_path}{name}"
             
-            if test_folder in self.tag_cache or any(p.startswith(test_folder) for p in self.tag_cache.keys()):
-                item.setData(Qt.UserRole, test_folder)
-                item.setIcon(self.style().standardIcon(QStyle.SP_DirIcon)) 
-            else:
-                item.setData(Qt.UserRole, test_file) 
-                item.setIcon(self.style().standardIcon(QStyle.SP_FileIcon)) 
+            # --- UPDATED: Uses the new high-speed icon fetcher ---
+            is_fldr = test_folder in self.tag_cache or any(p.startswith(test_folder) for p in self.tag_cache.keys())
+            item.setData(Qt.UserRole, test_folder if is_fldr else test_file)
+            item.setIcon(self._get_icon_for_node(name, is_fldr))
+            # -----------------------------------------------------
                 
             lst.addItem(item)
             
@@ -2052,8 +2275,8 @@ class vmanTagLibraryDialog(QDialog):
                 l_item = QListWidgetItem(name)
                 l_item.setData(Qt.UserRole, node_v_path)
                 
-                if is_folder: l_item.setIcon(self.style().standardIcon(QStyle.SP_DirIcon))
-                else: l_item.setIcon(self.style().standardIcon(QStyle.SP_FileIcon))
+              # --- UPDATED: Uses the new high-speed icon fetcher ---
+                l_item.setIcon(self._get_icon_for_node(name, is_folder))
                 
                 if node_v_path in self.tag_cache and target_tag in self.tag_cache[node_v_path]:
                     l_item.setForeground(QBrush(QColor("#58a6ff")))
@@ -2179,10 +2402,8 @@ class vmanTagLibraryDialog(QDialog):
                 l_item = QListWidgetItem(name)
                 l_item.setData(Qt.UserRole, node_v_path)
                 
-                if is_folder:
-                    l_item.setIcon(self.style().standardIcon(QStyle.SP_DirIcon))
-                else:
-                    l_item.setIcon(self.style().standardIcon(QStyle.SP_FileIcon))
+                # --- UPDATED: Uses the new high-speed icon fetcher ---
+                l_item.setIcon(self._get_icon_for_node(name, is_folder))
                 
                 if query in name.lower():
                     l_item.setForeground(QBrush(QColor("#2ea043")))
@@ -2534,6 +2755,166 @@ class vmanTagLibraryDialog(QDialog):
         except Exception as e: QMessageBox.critical(self, "Error", str(e))
 
 
+
+class HeatmapColorConfigDialog(QDialog):
+    def __init__(self, db_path, parent=None):
+        super().__init__(parent)
+        self.db_path = db_path
+        self.setWindowTitle("🎨 Color Legend & Customization")
+        self.resize(500, 600)
+        if parent and hasattr(parent, 'styleSheet'): self.setStyleSheet(parent.styleSheet())
+        
+        self.settings = QSettings("vmanOS", "HeatmapColors")
+        self.color_map = self.settings.value("custom_colors", {})
+        if not isinstance(self.color_map, dict): self.color_map = {}
+        
+        # Default Category Colors (High Contrast)
+        defaults = {"Category_Images": "#a371f7", "Category_Videos": "#f85149", "Category_Audio": "#ff7b72", 
+                    "Category_Documents": "#d2a8ff", "Category_Code": "#79c0ff", "Category_Archives": "#e3b341", "Category_Others": "#8b949e"}
+        for k, v in defaults.items():
+            if k not in self.color_map: self.color_map[k] = v
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel("<b>Double-click a color square to change it. Colors are saved permanently.</b>"))
+        
+        self.table = QTableWidget(0, 3)
+        self.table.setHorizontalHeaderLabels(["Type", "Name", "Color"])
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.table.setColumnWidth(0, 100); self.table.setColumnWidth(2, 80)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.cellDoubleClicked.connect(self.edit_color)
+        layout.addWidget(self.table)
+        
+        btn_reset = QPushButton("Reset to Defaults")
+        btn_reset.clicked.connect(self.reset_colors)
+        layout.addWidget(btn_reset)
+        
+        self.populate_table()
+
+    def get_distinct_color(self, index):
+        hue = (index * 137.508) % 360  # Golden angle distributes colors evenly
+        r, g, b = colorsys.hls_to_rgb(hue/360.0, 0.65, 0.85)
+        return f"#{int(r*255):02x}{int(g*255):02x}{int(b*255):02x}"
+
+    def populate_table(self):
+        self.table.setRowCount(0)
+        # Dynamically fetch top extensions from DB to ensure they have colors
+        with sqlite3.connect(self.db_path) as conn:
+            exts = conn.cursor().execute("SELECT extension, COUNT(id) FROM virtual_fs WHERE is_folder=0 GROUP BY extension ORDER BY COUNT(id) DESC LIMIT 50").fetchall()
+            for i, (ext, _) in enumerate(exts):
+                ext_clean = str(ext).lower() if ext else "none"
+                key = f"Extension_{ext_clean}"
+                if key not in self.color_map:
+                    self.color_map[key] = self.get_distinct_color(i)
+        
+        self.settings.setValue("custom_colors", self.color_map)
+        
+        for k, hex_val in sorted(self.color_map.items()):
+            row = self.table.rowCount()
+            self.table.insertRow(row)
+            parts = k.split("_", 1)
+            typ = parts[0]
+            name = parts[1] if len(parts) > 1 else ""
+            
+            self.table.setItem(row, 0, QTableWidgetItem(typ))
+            self.table.setItem(row, 1, QTableWidgetItem(name.upper() if typ == "Extension" else name))
+            
+            color_item = QTableWidgetItem()
+            color_item.setBackground(QBrush(QColor(hex_val)))
+            color_item.setData(Qt.UserRole, k) # Store key
+            self.table.setItem(row, 2, color_item)
+
+    def edit_color(self, row, col):
+        if col != 2: return
+        item = self.table.item(row, 2)
+        key = item.data(Qt.UserRole)
+        current_color = QColor(self.color_map.get(key, "#ffffff"))
+        
+        new_color = QColorDialog.getColor(current_color, self, f"Pick Color for {key}")
+        if new_color.isValid():
+            hex_color = new_color.name()
+            self.color_map[key] = hex_color
+            self.settings.setValue("custom_colors", self.color_map)
+            item.setBackground(QBrush(new_color))
+            if self.parent():
+                if hasattr(self.parent(), 'render_heatmap'): self.parent().render_heatmap()
+                # Force Calendar to instantly update with the new color
+                if hasattr(self.parent(), 'highlight_month') and hasattr(self.parent(), 'calendar'):
+                    self.parent().highlight_month(self.parent().calendar.yearShown(), self.parent().calendar.monthShown())
+
+    def reset_colors(self):
+        self.settings.remove("custom_colors")
+        self.color_map = {}
+        defaults = {"Category_Images": "#a371f7", "Category_Videos": "#f85149", "Category_Audio": "#ff7b72", 
+                    "Category_Documents": "#d2a8ff", "Category_Code": "#79c0ff", "Category_Archives": "#e3b341", "Category_Others": "#8b949e"}
+        for k, v in defaults.items(): self.color_map[k] = v
+        self.populate_table()
+        if self.parent():
+            if hasattr(self.parent(), 'render_heatmap'): self.parent().render_heatmap()
+            if hasattr(self.parent(), 'highlight_month') and hasattr(self.parent(), 'calendar'):
+                self.parent().highlight_month(self.parent().calendar.yearShown(), self.parent().calendar.monthShown())
+
+class RowLimitDialog(QDialog):
+    def __init__(self, total_rows, parent=None):
+        super().__init__(parent)
+        self.total_rows = total_rows
+        self.setWindowTitle("Data View Limit")
+        self.resize(400, 250)
+        if parent and hasattr(parent, 'styleSheet'): self.setStyleSheet(parent.styleSheet())
+        
+        layout = QVBoxLayout(self)
+        lbl = QLabel(f"<b>Found {total_rows:,} matching records.</b><br>Loading millions of rows into the UI grid will reduce performance. How many rows would you like to render in the Activity Log?<br><i>(Note: Visual Charts will still process ALL data instantly).</i>")
+        lbl.setWordWrap(True)
+        layout.addWidget(lbl)
+        
+        self.radio_group = QButtonGroup(self)
+        self.rb_rec = QRadioButton(f"Recommended (First {min(500, total_rows)} rows)")
+        self.rb_rec.setChecked(True)
+        self.rb_first_half = QRadioButton(f"First Half ({total_rows // 2} rows)")
+        self.rb_last_half = QRadioButton(f"Last Half ({total_rows - (total_rows // 2)} rows)")
+        self.rb_all = QRadioButton(f"All Rows ({total_rows}) - ⚠️ May cause UI stutter")
+        self.rb_custom = QRadioButton("Custom Range:")
+        
+        for i, rb in enumerate([self.rb_rec, self.rb_first_half, self.rb_last_half, self.rb_all, self.rb_custom]):
+            self.radio_group.addButton(rb, i)
+            layout.addWidget(rb)
+            
+        self.custom_lay = QHBoxLayout()
+        self.spin_limit = QSpinBox()
+        self.spin_limit.setRange(1, total_rows)
+        self.spin_limit.setValue(min(500, total_rows))
+        self.spin_limit.setPrefix("Show: ")
+        
+        self.spin_offset = QSpinBox()
+        self.spin_offset.setRange(0, total_rows - 1)
+        self.spin_offset.setValue(0)
+        self.spin_offset.setPrefix("Skip first: ")
+        
+        self.custom_lay.addWidget(self.spin_limit)
+        self.custom_lay.addWidget(self.spin_offset)
+        layout.addLayout(self.custom_lay)
+        
+        self.rb_custom.toggled.connect(lambda checked: (self.spin_limit.setEnabled(checked), self.spin_offset.setEnabled(checked)))
+        self.spin_limit.setEnabled(False); self.spin_offset.setEnabled(False)
+        
+        btn_box = QHBoxLayout()
+        btn_ok = QPushButton("Render Data")
+        btn_ok.setStyleSheet("background-color: #2ea043; color: white; font-weight: bold;")
+        btn_ok.clicked.connect(self.accept)
+        btn_cancel = QPushButton("Cancel")
+        btn_cancel.clicked.connect(self.reject)
+        btn_box.addWidget(btn_ok); btn_box.addWidget(btn_cancel)
+        layout.addLayout(btn_box)
+
+    def get_values(self):
+        idx = self.radio_group.checkedId()
+        if idx == 0: return min(500, self.total_rows), 0
+        elif idx == 1: return self.total_rows // 2, 0
+        elif idx == 2: return self.total_rows - (self.total_rows // 2), self.total_rows // 2
+        elif idx == 3: return self.total_rows, 0
+        else: return self.spin_limit.value(), self.spin_offset.value()
+
 class TimelineDiaryDialog(QDialog):
     def __init__(self, db_path, parent=None):
         super().__init__(parent)
@@ -2544,10 +2925,8 @@ class TimelineDiaryDialog(QDialog):
         self.resize(1100, 670)
         self.setMinimumSize(950, 660)
         
-        if parent and hasattr(parent, 'theme_combo'):
-            self.setStyleSheet(THEMES.get(parent.theme_combo.currentText(), THEMES["Dark"]))
-        else:
-            self.setStyleSheet(THEMES["Dark"])
+        # FORCE DARK MODE ALWAYS
+        self.setStyleSheet(THEMES["Dark"])
 
         main_layout = QVBoxLayout(self)
         main_layout.setContentsMargins(10, 10, 10, 10)
@@ -2564,6 +2943,11 @@ class TimelineDiaryDialog(QDialog):
         
         # 1. Calendar
         self.calendar = QCalendarWidget()
+
+        # --- NEW: Context Menu for Calendar to toggle auto-switch ---
+        self.auto_switch_diary = True
+        self.calendar.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.calendar.customContextMenuRequested.connect(self.show_calendar_context_menu)
 
         self.date_mode_mod = QRadioButton("Modified")
         self.date_mode_mod.setChecked(True)
@@ -2590,16 +2974,8 @@ class TimelineDiaryDialog(QDialog):
         self.calendar.clicked.connect(self.on_calendar_clicked)
         # -------------------------------------------------------------------
         
-        font = self.calendar.font(); font.setPointSize(10); self.calendar.setFont(font)
-        self.calendar.setStyleSheet("""
-            QCalendarWidget QWidget { alternate-background-color: #161b22; background-color: #0d1117; color: #c9d1d9; }
-            QCalendarWidget QToolButton { color: #c9d1d9; font-weight: bold; background-color: transparent; padding: 5px; }
-            QCalendarWidget QToolButton::hover { background-color: #30363d; border-radius: 4px; }
-            QCalendarWidget QMenu { background-color: #161b22; color: white; }
-            QCalendarWidget QSpinBox { background: #161b22; color: white; border: 1px solid #30363d; }
-            QCalendarWidget QAbstractItemView:enabled { background-color: #0d1117; color: #c9d1d9; selection-background-color: #2ea043; selection-color: white; outline: none; }
-            QCalendarWidget QAbstractItemView:disabled { color: #484f58; }
-        """)
+        # --- DYNAMIC CALENDAR STYLING ---
+        self.update_calendar_style()
         self.calendar.setFixedHeight(280)
         left_lay.addWidget(self.calendar)
         
@@ -2642,12 +3018,24 @@ class TimelineDiaryDialog(QDialog):
             QTabWidget::pane { border: 1px solid #30363d; background: #0d1117; border-radius: 4px; border-top-left-radius: 0px; }
         """)
         
+        # Ensure setting property exists
+        self.settings = QSettings("vmanOS", "TimelineSettings")
+        self.calendar_view_mode = self.settings.value("calendar_view_mode", "Default (Green Highlight)")
+
         # --- TAB 1: HTML Diary Reader ---
         tab_diary = QWidget()
         diary_lay = QVBoxLayout(tab_diary)
         diary_lay.setContentsMargins(0, 0, 0, 0)
         self.diary_browser = QTextBrowser()
-        self.diary_browser.setStyleSheet("background-color: #0d1117; border: none; padding: 10px;")
+        
+        # Custom Thin Scrollbar & Sleek Dark Mode Styling
+        self.diary_browser.setStyleSheet("""
+            QTextBrowser { background-color: #0d1117; border: none; padding: 10px; color: #c9d1d9; }
+            QScrollBar:vertical { border: none; background: #0d1117; width: 8px; margin: 0px; }
+            QScrollBar::handle:vertical { background: #30363d; min-height: 30px; border-radius: 4px; }
+            QScrollBar::handle:vertical:hover { background: #58a6ff; }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { border: none; background: none; }
+        """)
         diary_lay.addWidget(self.diary_browser)
         self.tabs.addTab(tab_diary, "📖 Daily Diary")
 
@@ -2656,8 +3044,26 @@ class TimelineDiaryDialog(QDialog):
         data_lay = QVBoxLayout(tab_data)
         data_lay.setContentsMargins(0, 0, 0, 0)
         
-        self.table = QTableWidget(0, 6)
-        self.table.setHorizontalHeaderLabels(["Name", "Type", "Ext", "Size", "Virtual Location", "ID"])
+        # NEW: Local Activity Filter Bar
+        local_filter_lay = QHBoxLayout()
+        local_filter_lay.setContentsMargins(10, 10, 10, 5)
+        self.log_search_box = QLineEdit()
+        self.log_search_box.setPlaceholderText("🔍 Filter Name or Virtual Location...")
+        self.log_search_box.textChanged.connect(self.filter_activity_log)
+        
+        self.log_cat_box = QComboBox()
+        self.log_cat_box.addItems(["All Types", "Images", "Videos", "Audio", "Documents", "Code", "Archives"])
+        self.log_cat_box.setEditable(True)
+        self.log_cat_box.lineEdit().setPlaceholderText("Or type ext (e.g. .jpg)")
+        self.log_cat_box.currentTextChanged.connect(self.filter_activity_log)
+        
+        local_filter_lay.addWidget(self.log_search_box, stretch=1)
+        local_filter_lay.addWidget(self.log_cat_box)
+        data_lay.addLayout(local_filter_lay)
+        
+        self.table = QTableWidget(0, 9)
+        self.table.setIconSize(QSize(20, 20))
+        self.table.setHorizontalHeaderLabels(["S.No.", "Name", "Type", "Ext", "Size", "Modified Date", "Virtual Location", "Tags", "ID"])
         self.table.setSortingEnabled(True)
         self.table.verticalHeader().setVisible(False)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
@@ -2666,9 +3072,19 @@ class TimelineDiaryDialog(QDialog):
         self.table.customContextMenuRequested.connect(self.show_context_menu)
         self.table.doubleClicked.connect(self.open_scanned_file)
         
-        self.table.setColumnWidth(0, 220); self.table.setColumnWidth(1, 80); self.table.setColumnWidth(2, 60); self.table.setColumnWidth(3, 80)
-        self.table.horizontalHeader().setSectionResizeMode(4, QHeaderView.Stretch)
-        self.table.setColumnHidden(5, True)
+        # --- HEADER CONTEXT MENU ---
+        self.table.horizontalHeader().setContextMenuPolicy(Qt.CustomContextMenu)
+        self.table.horizontalHeader().customContextMenuRequested.connect(self.show_header_menu)
+        
+        self.table.setColumnWidth(0, 50); self.table.setColumnWidth(1, 220); self.table.setColumnWidth(2, 80)
+        self.table.setColumnWidth(3, 60); self.table.setColumnWidth(4, 80); self.table.setColumnWidth(5, 140)
+        self.table.horizontalHeader().setSectionResizeMode(6, QHeaderView.Stretch)
+        self.table.setColumnHidden(0, True) # Hide S.No by default
+        self.table.setColumnHidden(8, True) # Hide ID by default
+        
+        self.settings = QSettings("vmanOS", "TimelineSettings")
+        saved_state = self.settings.value("table_state")
+        if saved_state: self.table.horizontalHeader().restoreState(saved_state)
         
         data_lay.addWidget(self.table)
         self.tabs.addTab(tab_data, "📋 Activity Log")
@@ -2681,14 +3097,9 @@ class TimelineDiaryDialog(QDialog):
         top_chart_bar.addWidget(QLabel("<b>Chart Metric:</b>"))
         self.cb_chart_metric = QComboBox()
         self.cb_chart_metric.addItems([
-            "File Count by Extension",
-            "Storage Size by Extension",
-            "Storage Usage by Year",
-            "File Age Distribution",
-            "Top 10 Largest Files",
-            "File Modification Timeline",
-            "File Size Distribution",
-            "Tag Utilization"
+            "File Count by Extension", "Storage Size by Extension", "Storage Usage by Year",
+            "File Age Distribution", "Top 10 Largest Files", "File Modification Timeline",
+            "File Size Distribution", "Tag Utilization"
         ])
         self.cb_chart_metric.currentTextChanged.connect(self.force_chart_redraw)
         top_chart_bar.addWidget(self.cb_chart_metric, stretch=1)
@@ -2699,7 +3110,88 @@ class TimelineDiaryDialog(QDialog):
         self.canvas = FigureCanvasQTAgg(self.fig)
         chart_lay.addWidget(self.canvas, stretch=1)
         self.tabs.addTab(tab_charts, "📊 Visual Analytics")
+
+        # --- TAB 4: Monthly Chart (NEW) ---
+        tab_monthly = QWidget()
+        monthly_lay = QVBoxLayout(tab_monthly)
         
+        top_monthly_bar = QHBoxLayout()
+        top_monthly_bar.addWidget(QLabel("<b>Chart Metric:</b>"))
+        self.cb_monthly_metric = QComboBox()
+        self.cb_monthly_metric.addItems([
+            "Daily Activity (Count)", "Daily Activity (Size)", 
+            "By Category (Count)", "By Category (Size)", 
+            "By Extension (Count)", "By Extension (Size)", 
+            "Tag Utilization", "Top 10 Largest Files"
+        ])
+        self.cb_monthly_metric.currentTextChanged.connect(self.render_monthly_chart)
+        top_monthly_bar.addWidget(self.cb_monthly_metric, stretch=1)
+        monthly_lay.addLayout(top_monthly_bar)
+
+        self.fig_monthly = Figure(figsize=(8, 5), dpi=100)
+        self.fig_monthly.patch.set_facecolor('#0d1117')
+        self.canvas_monthly = FigureCanvasQTAgg(self.fig_monthly)
+        
+        monthly_scroll = QScrollArea()
+        monthly_scroll.setWidgetResizable(True)
+        monthly_scroll.setWidget(self.canvas_monthly)
+        monthly_lay.addWidget(monthly_scroll)
+        self.tabs.addTab(tab_monthly, "📅 Monthly Chart")
+
+        # --- TAB 5: Yearly Heatmap (GitHub Style) ---
+        tab_heatmap = QWidget()
+        heat_lay = QVBoxLayout(tab_heatmap)
+        
+        heat_bar = QHBoxLayout()
+        self.cb_heat_year = QComboBox()
+        self.cb_heat_mode = QComboBox()
+        
+        # Clean fluid options (No repeated colors!)
+        self.cb_heat_mode.addItems([
+            "Activity Volume by Count", 
+            "Data Volume by Size", 
+            "Dominant Category by Count",  
+            "Dominant Category by Size",  
+            "Dominant Extension by Count",
+            "Dominant Extension by Size",
+            "Forensic: Tagging Activity",
+            "Forensic: Average File Size",
+            "Forensic: Max Single File Size"
+        ])
+        
+        self.btn_heat_render = QPushButton("Generate Heatmap")
+        self.btn_heat_render.setStyleSheet("QPushButton { background-color: rgba(88, 166, 255, 0.1); color: #58a6ff; border: 1px solid rgba(88, 166, 255, 0.4); border-radius: 5px; padding: 5px 15px; font-weight: bold; } QPushButton:hover { background-color: rgba(88, 166, 255, 0.25); border: 1px solid #58a6ff; color: #ffffff; }")
+        self.btn_heat_render.clicked.connect(self.render_heatmap)
+        
+        self.btn_heat_colors = QPushButton("Colors")
+        self.btn_heat_colors.setStyleSheet("QPushButton { background-color: rgba(227, 179, 65, 0.1); color: #e3b341; border: 1px solid rgba(227, 179, 65, 0.4); border-radius: 5px; padding: 5px 15px; font-weight: bold; } QPushButton:hover { background-color: rgba(227, 179, 65, 0.25); border: 1px solid #e3b341; color: #ffffff; }")
+        self.btn_heat_colors.clicked.connect(self.open_color_manager)
+        
+        self.btn_heat_grid = QPushButton("Settings")
+        self.btn_heat_grid.setStyleSheet("QPushButton { background-color: rgba(139, 148, 158, 0.1); color: #8b949e; border: 1px solid rgba(139, 148, 158, 0.4); border-radius: 5px; padding: 5px 15px; font-weight: bold; } QPushButton:hover { background-color: rgba(139, 148, 158, 0.25); border: 1px solid #c9d1d9; color: #ffffff; }")
+        self.btn_heat_grid.clicked.connect(self.show_grid_settings_menu)
+        
+        heat_bar.addWidget(QLabel("<b>Year:</b>"))
+        heat_bar.addWidget(self.cb_heat_year)
+        heat_bar.addWidget(QLabel("<b>Mode:</b>"))
+        heat_bar.addWidget(self.cb_heat_mode)
+        heat_bar.addWidget(self.btn_heat_render)
+        heat_bar.addWidget(self.btn_heat_colors)
+        heat_bar.addWidget(self.btn_heat_grid)
+        heat_bar.addStretch()
+        heat_lay.addLayout(heat_bar)
+        
+        self.fig_heat = Figure(figsize=(10, 3), dpi=100)
+        self.fig_heat.patch.set_facecolor('#0d1117')
+        self.canvas_heat = FigureCanvasQTAgg(self.fig_heat)
+        
+        heat_scroll_area = QScrollArea()
+        heat_scroll_area.setWidgetResizable(True)
+        heat_scroll_area.setWidget(self.canvas_heat)
+        heat_lay.addWidget(heat_scroll_area)
+        
+        self.tabs.addTab(tab_heatmap, "📅 Yearly Activity")
+
         # Layout Assembly
         self.splitter.addWidget(left_widget)
         self.splitter.addWidget(self.tabs)
@@ -2707,71 +3199,630 @@ class TimelineDiaryDialog(QDialog):
         main_layout.addWidget(self.splitter)
         
         self.latest_analytics = None
+        self.is_populating = False
+        
+        # Set default tab switch behavior (0 = Diary, 1 = Activity Log, etc)
+        self.auto_switch_target = 0
+        
+        self.cb_year.currentTextChanged.connect(lambda: self.update_smart_filters('year'))
+        self.cb_category.currentTextChanged.connect(lambda: self.update_smart_filters('category'))
+        
         self.populate_dropdowns()
         
         today = QDate.currentDate()
         self.calendar.setSelectedDate(today)
         self.highlight_month(today.year(), today.month())
-        self.on_calendar_clicked(today)
+    
+    def update_calendar_style(self):
+        font = self.calendar.font()
+        font.setPointSize(10)
+        self.calendar.setFont(font)
+        
+        # Check user setting for the yellow border
+        settings = QSettings("vmanOS", "TimelineSettings")
+        show_border = settings.value("calendar_show_border", True, type=bool)
+        
+        # Apply the transparent yellow border OR completely invisible selection background
+        if show_border:
+            sel_style = "border: 2px solid #e3b341; background-color: rgba(0, 0, 0, 160); color: white;"
+        else:
+            # Using rgba(0,0,0,0) ensures Qt does NOT erase the highlighted background color you painted.
+            # A faint, semi-transparent white border is added so you still know which date is active.
+            sel_style = "border: 1px solid rgba(255, 255, 255, 50); background-color: rgba(0, 0, 0, 0); color: white;"
+            
+        self.calendar.setStyleSheet(f"""
+            QCalendarWidget QWidget {{ alternate-background-color: #161b22; background-color: #0d1117; color: #c9d1d9; }}
+            QCalendarWidget QToolButton {{ color: #c9d1d9; font-weight: bold; background-color: transparent; padding: 5px; }}
+            QCalendarWidget QToolButton::hover {{ background-color: #30363d; border-radius: 4px; }}
+            QCalendarWidget QMenu {{ background-color: #161b22; color: white; }}
+            QCalendarWidget QSpinBox {{ background: #161b22; color: white; border: 1px solid #30363d; }}
+            QCalendarWidget QAbstractItemView:enabled {{ 
+                background-color: #0d1117; 
+                color: #c9d1d9; 
+                selection-background-color: rgba(0, 0, 0, 0); 
+                selection-color: white; 
+                outline: none; 
+            }}
+            QCalendarWidget QAbstractItemView:disabled {{ color: #484f58; }}
+            QCalendarWidget QTableView::item:selected {{ {sel_style} }}
+        """)
+        
+    def toggle_calendar_border(self, checked):
+        settings = QSettings("vmanOS", "TimelineSettings")
+        settings.setValue("calendar_show_border", checked)
+        self.update_calendar_style()
+    
+    def prompt_custom_spacing(self):
+        settings = QSettings("vmanOS", "HeatmapGridSettings")
+        curr_x = settings.value("custom_gap_x", 0.1, type=float)
+        curr_y = settings.value("custom_gap_y", 0.1, type=float)
+        
+        # Ask for X (Horizontal distance between weeks)
+        x_val, ok1 = QInputDialog.getDouble(self, "Custom Spacing", "Horizontal gap between weeks (e.g. 0.0 to 2.0):", curr_x, 0.0, 10.0, 2)
+        if not ok1: return
+        
+        # Ask for Y (Vertical distance between days)
+        y_val, ok2 = QInputDialog.getDouble(self, "Custom Spacing", "Vertical gap between days (e.g. 0.0 to 2.0):", curr_y, 0.0, 10.0, 2)
+        if not ok2: return
+        
+        settings.setValue("block_spacing", "Custom")
+        settings.setValue("custom_gap_x", x_val)
+        settings.setValue("custom_gap_y", y_val)
+        self.render_heatmap()
 
+    def show_grid_settings_menu(self):
+        menu = QMenu(self)
+        settings = QSettings("vmanOS", "HeatmapGridSettings")
+        
+        # --- LAYOUT VIEWS ---
+        layout_menu = menu.addMenu("🖥️ Layout Style")
+        current_layout = settings.value("layout_style", "Standard")
+        for label in ["Standard", "Pure GitHub", "Weeks View (Spreadsheet)"]:
+            act = layout_menu.addAction(label); act.setCheckable(True); act.setChecked(current_layout == label)
+            act.triggered.connect(lambda checked, v=label: (settings.setValue("layout_style", v), self.render_heatmap()))
+            
+        # --- BLOCK SPACING ---
+        spacing_menu = menu.addMenu("📏 Block Spacing (Gap)")
+        current_spacing = settings.value("block_spacing", "Normal")
+        for label in ["Touching (No Gap)", "Normal", "Wide"]:
+            act = spacing_menu.addAction(label); act.setCheckable(True); act.setChecked(current_spacing == label)
+            act.triggered.connect(lambda checked, v=label: (settings.setValue("block_spacing", v), self.render_heatmap()))
+        
+        spacing_menu.addSeparator()
+        act_custom = spacing_menu.addAction("✏️ Custom Input..."); act_custom.setCheckable(True); act_custom.setChecked(current_spacing == "Custom")
+        act_custom.triggered.connect(self.prompt_custom_spacing)
+            
+        menu.addSeparator()
+
+        color_int_menu = menu.addMenu("Gradient Color (Intensity Mode)")
+        current_int = settings.value("intensity_color", "Fire")
+        for label in ["Fire", "Green", "Blue"]:
+            act = color_int_menu.addAction(label); act.setCheckable(True); act.setChecked(current_int == label)
+            act.triggered.connect(lambda checked, v=label: (settings.setValue("intensity_color", v), self.render_heatmap()))
+            
+        menu.addSeparator()
+            
+        act_legend = menu.addAction("Show Category/Extension Legend")
+        act_legend.setCheckable(True); act_legend.setChecked(settings.value("show_legend", False, type=bool))
+        act_legend.toggled.connect(lambda v: (settings.setValue("show_legend", v), self.render_heatmap()))
+
+        act_show = menu.addAction("Show Month Boundaries")
+        act_show.setCheckable(True); act_show.setChecked(settings.value("show_grid", True, type=bool))
+        act_show.toggled.connect(lambda v: (settings.setValue("show_grid", v), self.render_heatmap()))
+        
+        style_menu = menu.addMenu("Boundary Style")
+        current_style = settings.value("line_style", "-")
+        for label, val in [("Solid", "-"), ("Dashed", "--"), ("Dotted", ":")]:
+            act = style_menu.addAction(label); act.setCheckable(True); act.setChecked(current_style == val)
+            act.triggered.connect(lambda checked, v=val: (settings.setValue("line_style", v), self.render_heatmap()))
+            
+        color_menu = menu.addMenu("Boundary Color")
+        current_color = settings.value("line_color", "#58a6ff")
+        for label, val in [("Blue", "#58a6ff"), ("Green", "#3fb950"), ("Red", "#f85149"), ("Yellow", "#e3b341"), ("Gray", "#8b949e")]:
+            act = color_menu.addAction(label); act.setCheckable(True); act.setChecked(current_color == val)
+            act.triggered.connect(lambda checked, v=val: (settings.setValue("line_color", v), self.render_heatmap()))
+
+        from PySide6.QtCore import QPoint
+        menu.exec(self.btn_heat_grid.mapToGlobal(QPoint(0, self.btn_heat_grid.height())))
+ 
+    def render_heatmap(self):
+        self.fig_heat.clear()
+        year_str = self.cb_heat_year.currentText()
+        if not year_str or year_str == "All": return
+        
+        mode = self.cb_heat_mode.currentText()
+        ax = self.fig_heat.add_subplot(111)
+        ax.set_facecolor('#0d1117')
+        
+        data_dict = {} 
+        is_intensity_mode = any(k in mode for k in ["Volume", "Forensic"])
+
+        with sqlite3.connect(self.db_path) as conn:
+            cur = conn.cursor()
+            if "Volume by Count" in mode:
+                cur.execute("SELECT SUBSTR(modified, 1, 10), COUNT(id) FROM virtual_fs WHERE year=? AND in_trash=0 GROUP BY SUBSTR(modified, 1, 10)", (year_str,))
+                for dt, val in cur.fetchall(): data_dict[dt] = val
+            elif "Volume by Size" in mode:
+                cur.execute("SELECT SUBSTR(modified, 1, 10), SUM(size) FROM virtual_fs WHERE year=? AND in_trash=0 AND is_folder=0 GROUP BY SUBSTR(modified, 1, 10)", (year_str,))
+                for dt, val in cur.fetchall(): data_dict[dt] = val
+            elif "Forensic: Tagging" in mode:
+                cur.execute("SELECT SUBSTR(modified, 1, 10), COUNT(id) FROM virtual_fs WHERE year=? AND in_trash=0 AND is_folder=0 AND custom_tags IS NOT NULL AND custom_tags != '' GROUP BY SUBSTR(modified, 1, 10)", (year_str,))
+                for dt, val in cur.fetchall(): data_dict[dt] = val
+            elif "Forensic: Average" in mode:
+                cur.execute("SELECT SUBSTR(modified, 1, 10), AVG(size) FROM virtual_fs WHERE year=? AND in_trash=0 AND is_folder=0 GROUP BY SUBSTR(modified, 1, 10)", (year_str,))
+                for dt, val in cur.fetchall(): data_dict[dt] = val
+            elif "Forensic: Max" in mode:
+                cur.execute("SELECT SUBSTR(modified, 1, 10), MAX(size) FROM virtual_fs WHERE year=? AND in_trash=0 AND is_folder=0 GROUP BY SUBSTR(modified, 1, 10)", (year_str,))
+                for dt, val in cur.fetchall(): data_dict[dt] = val
+            elif "Dominant Category" in mode:
+                metric = "SUM(size)" if "Size" in mode else "COUNT(id)"
+                cur.execute(f"SELECT SUBSTR(modified, 1, 10), category, {metric} FROM virtual_fs WHERE year=? AND in_trash=0 AND is_folder=0 GROUP BY SUBSTR(modified, 1, 10), category", (year_str,))
+                temp_dict = {}
+                for dt, cat, val in cur.fetchall():
+                    if dt not in temp_dict or (val or 0) > temp_dict[dt][1]: temp_dict[dt] = (cat, val or 0)
+                for dt, (cat, _) in temp_dict.items(): data_dict[dt] = cat
+            elif "Dominant Extension" in mode:
+                metric = "SUM(size)" if "Size" in mode else "COUNT(id)"
+                cur.execute(f"SELECT SUBSTR(modified, 1, 10), extension, {metric} FROM virtual_fs WHERE year=? AND in_trash=0 AND is_folder=0 GROUP BY SUBSTR(modified, 1, 10), extension", (year_str,))
+                temp_dict = {}
+                for dt, ext, val in cur.fetchall():
+                    if dt not in temp_dict or (val or 0) > temp_dict[dt][1]: temp_dict[dt] = (ext, val or 0)
+                for dt, (ext, _) in temp_dict.items(): data_dict[dt] = ext
+        
+        import datetime as dt_lib
+        try:
+            start_date = dt_lib.date(int(year_str), 1, 1)
+            end_date = dt_lib.date(int(year_str), 12, 31)
+        except ValueError: return
+        
+        start_weekday = start_date.weekday()
+        delta = end_date - start_date
+        
+        saved_colors = QSettings("vmanOS", "HeatmapColors").value("custom_colors", {})
+        if not isinstance(saved_colors, dict): saved_colors = {}
+        cat_colors = {"Images": "#a371f7", "Videos": "#f85149", "Audio": "#ff7b72", "Documents": "#d2a8ff", "Code": "#79c0ff", "Archives": "#e3b341", "Others": "#8b949e"}
+        
+        grid_settings = QSettings("vmanOS", "HeatmapGridSettings")
+        layout_style = grid_settings.value("layout_style", "Standard")
+        block_spacing = grid_settings.value("block_spacing", "Normal")
+        show_grid = grid_settings.value("show_grid", True, type=bool)
+        show_legend = grid_settings.value("show_legend", False, type=bool)
+        intensity_color = grid_settings.value("intensity_color", "Fire")
+        line_style = grid_settings.value("line_style", "-")
+        line_color = grid_settings.value("line_color", "#58a6ff")
+
+        # --- INDEPENDENT GAP GEOMETRY ---
+        gap_x, gap_y = 0.2, 0.2 # Normal
+        if block_spacing == "Touching (No Gap)": gap_x, gap_y = 0.0, 0.0
+        elif block_spacing == "Wide": gap_x, gap_y = 0.5, 0.5
+        elif block_spacing == "Custom":
+            gap_x = grid_settings.value("custom_gap_x", 0.1, type=float)
+            gap_y = grid_settings.value("custom_gap_y", 0.1, type=float)
+            
+        box_w, box_h = 1.0, 1.0
+        edge_c = "none"
+        edge_lw = 0.0
+        
+        # --- VIEW PRESETS OVERRIDE ---
+        if layout_style == "Pure GitHub":
+            gap_x, gap_y = 0.2, 0.2
+            show_grid = False
+            ax.set_aspect('equal') # Forces perfect squares like GitHub
+        elif layout_style == "Weeks View (Spreadsheet)":
+            gap_x, gap_y = 0.0, 0.0
+            edge_c = "#30363d"
+            edge_lw = 1.0
+
+        max_vol = max(data_dict.values()) if (is_intensity_mode and data_dict) else 1
+        
+        month_dividers = set() 
+        month_labels_x = []
+
+        import hashlib
+        import matplotlib.patches as mpatches
+        
+        for i in range(delta.days + 1):
+            current_d = start_date + dt_lib.timedelta(days=i)
+            d_str = current_d.strftime("%Y-%m-%d")
+            
+            # Absolute Day-of-Year math for unbreakable alignment
+            col = (i + start_weekday) // 7
+            row = current_d.weekday() 
+            
+            x_pos = col * (box_w + gap_x)
+            y_pos = row * (box_h + gap_y)
+            
+            if current_d.day == 1: 
+                month_dividers.add(x_pos)
+                month_labels_x.append(x_pos + (box_w / 2))
+            
+            val = data_dict.get(d_str, None)
+            if val is None:
+                c_hex = "#161b22" if layout_style != "Weeks View (Spreadsheet)" else "#0d1117"
+            else:
+                if is_intensity_mode:
+                    intensity = max(0.2, min(1.0, float(val) / float(max_vol)))
+                    if "Green" in intensity_color: r, g, b = int(22 + (57 - 22) * intensity), int(27 + (211 - 27) * intensity), int(34 + (83 - 34) * intensity)
+                    elif "Blue" in intensity_color: r, g, b = int(22 + (88 - 22) * intensity), int(27 + (166 - 27) * intensity), int(34 + (255 - 34) * intensity)
+                    else: r, g, b = int(22 + (248 - 22) * intensity), int(27 + (81 - 27) * intensity), int(34 + (73 - 34) * intensity) 
+                    c_hex = f"#{r:02x}{g:02x}{b:02x}"
+                elif "Category" in mode:
+                    cat_clean = val if val else "Others"
+                    c_hex = saved_colors.get(f"Category_{cat_clean}", cat_colors.get(cat_clean, "#8b949e"))
+                elif "Extension" in mode:
+                    ext_clean = str(val).lower() if val else "none"
+                    key = f"Extension_{ext_clean}"
+                    if key in saved_colors: c_hex = saved_colors[key]
+                    else:
+                        h = int(hashlib.md5(ext_clean.encode()).hexdigest(), 16)
+                        c_hex = f"#{min(255, max(100, h & 0xFF)):02x}{min(255, max(100, (h >> 8) & 0xFF)):02x}{min(255, max(100, (h >> 16) & 0xFF)):02x}"
+                        
+            # Draw mathematically precise box
+            rect = mpatches.Rectangle((x_pos, y_pos), box_w, box_h, facecolor=c_hex, edgecolor=edge_c, linewidth=edge_lw)
+            ax.add_patch(rect)
+        
+        # Determine strict drawing boundaries
+        max_x = (53 * (box_w + gap_x))
+        max_y = (7 * (box_h + gap_y))
+        
+        ax.set_xlim(-gap_x, max_x)
+        ax.set_ylim(max_y, -gap_y) # Inverted Y so Monday is at the top
+        
+        # Setup specific Y-Axis labels depending on layout mode
+        y_ticks = [(r * (box_h + gap_y)) + (box_h / 2) for r in range(7)]
+        ax.set_yticks(y_ticks)
+        
+        if layout_style == "Pure GitHub":
+            ax.set_yticklabels(['', 'Mon', '', 'Wed', '', 'Fri', ''], color="#8b949e", fontsize=8)
+        else:
+            ax.set_yticklabels(['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'], color="#8b949e", fontsize=8)
+
+        # Apply Month Lines
+        if show_grid and layout_style != "Pure GitHub":
+            for x_line in month_dividers:
+                ax.plot([x_line - (gap_x / 2), x_line - (gap_x / 2)], [-gap_y, max_y], color=line_color, linestyle=line_style, linewidth=1.5, zorder=5)
+
+        ax.set_xticks(month_labels_x)
+        ax.set_xticklabels(['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'], color="#c9d1d9", fontsize=9, fontweight="bold")
+        
+        for spine in ['top', 'right', 'bottom', 'left']: ax.spines[spine].set_visible(False)
+        ax.tick_params(axis='both', which='major', length=0)
+        
+        # Build Legendary Layout
+        if not is_intensity_mode and show_legend:
+            legend_patches = []
+            if "Category" in mode:
+                for cat_name in set(data_dict.values()): 
+                    if cat_name: legend_patches.append(mpatches.Patch(color=saved_colors.get(f"Category_{cat_name}", cat_colors.get(cat_name, "#8b949e")), label=cat_name))
+            elif "Extension" in mode:
+                for ext_name in set(data_dict.values()): 
+                    if ext_name:
+                        ext_clean = str(ext_name).lower()
+                        key = f"Extension_{ext_clean}"
+                        if key in saved_colors: c_hex = saved_colors[key]
+                        else:
+                            h = int(hashlib.md5(ext_clean.encode()).hexdigest(), 16)
+                            c_hex = f"#{min(255, max(100, h & 0xFF)):02x}{min(255, max(100, (h >> 8) & 0xFF)):02x}{min(255, max(100, (h >> 16) & 0xFF)):02x}"
+                        legend_patches.append(mpatches.Patch(color=c_hex, label=str(ext_name).upper()))
+            
+            ax.legend(handles=legend_patches, loc='center left', bbox_to_anchor=(1, 0.5), frameon=False, labelcolor='#c9d1d9')
+            self.fig_heat.tight_layout(rect=[0, 0, 0.9, 1]) 
+        else:
+            self.fig_heat.tight_layout()
+            
+        self.canvas_heat.draw()
+ 
+    def show_calendar_context_menu(self, pos):
+        menu = QMenu(self)
+        
+        act_refresh = menu.addAction("🔄 Refresh Timeline Data")
+        act_refresh.triggered.connect(lambda: (self.populate_dropdowns(), self.highlight_month(self.calendar.yearShown(), self.calendar.monthShown()), self.render_heatmap()))
+        menu.addSeparator()
+        
+        # --- NEW: Optional Yellow Selection Border Toggle ---
+        settings = QSettings("vmanOS", "TimelineSettings")
+        act_border = menu.addAction("Show Yellow Selection Border")
+        act_border.setCheckable(True)
+        act_border.setChecked(settings.value("calendar_show_border", True, type=bool))
+        act_border.toggled.connect(self.toggle_calendar_border)
+        menu.addSeparator()
+        
+        switch_menu = menu.addMenu("On Date Click, Switch to Tab...")
+        tabs = [("📖 Daily Diary", 0), ("📋 Activity Log", 1), ("📊 Visual Analytics", 2), ("📅 Monthly Chart", 3), ("🔥 Yearly Activity", 4), ("Stay on Current Tab", -1)]
+        
+        for name, idx in tabs:
+            act = switch_menu.addAction(name)
+            act.setCheckable(True)
+            act.setChecked(getattr(self, 'auto_switch_target', 0) == idx)
+            act.triggered.connect(lambda checked=False, val=idx: self.set_auto_switch(val))
+            
+        menu.addSeparator()
+        
+        view_menu = menu.addMenu("Calendar Highlighting Mode")
+        modes = ["Default (Green Highlight)", "Activity Volume (Green Gradient)", "Dominant Category (Count)", "Dominant Category (Size)", "Dominant Extension (Count)", "Dominant Extension (Size)"]
+        for mode in modes:
+            act = view_menu.addAction(mode)
+            act.setCheckable(True)
+            act.setChecked(self.calendar_view_mode == mode)
+            act.triggered.connect(lambda checked=False, m=mode: self.set_calendar_view_mode(m))
+            
+        menu.exec(self.calendar.mapToGlobal(pos))
+        
+    def set_calendar_view_mode(self, mode):
+        self.calendar_view_mode = mode
+        self.settings.setValue("calendar_view_mode", mode)
+        self.highlight_month(self.calendar.yearShown(), self.calendar.monthShown())
+        
+    def set_auto_switch(self, val):
+        self.auto_switch_target = val
+        
+
+    def on_calendar_clicked(self, date):
+        self.load_html_diary(date)
+        date_str = date.toString("yyyy-MM-dd")
+        col = "creation_date" if getattr(self, 'date_mode_cre', None) and self.date_mode_cre.isChecked() else "modified"
+        
+        query = f"SELECT id, name, is_folder, extension, size, parent_path, {col}, custom_tags FROM virtual_fs WHERE {col} LIKE ? AND is_folder=0 AND in_trash=0"
+        
+        self.execute_search(query, (f"{date_str}%",), update_highlights=False)
+        
+        if self.auto_switch_target != -1:
+            self.tabs.setCurrentIndex(self.auto_switch_target)
+
+    def open_color_manager(self):
+        HeatmapColorConfigDialog(self.db_path, self).exec()
+        
+
+    def load_html_diary(self, date):
+        dt_str = date.toString("yyyy-MM-dd")
+        col = "creation_date" if getattr(self, 'date_mode_cre', None) and self.date_mode_cre.isChecked() else "modified"
+        
+        with sqlite3.connect(self.db_path) as conn:
+            # FAST FETCH: Limits HTML text generation to 150 items to prevent hanging
+            entries = conn.cursor().execute(f"SELECT SUBSTR({col}, 12, 8), name, parent_path, size, category FROM virtual_fs WHERE {col} LIKE ? AND is_folder=0 AND in_trash=0 ORDER BY {col} ASC LIMIT 150", (f"{dt_str}%",)).fetchall()
+        
+        html = f"<h1 style='color:#58a6ff; text-align:center;'>📖 System Timeline: {date.toString('dddd, MMMM d, yyyy')}</h1><hr>"
+        if not entries: 
+            html += "<h3 style='color:#8b949e; text-align:center;'><br><br>No system activity recorded on this day.</h3>"
+        else:
+            if len(entries) == 150:
+                html += f"<p style='color:#e3b341; text-align:center;'><b>Showing first 150 activities for performance. View full list in Activity Log.</b></p><br>"
+            else:
+                html += f"<p style='color:#c9d1d9; text-align:center;'><b>{len(entries)}</b> files were logged.</p><br>"
+            
+            html += "<ul style='list-style-type: none; padding-left: 0;'>"
+            cat_colors = {"Images": "#a371f7", "Videos": "#f85149", "Audio": "#ff7b72", "Documents": "#d2a8ff", "Code": "#79c0ff", "Others": "#8b949e"}
+            action_verb = "Created" if getattr(self, 'date_mode_cre', None) and self.date_mode_cre.isChecked() else "Modified"
+            
+            for time_str, name, pp, size, cat in entries:
+                c_color = cat_colors.get(cat, "#8b949e")
+                try: safe_size = human_size(size)
+                except: safe_size = f"{size} bytes"
+                
+                html += f"<li style='margin-bottom: 15px; background-color: rgba(33, 38, 45, 0.6); padding: 12px; border-left: 5px solid {c_color}; border-radius: 6px;'><span style='color: #58a6ff; font-size: 15px;'><b>🕒 {time_str}</b></span><br><span style='font-size: 16px; color: white;'>{action_verb} <b style='color: {c_color};'>{name}</b></span> <span style='color: #8b949e; font-size: 13px;'>({safe_size})</span><br><span style='color: #8b949e; font-size: 13px;'>Path: {pp}</span></li>"
+            html += "</ul>"
+        self.diary_browser.setHtml(html)
+            
+    def filter_activity_log(self):
+        term = self.log_search_box.text().lower()
+        cat_ext = self.log_cat_box.currentText().lower()
+        is_cat = cat_ext in ["all types", "images", "videos", "audio", "documents", "code", "archives"]
+        
+        cat_map = {
+            "images": ['.png', '.jpg', '.jpeg', '.bmp', '.gif', '.webp', '.svg'],
+            "videos": ['.mp4', '.avi', '.mkv', '.mov', '.wmv', '.flv'],
+            "audio": ['.mp3', '.wav', '.ogg', '.flac', '.aac'],
+            "documents": ['.pdf', '.doc', '.docx', '.txt', '.csv', '.xlsx', '.xls', '.ppt', '.pptx', '.md'],
+            "code": ['.py', '.js', '.html', '.css', '.cpp', '.c', '.java', '.json', '.xml', '.sh'],
+            "archives": ['.zip', '.rar', '.7z', '.tar', '.gz']
+        }
+
+        self.table.setUpdatesEnabled(False)
+        for r in range(self.table.rowCount()):
+            name = self.table.item(r, 1).text().lower() if self.table.item(r, 1) else ""
+            path = self.table.item(r, 6).text().lower() if self.table.item(r, 6) else ""
+            ext = self.table.item(r, 3).text().lower() if self.table.item(r, 3) else ""
+            
+            match_text = (term in name or term in path) if term else True
+            match_ext = True
+            
+            if not is_cat and cat_ext:
+                match_ext = (cat_ext in ext)
+            elif is_cat and cat_ext != "all types":
+                match_ext = any(e in ext for e in cat_map.get(cat_ext, []))
+            
+            self.table.setRowHidden(r, not (match_text and match_ext))
+        self.table.setUpdatesEnabled(True)
+
+    def update_smart_filters(self, trigger_source):
+        if self.is_populating: return
+        self.is_populating = True
+        
+        y = self.cb_year.currentText()
+        c = self.cb_category.currentText()
+        
+        with sqlite3.connect(self.db_path) as conn:
+            cur = conn.cursor()
+            
+            if trigger_source == 'year' and y != "All":
+                cur.execute("SELECT DISTINCT month FROM virtual_fs WHERE year=? AND month IS NOT NULL AND month != '' AND in_trash=0 ORDER BY month ASC", (y,))
+                months = ["All"] + [str(r[0]) for r in cur.fetchall()]
+                self.cb_month.clear(); self.cb_month.addItems(months)
+                
+            if trigger_source in ['year', 'category']:
+                query = "SELECT DISTINCT extension FROM virtual_fs WHERE extension IS NOT NULL AND extension != '' AND is_folder=0 AND in_trash=0"
+                params = []
+                if y != "All": query += " AND year=?"; params.append(y)
+                if c != "All": query += " AND category=?"; params.append(c)
+                query += " ORDER BY extension ASC"
+                
+                cur.execute(query, tuple(params))
+                exts = ["All"] + [str(r[0]) for r in cur.fetchall()]
+                self.cb_ext.clear(); self.cb_ext.addItems(exts)
+                
+        self.is_populating = False
+    
+    def closeEvent(self, event):
+        self.settings.setValue("table_state", self.table.horizontalHeader().saveState())
+        super().closeEvent(event)
+        
+    def show_header_menu(self, pos):
+        menu = QMenu(self)
+        for col in range(self.table.columnCount()):
+            name = self.table.horizontalHeaderItem(col).text()
+            action = menu.addAction(f"Show {name}")
+            action.setCheckable(True)
+            action.setChecked(not self.table.isColumnHidden(col))
+            action.toggled.connect(lambda checked, c=col: self.table.setColumnHidden(c, not checked))
+        menu.exec(self.table.horizontalHeader().mapToGlobal(pos))
+        
     def on_date_mode_changed(self):
         # Instantly forces the calendar, HTML reader, and Table to reload with the newly chosen metric
         self.highlight_month(self.calendar.yearShown(), self.calendar.monthShown())
         self.on_calendar_clicked(self.calendar.selectedDate())
 
     def populate_dropdowns(self):
-        with sqlite3.connect(self.db_path) as conn:
-            cur = conn.cursor()
-            self.cb_year.addItem("All")
-            cur.execute("SELECT DISTINCT year FROM virtual_fs WHERE year IS NOT NULL AND year != '' AND in_trash=0 ORDER BY year DESC")
-            self.cb_year.addItems([str(r[0]) for r in cur.fetchall()])
-            self.cb_month.addItem("All")
-            cur.execute("SELECT DISTINCT month FROM virtual_fs WHERE month IS NOT NULL AND month != '' AND in_trash=0 ORDER BY month ASC")
-            self.cb_month.addItems([str(r[0]) for r in cur.fetchall()])
-            self.cb_category.addItem("All")
-            cur.execute("SELECT DISTINCT category FROM virtual_fs WHERE category IS NOT NULL AND category != '' AND in_trash=0 ORDER BY category ASC")
-            self.cb_category.addItems([str(r[0]) for r in cur.fetchall()])
-            self.cb_ext.addItem("All")
-            cur.execute("SELECT DISTINCT extension FROM virtual_fs WHERE extension IS NOT NULL AND extension != '' AND is_folder=0 AND in_trash=0 ORDER BY extension ASC")
-            self.cb_ext.addItems([str(r[0]) for r in cur.fetchall()])
-            self.cb_size.addItems(["All", "Tiny (< 1MB)", "Medium (1MB - 500MB)", "Huge (> 500MB)"])
-            self.cb_tag.addItem("All")
-            cur.execute("SELECT custom_tags FROM virtual_fs WHERE custom_tags IS NOT NULL AND custom_tags != '' AND in_trash=0")
-            all_tags = set()
-            for (tags_str,) in cur.fetchall():
-                for t in tags_str.split(','):
-                    if t.strip(): all_tags.add(t.strip())
-            self.cb_tag.addItems(sorted(list(all_tags)))
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cur = conn.cursor()
+                
+                # Check existing columns to prevent SQLite crashes on older schemas
+                cur.execute("PRAGMA table_info(virtual_fs)")
+                cols = [row[1] for row in cur.fetchall()]
+                
+                self.cb_year.addItem("All")
+                if 'year' in cols:
+                    cur.execute("SELECT DISTINCT year FROM virtual_fs WHERE year IS NOT NULL AND year != '' AND in_trash=0 ORDER BY year DESC")
+                    years = [str(r[0]) for r in cur.fetchall()]
+                    self.cb_year.addItems(years)
+                    self.cb_heat_year.clear()          # ADD THIS
+                    self.cb_heat_year.addItems(years)  # ADD THIS
+                    
+                self.cb_month.addItem("All")
+                if 'month' in cols:
+                    cur.execute("SELECT DISTINCT month FROM virtual_fs WHERE month IS NOT NULL AND month != '' AND in_trash=0 ORDER BY month ASC")
+                    self.cb_month.addItems([str(r[0]) for r in cur.fetchall()])
+                
+                self.cb_category.addItem("All")
+                if 'category' in cols:
+                    cur.execute("SELECT DISTINCT category FROM virtual_fs WHERE category IS NOT NULL AND category != '' AND in_trash=0 ORDER BY category ASC")
+                    self.cb_category.addItems([str(r[0]) for r in cur.fetchall()])
+                
+                self.cb_ext.addItem("All")
+                if 'extension' in cols:
+                    cur.execute("SELECT DISTINCT extension FROM virtual_fs WHERE extension IS NOT NULL AND extension != '' AND is_folder=0 AND in_trash=0 ORDER BY extension ASC")
+                    self.cb_ext.addItems([str(r[0]) for r in cur.fetchall()])
+                
+                self.cb_size.addItems(["All", "Tiny (< 1MB)", "Medium (1MB - 500MB)", "Huge (> 500MB)"])
+                
+                self.cb_tag.addItem("All")
+                if 'custom_tags' in cols:
+                    cur.execute("SELECT custom_tags FROM virtual_fs WHERE custom_tags IS NOT NULL AND custom_tags != '' AND in_trash=0")
+                    all_tags = set()
+                    for (tags_str,) in cur.fetchall():
+                        for t in tags_str.split(','):
+                            if t.strip(): all_tags.add(t.strip())
+                    self.cb_tag.addItems(sorted(list(all_tags)))
+                    
+        except Exception as e:
+            print(f"Error populating dropdowns: {e}")
 
     def highlight_month(self, year, month):
         self.calendar.setDateTextFormat(QDate(), QTextCharFormat())
-        with sqlite3.connect(self.db_path) as conn:
-            cur = conn.cursor()
-            query_mod = f"SELECT DISTINCT SUBSTR(modified, 9, 2) FROM virtual_fs WHERE is_folder=0 AND in_trash=0 AND modified LIKE '{year}-{month:02d}-%'"
-            query_cre = f"SELECT DISTINCT SUBSTR(creation_date, 9, 2) FROM virtual_fs WHERE is_folder=0 AND in_trash=0 AND creation_date LIKE '{year}-{month:02d}-%'"
-            
-            mod_days = set(r[0] for r in cur.execute(query_mod).fetchall())
-            cre_days = set(r[0] for r in cur.execute(query_cre).fetchall())
-            
-            if self.date_mode_mod.isChecked(): days = mod_days
-            elif self.date_mode_cre.isChecked(): days = cre_days
-            elif self.date_mode_cm.isChecked(): days = mod_days.intersection(cre_days)
-            else: days = mod_days.union(cre_days)
         
-        fmt = QTextCharFormat()
-        fmt.setBackground(QColor("#2ea043")); fmt.setForeground(QColor("white")); fmt.setFontWeight(QFont.Bold)
-        for d in days:
-            try: self.calendar.setDateTextFormat(QDate(year, month, int(d)), fmt)
+        where_clauses = ["is_folder=0", "in_trash=0"]
+        params = []
+        
+        if hasattr(self, 'cb_category') and self.cb_category.currentText() != "All":
+            where_clauses.append("category=?"); params.append(self.cb_category.currentText())
+        if hasattr(self, 'cb_ext') and self.cb_ext.currentText() != "All":
+            where_clauses.append("extension=?"); params.append(self.cb_ext.currentText())
+        if hasattr(self, 'cb_tag') and self.cb_tag.currentText() != "All":
+            where_clauses.append("custom_tags LIKE ?"); params.append(f"%{self.cb_tag.currentText()}%")
+            
+        if hasattr(self, 'cb_size'):
+            s = self.cb_size.currentText()
+            if s == "Tiny (< 1MB)": where_clauses.append("size < 1048576")
+            elif s == "Medium (1MB - 500MB)": where_clauses.append("size >= 1048576 AND size <= 524288000")
+            elif s == "Huge (> 500MB)": where_clauses.append("size > 524288000")
+
+        base_sql = f"WHERE {' AND '.join(where_clauses)}"
+        ym_prefix = f"{year}-{month:02d}-%"
+        
+        mode = getattr(self, 'calendar_view_mode', "Default (Green Highlight)")
+        data_dict = {}
+        max_vol = 1
+        
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("PRAGMA journal_mode=WAL;")
+            cur = conn.cursor()
+            
+            # --- C+M / BOTH LOGIC ---
+            def get_days_for_col(col_name):
+                p = tuple(params + [ym_prefix])
+                if "Default" in mode:
+                    cur.execute(f"SELECT DISTINCT SUBSTR({col_name}, 9, 2) FROM virtual_fs {base_sql} AND {col_name} LIKE ?", p)
+                    return {int(r[0]): "default" for r in cur.fetchall() if r[0]}
+                elif "Volume" in mode:
+                    cur.execute(f"SELECT SUBSTR({col_name}, 9, 2), COUNT(id) FROM virtual_fs {base_sql} AND {col_name} LIKE ? GROUP BY SUBSTR({col_name}, 9, 2)", p)
+                    return {int(d): c for d, c in cur.fetchall() if d}
+                else:
+                    is_cat = "Category" in mode
+                    metric = "SUM(size)" if "Size" in mode else "COUNT(id)"
+                    target_col = "category" if is_cat else "extension"
+                    cur.execute(f"SELECT SUBSTR({col_name}, 9, 2), {target_col}, {metric} FROM virtual_fs {base_sql} AND {col_name} LIKE ? GROUP BY SUBSTR({col_name}, 9, 2), {target_col}", p)
+                    temp = {}
+                    for d, t_val, val in cur.fetchall():
+                        day = int(d)
+                        if day not in temp or (val or 0) > temp[day][1]: temp[day] = (t_val, val or 0)
+                    return {d: v[0] for d, v in temp.items()}
+
+            if self.date_mode_both.isChecked():
+                d_mod = get_days_for_col("modified")
+                d_cre = get_days_for_col("creation_date")
+                data_dict = {**d_cre, **d_mod} # Union
+            elif self.date_mode_cm.isChecked():
+                d_mod = get_days_for_col("modified")
+                d_cre = get_days_for_col("creation_date")
+                common = set(d_mod.keys()).intersection(set(d_cre.keys())) # Intersection
+                data_dict = {k: d_mod[k] for k in common} 
+            elif self.date_mode_cre.isChecked():
+                data_dict = get_days_for_col("creation_date")
+            else:
+                data_dict = get_days_for_col("modified")
+                
+            if "Volume" in mode and data_dict:
+                max_vol = max(data_dict.values())
+
+        saved_colors = QSettings("vmanOS", "HeatmapColors").value("custom_colors", {})
+        if not isinstance(saved_colors, dict): saved_colors = {}
+        cat_colors = {"Images": "#a371f7", "Videos": "#f85149", "Audio": "#ff7b72", "Documents": "#d2a8ff", "Code": "#79c0ff", "Archives": "#e3b341", "Others": "#8b949e"}
+
+        for day, val in data_dict.items():
+            fmt = QTextCharFormat()
+            fmt.setForeground(QBrush(QColor("white"))); fmt.setFontWeight(QFont.Bold)
+            bg_color = "#2ea043" 
+            
+            if "Volume" in mode:
+                intensity = max(0.2, min(1.0, float(val) / float(max_vol)))
+                r, g, b = int(22 + (57 - 22) * intensity), int(27 + (211 - 27) * intensity), int(34 + (83 - 34) * intensity)
+                bg_color = f"#{r:02x}{g:02x}{b:02x}"
+            elif "Category" in mode:
+                cat_clean = val if val else "Others"
+                bg_color = saved_colors.get(f"Category_{cat_clean}", cat_colors.get(cat_clean, "#8b949e"))
+            elif "Extension" in mode:
+                ext_clean = str(val).lower() if val else "none"
+                key = f"Extension_{ext_clean}"
+                if key in saved_colors: bg_color = saved_colors[key]
+                else:
+                    import hashlib
+                    h = int(hashlib.md5(ext_clean.encode()).hexdigest(), 16)
+                    bg_color = f"#{min(255, max(100, h & 0xFF)):02x}{min(255, max(100, (h >> 8) & 0xFF)):02x}{min(255, max(100, (h >> 16) & 0xFF)):02x}"
+
+            fmt.setBackground(QBrush(QColor(bg_color)))
+            try: self.calendar.setDateTextFormat(QDate(year, month, day), fmt)
             except ValueError: pass
 
-    def on_calendar_clicked(self, date):
-        self.load_html_diary(date)
-        date_str = date.toString("yyyy-MM-dd")
-        col = "creation_date" if self.date_mode_cre.isChecked() else "modified"
-        query = f"SELECT id, name, is_folder, extension, size, parent_path, {col}, custom_tags FROM virtual_fs WHERE {col} LIKE ? AND in_trash=0"
-        
-        self.execute_search(query, (f"{date_str}%",), update_highlights=False)
-        self.tabs.setCurrentIndex(0)
 
     def load_by_date(self, date):
         date_str = date.toString("yyyy-MM-dd")
@@ -2783,28 +3834,31 @@ class TimelineDiaryDialog(QDialog):
         
         self.execute_search(query, (f"{date_str}%",), update_highlights=False)
 
-    def load_html_diary(self, date):
         dt_str = date.toString("yyyy-MM-dd")
-        col = "creation_date"
-        if self.date_mode_mod.isChecked() or self.date_mode_cm.isChecked(): col = "modified"
-        elif self.date_mode_cre.isChecked(): col = "creation_date"
-        else: col = "modified" # 'Both' defaults query to modified for standard fetching
+        col = "creation_date" if self.date_mode_cre.isChecked() else "modified"
+        if self.date_mode_both.isChecked() or self.date_mode_cm.isChecked(): col = "modified"
+        
         with sqlite3.connect(self.db_path) as conn:
-            entries = conn.cursor().execute(f"SELECT SUBSTR({col}, 12, 8), name, parent_path, size, category FROM virtual_fs WHERE {col} LIKE ? AND is_folder=0 AND in_trash=0 ORDER BY {col} ASC", (f"{dt_str}%",)).fetchall()
+            # FIX HANG: Limit HTML string generation to 150 items
+            entries = conn.cursor().execute(f"SELECT SUBSTR({col}, 12, 8), name, parent_path, size, category FROM virtual_fs WHERE {col} LIKE ? AND is_folder=0 AND in_trash=0 ORDER BY {col} ASC LIMIT 150", (f"{dt_str}%",)).fetchall()
         
         html = f"<h1 style='color:#58a6ff; text-align:center;'>📖 System Timeline: {date.toString('dddd, MMMM d, yyyy')}</h1><hr>"
         if not entries: 
             html += "<h3 style='color:#8b949e; text-align:center;'><br><br>No system activity recorded on this day.</h3>"
         else:
-            html += f"<p style='color:#c9d1d9; text-align:center;'><b>{len(entries)}</b> files were modified or logged.</p><br><ul style='list-style-type: none; padding-left: 0;'>"
-            cat_colors = {"Images": "#a371f7", "Videos": "#f85149", "Audio": "#ff7b72", "Documents": "#d2a8ff", "Code": "#79c0ff", "Others": "#8b949e"}
+            if len(entries) == 150:
+                html += f"<p style='color:#e3b341; text-align:center;'><b>Showing first 150 activities. Check Activity Log tab for full list.</b></p><br>"
+            else:
+                html += f"<p style='color:#c9d1d9; text-align:center;'><b>{len(entries)}</b> files were logged.</p><br>"
             
+            html += "<ul style='list-style-type: none; padding-left: 0;'>"
+            cat_colors = {"Images": "#a371f7", "Videos": "#f85149", "Audio": "#ff7b72", "Documents": "#d2a8ff", "Code": "#79c0ff", "Others": "#8b949e"}
             action_verb = "Created" if self.date_mode_cre.isChecked() else "Modified"
             
             for time_str, name, pp, size, cat in entries:
                 c_color = cat_colors.get(cat, "#8b949e")
                 try: safe_size = human_size(size)
-                except NameError: safe_size = f"{size} bytes"
+                except: safe_size = f"{size} bytes"
                 
                 html += f"<li style='margin-bottom: 15px; background-color: rgba(33, 38, 45, 0.6); padding: 12px; border-left: 5px solid {c_color}; border-radius: 6px;'><span style='color: #58a6ff; font-size: 15px;'><b>🕒 {time_str}</b></span><br><span style='font-size: 16px; color: white;'>{action_verb} <b style='color: {c_color};'>{name}</b></span> <span style='color: #8b949e; font-size: 13px;'>({safe_size})</span><br><span style='color: #8b949e; font-size: 13px;'>Path: {pp}</span></li>"
             html += "</ul>"
@@ -2836,71 +3890,177 @@ class TimelineDiaryDialog(QDialog):
         
         self.tabs.setCurrentIndex(1)
 
-    # ADDED the update_highlights flag here
     def execute_search(self, query, params, update_highlights=True):
+        self.table.setUpdatesEnabled(False) 
         self.table.setSortingEnabled(False)
         self.table.setRowCount(0)
         
-        dates_found = set()
-        analytics = {
-            'ext_counts': {}, 'ext_sizes': {},
-            'year_sizes': {}, 'age_days': [],
-            'all_files': [], 
-            'mod_timeline': {}, 
-            'size_list': [], 
-            'tags': {'Tagged': 0, 'Untagged': 0},
-            'total': 0
-        }
+        self.current_chart_query = query
+        self.current_chart_params = params
         
-        now = datetime.now()
+        colors_map = {"Red": QColor("#5c2121"), "Orange": QColor("#663c14"), "Gold": QColor("#5c4c21"), "Green": QColor("#215c2b"), "Cyan": QColor("#1b5e5e"), "Blue": QColor("#213c5c"), "Purple": QColor("#43215c"), "Pink": QColor("#5c2144")}
 
         with sqlite3.connect(self.db_path) as conn:
+            conn.execute("PRAGMA journal_mode=WAL;")
             cur = conn.cursor()
-            cur.execute(query, params)
+                       
+            try: where_clause = query.split("WHERE ")[1].split(" ORDER BY")[0].split(" LIMIT")[0]
+            except: where_clause = "in_trash=0"
+                
+            # --- UPDATED: Automatically triggers the smart calendar painter ---
+            if update_highlights:
+                self.highlight_month(self.calendar.yearShown(), self.calendar.monthShown())
+
+            # --- SMART LIMIT & OFFSET ARCHITECTURE ---
+            # Instantly count total records
+            count_query = "SELECT COUNT(id) FROM virtual_fs WHERE " + where_clause
+            total_rows = conn.execute(count_query, params).fetchone()[0]
+            
+            if total_rows == 0:
+                self.table.setUpdatesEnabled(True)
+                self.render_charts()
+                self.render_monthly_chart()
+                return
+
+            limit = min(500, total_rows)
+            offset = 0
+            
+            # Show control prompt if user hit 'Apply Filter' and data is large
+            if total_rows > 500:
+                dlg = RowLimitDialog(total_rows, self)
+                if dlg.exec() == QDialog.Accepted:
+                    limit, offset = dlg.get_values()
+                else:
+                    self.table.setUpdatesEnabled(True)
+                    return # User cancelled
+            
+            prog = QProgressDialog(f"Rendering {limit} rows to UI...", "Cancel", 0, limit, self)
+            prog.setWindowTitle("Loading Activity Log")
+            prog.setWindowModality(Qt.WindowModal)
+            prog.setMinimumDuration(0)
+            prog.show(); QApplication.processEvents()
+
+            # Execute the precise slice for the UI Grid ONLY
+            table_query = query.split(" LIMIT")[0] + f" LIMIT {limit} OFFSET {offset}"
+            mod_query = table_query.replace("custom_tags FROM", "custom_tags, color_tag, category FROM")
+            cur.execute(mod_query, params)
             results = cur.fetchall()
             
-            for db_id, name, is_folder, ext, size, path, mod, tags in results:
-                row = self.table.rowCount()
-                self.table.insertRow(row)
-                self.table.setItem(row, 0, QTableWidgetItem(name))
-                self.table.setItem(row, 1, QTableWidgetItem("📁 Folder" if is_folder else "📄 File"))
-                self.table.setItem(row, 2, QTableWidgetItem(ext if ext else ""))
-                self.table.setItem(row, 3, SizeTableWidgetItem(size or 0)) 
-                self.table.setItem(row, 4, QTableWidgetItem(path))
-                self.table.setItem(row, 5, QTableWidgetItem(str(db_id)))
-                
-                analytics['total'] += 1
-                
-                if mod:
-                    date_part = mod.split(" ")[0]
-                    dates_found.add(date_part)
-                    analytics['mod_timeline'][date_part] = analytics['mod_timeline'].get(date_part, 0) + 1
+            self.table.setRowCount(len(results))
+            for r, (db_id, name, is_folder, ext, size, path, mod, tags, c_tag, cat) in enumerate(results):
+                if prog.wasCanceled(): 
+                    self.table.setRowCount(r)
+                    break
                     
-                    try:
-                        dt_mod = datetime.strptime(mod, "%Y-%m-%d %H:%M:%S")
-                        analytics['year_sizes'][dt_mod.year] = analytics['year_sizes'].get(dt_mod.year, 0) + (size or 0)
-                        analytics['age_days'].append((now - dt_mod).days)
-                    except: pass
+                if r % 100 == 0:
+                    prog.setValue(r)
+                    QApplication.processEvents()
 
-                if not is_folder:
-                    safe_ext = ext.upper() if ext else "UNKNOWN"
-                    safe_size = size or 0
-                    analytics['ext_counts'][safe_ext] = analytics['ext_counts'].get(safe_ext, 0) + 1
-                    analytics['ext_sizes'][safe_ext] = analytics['ext_sizes'].get(safe_ext, 0) + safe_size
-                    analytics['size_list'].append(safe_size)
-                    analytics['all_files'].append((name, safe_size))
-                    
-                    if tags and str(tags).strip(): analytics['tags']['Tagged'] += 1
-                    else: analytics['tags']['Untagged'] += 1
+                # Fix: Add offset to S.No. so it accurately reflects skipping
+                sno_item = QTableWidgetItem(); sno_item.setData(Qt.DisplayRole, r + 1 + offset)
+                self.table.setItem(r, 0, sno_item)
                 
+                name_item = QTableWidgetItem(name)
+                if self.parent() and hasattr(self.parent(), '_icon_cache'):
+                    ext_clean = str(ext).lower().strip('.') if ext else ""
+                    if is_folder: name_item.setIcon(self.parent().style().standardIcon(QStyle.SP_DirIcon))
+                    elif ext_clean in self.parent()._icon_cache: name_item.setIcon(self.parent()._icon_cache[ext_clean])
+                    else: name_item.setIcon(self.parent().style().standardIcon(QStyle.SP_FileIcon))
+                self.table.setItem(r, 1, name_item)
+                self.table.setItem(r, 2, QTableWidgetItem("📁 Folder" if is_folder else "📄 File"))
+                self.table.setItem(r, 3, QTableWidgetItem(ext if ext else ""))
+                self.table.setItem(r, 4, SizeTableWidgetItem(size or 0)) 
+                self.table.setItem(r, 5, QTableWidgetItem(str(mod)))
+                self.table.setItem(r, 6, QTableWidgetItem(path))
+                self.table.setItem(r, 7, QTableWidgetItem(str(tags) if tags else ""))
+                
+                id_item = QTableWidgetItem(); id_item.setData(Qt.DisplayRole, db_id)
+                self.table.setItem(r, 8, id_item)
+                
+                if c_tag and c_tag in colors_map:
+                    bg_brush = QBrush(colors_map[c_tag])
+                    for col in range(9):
+                        item = self.table.item(r, col)
+                        if item: item.setBackground(bg_brush); item.setForeground(QBrush(QColor("white")))
+
+        prog.close()
         self.table.setSortingEnabled(True)
+        self.table.setUpdatesEnabled(True) 
         
-        # Only update the calendar highlights if the flag is True!
-        if update_highlights:
-            self.sync_calendar_highlights(dates_found)
-            
-        self.latest_analytics = analytics
+        # Trigger the optimized SQL chart engines (they will process ALL rows instantly)
         self.render_charts()
+        self.render_monthly_chart()
+        
+    def render_monthly_chart(self):
+        self.fig_monthly.clear()
+        
+        sel_date = self.calendar.selectedDate()
+        ym_prefix = f"{sel_date.year()}-{sel_date.month():02d}-%"
+        
+        metric = self.cb_monthly_metric.currentText()
+        ax = self.fig_monthly.add_subplot(111)
+        ax.set_facecolor('#0d1117')
+        colors = ["#58a6ff", "#3fb950", "#e3b341", "#a371f7", "#f85149", "#d2a8ff", "#79c0ff", "#2ea043"]
+        txt_c = "#c9d1d9"
+        
+        with sqlite3.connect(self.db_path) as conn:
+            cur = conn.cursor()
+            
+            if "Daily Activity" in metric:
+                cur.execute("SELECT SUBSTR(modified, 9, 2), COUNT(id), SUM(size) FROM virtual_fs WHERE modified LIKE ? AND in_trash=0 AND is_folder=0 GROUP BY SUBSTR(modified, 9, 2) ORDER BY SUBSTR(modified, 9, 2)", (ym_prefix,))
+                data = cur.fetchall()
+                if not data:
+                    ax.text(0.5, 0.5, "No Activity for this Month", color=txt_c, ha='center'); ax.axis('off')
+                else:
+                    days = [str(int(r[0])) for r in data]
+                    vals = [r[1] if "Count" in metric else (r[2] or 0)/(1024*1024) for r in data]
+                    ax.bar(days, vals, color="#3fb950")
+                    ax.set_xlabel(f"Days of {sel_date.toString('MMMM yyyy')} (1-31)", color=txt_c, fontweight="bold")
+                    ax.set_ylabel("Total Files" if "Count" in metric else "Size (MB)", color=txt_c)
+                    ax.set_title(metric, color=txt_c)
+                    
+            elif "Category" in metric:
+                cur.execute("SELECT category, COUNT(id), SUM(size) FROM virtual_fs WHERE modified LIKE ? AND in_trash=0 AND is_folder=0 GROUP BY category ORDER BY SUM(size) DESC", (ym_prefix,))
+                data = cur.fetchall()
+                if data:
+                    vals = [r[1] if "Count" in metric else (r[2] or 0)/(1024*1024) for r in data[:8]]
+                    ax.bar([r[0] if r[0] else 'Others' for r in data[:8]], vals, color=colors)
+                    ax.set_title(metric + (" (MB)" if "Size" in metric else ""), color=txt_c)
+                else: ax.text(0.5, 0.5, "No Data", color=txt_c, ha='center'); ax.axis('off')
+                
+            elif "Extension" in metric:
+                cur.execute("SELECT extension, COUNT(id), SUM(size) FROM virtual_fs WHERE modified LIKE ? AND in_trash=0 AND is_folder=0 GROUP BY extension ORDER BY SUM(size) DESC", (ym_prefix,))
+                data = cur.fetchall()
+                if data:
+                    vals = [r[1] if "Count" in metric else (r[2] or 0)/(1024*1024) for r in data[:10]]
+                    ax.bar([str(r[0]).upper() if r[0] else 'NONE' for r in data[:10]], vals, color=colors)
+                    ax.set_title(metric + (" (MB)" if "Size" in metric else ""), color=txt_c)
+                else: ax.text(0.5, 0.5, "No Data", color=txt_c, ha='center'); ax.axis('off')
+                
+            elif "Tag" in metric:
+                cur.execute("SELECT CASE WHEN custom_tags IS NULL OR custom_tags = '' THEN 'Untagged' ELSE 'Tagged' END, COUNT(id) FROM virtual_fs WHERE modified LIKE ? AND in_trash=0 AND is_folder=0 GROUP BY CASE WHEN custom_tags IS NULL OR custom_tags = '' THEN 'Untagged' ELSE 'Tagged' END", (ym_prefix,))
+                data = cur.fetchall()
+                if data:
+                    ax.pie([r[1] for r in data], labels=[r[0] for r in data], autopct='%1.1f%%', colors=["#30363d", "#58a6ff"], textprops={'color':"white"})
+                    ax.set_title("Tag Coverage", color=txt_c)
+                else: ax.text(0.5, 0.5, "No Data", color=txt_c, ha='center'); ax.axis('off')
+                
+            elif "Top 10" in metric:
+                cur.execute("SELECT name, size FROM virtual_fs WHERE modified LIKE ? AND in_trash=0 AND is_folder=0 ORDER BY size DESC LIMIT 10", (ym_prefix,))
+                data = cur.fetchall()
+                if data:
+                    names = [str(x[0]).replace('$', '\\$')[:20] + ".." if len(str(x[0])) > 20 else str(x[0]).replace('$', '\\$') for x in data]
+                    ax.barh(names, [(x[1] or 0)/1024/1024 for x in data], color="#f85149")
+                    ax.invert_yaxis(); ax.set_title("Top 10 Largest Files (MB)", color=txt_c)
+                else: ax.text(0.5, 0.5, "No Data", color=txt_c, ha='center'); ax.axis('off')
+
+        if "Tag" not in metric:
+            ax.tick_params(colors=txt_c, labelsize=9)
+            for spine in ['top', 'right']: ax.spines[spine].set_visible(False)
+            for spine in ['bottom', 'left']: ax.spines[spine].set_color('#30363d')
+            
+        self.fig_monthly.tight_layout()
+        self.canvas_monthly.draw()
 
     def force_chart_redraw(self):
         if self.latest_analytics:
@@ -2908,84 +4068,74 @@ class TimelineDiaryDialog(QDialog):
 
     def render_charts(self):
         self.fig.clear()
-        an = self.latest_analytics
-        if not an or an['total'] == 0:
-            ax = self.fig.add_subplot(111)
-            ax.set_facecolor('#0d1117'); ax.text(0.5, 0.5, "No Data", color='#8b949e', ha='center', va='center'); ax.axis('off')
-            self.canvas.draw(); return
-            
+        if not hasattr(self, 'current_chart_query'): return
+        
         metric = self.cb_chart_metric.currentText()
         ax = self.fig.add_subplot(111)
         ax.set_facecolor('#0d1117')
-        colors = ["#58a6ff", "#3fb950", "#e3b341", "#a371f7", "#f85149", "#8b949e"]
-
-        if "Extension" in metric:
-            data = an['ext_counts'] if "Count" in metric else an['ext_sizes']
-            sorted_d = sorted(data.items(), key=lambda x: x[1], reverse=True)[:6]
-            ax.bar([x[0] for x in sorted_d], [x[1] for x in sorted_d], color=colors)
-            ax.set_title(metric, color="#c9d1d9")
-
-        elif "Usage by Year" in metric:
-            years = sorted(an['year_sizes'].keys())
-            sizes = [an['year_sizes'][y] for y in years]
-            ax.plot(years, sizes, marker='o', color="#58a6ff", linewidth=2)
-            ax.fill_between(years, sizes, color="#58a6ff", alpha=0.2)
-            ax.set_title("Storage Growth by Year", color="#c9d1d9")
-
-        elif "Age Distribution" in metric:
-            bins = [0, 7, 30, 180, 365, 1825]
-            labels = ["<1wk", "<1mo", "<6mo", "<1yr", ">1yr"]
-            counts = [0] * len(labels)
-            for d in an['age_days']:
-                if d <= 7: counts[0]+=1
-                elif d <= 30: counts[1]+=1
-                elif d <= 180: counts[2]+=1
-                elif d <= 365: counts[3]+=1
-                else: counts[4]+=1
-            ax.bar(labels, counts, color="#a371f7")
-            ax.set_title("File Age (Time since Modified)", color="#c9d1d9")
-
-        elif "Top 10" in metric:
-            top_10 = sorted(an['all_files'], key=lambda x: x[1], reverse=True)[:10]
-            names = [str(x[0]).replace('$', '\\$')[:15] + "..." if len(str(x[0])) > 15 else str(x[0]).replace('$', '\\$') for x in top_10]
-            sizes = [x[1] for x in top_10]
-            ax.barh(names, sizes, color="#f85149")
-            ax.invert_yaxis()
-            ax.set_title("Top 10 Largest Files", color="#c9d1d9")
-
-        elif "Modification Timeline" in metric:
-            sorted_dates = sorted(an['mod_timeline'].keys())
-            counts = [an['mod_timeline'][d] for d in sorted_dates]
-            # Show only the last 15 active days to prevent overcrowding
-            disp_dates = sorted_dates[-15:]
-            disp_counts = counts[-15:]
-            ax.bar(disp_dates, disp_counts, color="#3fb950")
-            ax.tick_params(axis='x', rotation=45)
-            ax.set_title("Activity Spikes (Last 15 Active Days)", color="#c9d1d9")
-
-        elif "Size Distribution" in metric:
-            # Grouping files into logical size buckets
-            buckets = {"<1MB": 0, "1-10MB": 0, "10-100MB": 0, "100MB-1GB": 0, ">1GB": 0}
-            for s in an['size_list']:
-                if s < 1048576: buckets["<1MB"] += 1
-                elif s < 10485760: buckets["1-10MB"] += 1
-                elif s < 104857600: buckets["10-100MB"] += 1
-                elif s < 1073741824: buckets["100MB-1GB"] += 1
-                else: buckets[">1GB"] += 1
-            ax.bar(buckets.keys(), buckets.values(), color="#e3b341")
-            ax.set_title("Count by Size Range", color="#c9d1d9")
-
-        elif "Tag" in metric:
-            vals = [an['tags']['Tagged'], an['tags']['Untagged']]
-            ax.pie(vals, labels=["Tagged", "Untagged"], autopct='%1.1f%%', colors=["#3fb950", "#30363d"], textprops={'color':"white"})
-            ax.set_title("Tag Coverage", color="#c9d1d9")
-
-        # Global styling for Dark theme
-        ax.tick_params(axis='x', colors='#c9d1d9', labelsize=9)
-        ax.tick_params(axis='y', colors='#8b949e')
-        for spine in ['top', 'right']: ax.spines[spine].set_visible(False)
-        for spine in ['bottom', 'left']: ax.spines[spine].set_color('#30363d')
+        colors = ["#58a6ff", "#3fb950", "#e3b341", "#a371f7", "#f85149", "#8b949e", "#79c0ff", "#2ea043"]
+        txt_c = "#c9d1d9"
         
+        try: where_clause = self.current_chart_query.split("WHERE ")[1].split(" ORDER BY")[0].split(" LIMIT")[0]
+        except: where_clause = "in_trash=0"
+
+        with sqlite3.connect(self.db_path) as conn:
+            cur = conn.cursor()
+            
+            if "Extension" in metric:
+                cur.execute(f"SELECT extension, COUNT(id), SUM(size) FROM virtual_fs WHERE {where_clause} AND is_folder=0 GROUP BY extension", self.current_chart_params)
+                data = cur.fetchall()
+                if data:
+                    sorted_d = sorted(data, key=lambda x: x[1] if "Count" in metric else (x[2] or 0), reverse=True)[:8]
+                    vals = [x[1] if "Count" in metric else (x[2] or 0)/1024/1024 for x in sorted_d]
+                    ax.bar([str(x[0]).upper() if x[0] else 'NONE' for x in sorted_d], vals, color=colors)
+                    ax.set_title(metric + (" (MB)" if "Size" in metric else ""), color=txt_c)
+                else: ax.text(0.5, 0.5, "No Data", color=txt_c, ha='center'); ax.axis('off')
+
+            elif "Usage by Year" in metric:
+                cur.execute(f"SELECT year, SUM(size) FROM virtual_fs WHERE {where_clause} AND year IS NOT NULL AND year != '' GROUP BY year ORDER BY year", self.current_chart_params)
+                data = cur.fetchall()
+                if data:
+                    ax.plot([str(r[0]) for r in data], [(r[1] or 0)/1024/1024 for r in data], marker='o', color="#58a6ff", linewidth=2)
+                    ax.fill_between([str(r[0]) for r in data], [(r[1] or 0)/1024/1024 for r in data], color="#58a6ff", alpha=0.2)
+                    ax.set_title("Storage Growth by Year (MB)", color=txt_c)
+                else: ax.text(0.5, 0.5, "No Data", color=txt_c, ha='center'); ax.axis('off')
+
+            elif "Top 10" in metric:
+                cur.execute(f"SELECT name, size FROM virtual_fs WHERE {where_clause} AND is_folder=0 ORDER BY size DESC LIMIT 10", self.current_chart_params)
+                data = cur.fetchall()
+                if data:
+                    names = [str(x[0]).replace('$', '\\$')[:15] + "..." if len(str(x[0])) > 15 else str(x[0]).replace('$', '\\$') for x in data]
+                    ax.barh(names, [(x[1] or 0)/1024/1024 for x in data], color="#f85149")
+                    ax.invert_yaxis(); ax.set_title("Top 10 Largest Files (MB)", color=txt_c)
+                else: ax.text(0.5, 0.5, "No Data", color=txt_c, ha='center'); ax.axis('off')
+
+            elif "Modification Timeline" in metric:
+                cur.execute(f"SELECT SUBSTR(modified, 1, 10), COUNT(id) FROM virtual_fs WHERE {where_clause} AND modified IS NOT NULL AND modified != '' GROUP BY SUBSTR(modified, 1, 10) ORDER BY SUBSTR(modified, 1, 10) DESC LIMIT 15", self.current_chart_params)
+                data = cur.fetchall()
+                if data:
+                    data.reverse() # Show chronologically
+                    ax.bar([r[0][-5:] for r in data], [r[1] for r in data], color="#3fb950")
+                    ax.tick_params(axis='x', rotation=45); ax.set_title("Activity Spikes (Last 15 Active Days)", color=txt_c)
+                else: ax.text(0.5, 0.5, "No Data", color=txt_c, ha='center'); ax.axis('off')
+                
+            elif "Tag" in metric:
+                cur.execute(f"SELECT CASE WHEN custom_tags IS NULL OR custom_tags = '' THEN 'Untagged' ELSE 'Tagged' END, COUNT(id) FROM virtual_fs WHERE {where_clause} AND is_folder=0 GROUP BY CASE WHEN custom_tags IS NULL OR custom_tags = '' THEN 'Untagged' ELSE 'Tagged' END", self.current_chart_params)
+                data = cur.fetchall()
+                if data:
+                    ax.pie([r[1] for r in data], labels=[r[0] for r in data], autopct='%1.1f%%', colors=["#30363d", "#58a6ff"], textprops={'color':"white"})
+                    ax.set_title("Tag Coverage", color=txt_c)
+                else: ax.text(0.5, 0.5, "No Data", color=txt_c, ha='center'); ax.axis('off')
+            
+            else:
+                ax.text(0.5, 0.5, "Metric Supported in Monthly Tab", color=txt_c, ha='center'); ax.axis('off')
+
+        if "Tag" not in metric:
+            ax.tick_params(axis='x', colors=txt_c, labelsize=9)
+            ax.tick_params(axis='y', colors='#8b949e')
+            for spine in ['top', 'right']: ax.spines[spine].set_visible(False)
+            for spine in ['bottom', 'left']: ax.spines[spine].set_color('#30363d')
+            
         self.fig.tight_layout()
         self.canvas.draw()
 
@@ -2993,10 +4143,12 @@ class TimelineDiaryDialog(QDialog):
         item = self.table.itemAt(pos)
         if not item: return
         row = item.row()
-        db_id = int(self.table.item(row, 5).text())
-        typ = "folder" if "Folder" in self.table.item(row, 1).text() else "file"
-        v_path = self.table.item(row, 4).text()
-        name = self.table.item(row, 0).text()
+        
+        # FIX: Point to column 8 for db_id
+        db_id = int(self.table.item(row, 8).text())
+        typ = "folder" if "Folder" in self.table.item(row, 2).text() else "file"
+        v_path = self.table.item(row, 6).text()
+        name = self.table.item(row, 1).text()
         
         full_v_path = f"{v_path}{name}/" if typ == "folder" else f"{v_path}{name}"
         
@@ -3005,9 +4157,15 @@ class TimelineDiaryDialog(QDialog):
         act_vman = menu.addAction("🎞 Open in vman Viewer")
         act_loc = menu.addAction("📂 Open OS Location")
         menu.addSeparator()
+        
+        # --- NEW COLOR MENU ---
+        color_menu = menu.addMenu("🎨 Set Color Tag")
+        for color in ["None", "Red", "Orange", "Gold", "Green", "Cyan", "Blue", "Purple", "Pink"]: 
+            color_menu.addAction(color, lambda checked=False, c=color: self.bulk_assign_color_tags(c))
+            
         act_copy_p = menu.addAction("📋 Copy Virtual Path")
         act_props = menu.addAction("📊 Show Properties")
-        act_bulk_tag = menu.addAction("🏷️ Bulk Assign Custom Tag") 
+        act_bulk_tag = menu.addAction("🏷️ Assign Custom Tag")
         menu.addSeparator()
         act_trash = menu.addAction("🗑️ Move to Trash")
         act_perm = menu.addAction("🧨 Delete Permanently")
@@ -3045,6 +4203,21 @@ class TimelineDiaryDialog(QDialog):
             if QMessageBox.question(self, "Delete", "Permanently delete selected files?", QMessageBox.Yes|QMessageBox.No) == QMessageBox.Yes:
                 self.trash_selected_items(permanent=True)
 
+    def open_scanned_file(self, index):
+        # FIX: Point to column 8 for db_id
+        if self.parent(): self.parent().open_local_file_system(int(self.table.item(index.row(), 8).text()))
+  
+    def bulk_assign_color_tags(self, color):
+        ids = [int(self.table.item(idx.row(), 8).text()) for idx in self.table.selectionModel().selectedRows()]
+        if not ids: return
+        with sqlite3.connect(self.db_path) as conn:
+            conn.cursor().executemany("UPDATE virtual_fs SET color_tag = ? WHERE id = ?", [(color if color != "None" else "", i) for i in ids])
+            conn.commit()
+        QMessageBox.information(self, "Complete", f"Applied Color Tag: {color} to {len(ids)} items.")
+        
+        # Re-fetch the current active view to instantly show the painted rows
+        self.on_calendar_clicked(self.calendar.selectedDate())
+            
     def bulk_assign_tags(self):
         selected_rows = set(idx.row() for idx in self.table.selectedIndexes())
         if not selected_rows: return
@@ -3060,9 +4233,6 @@ class TimelineDiaryDialog(QDialog):
                 conn.commit()
             QMessageBox.information(self, "Complete", "Tags assigned successfully.")
             self.load_by_filters()
-
-    def open_scanned_file(self, index):
-        if self.parent(): self.parent().open_local_file_system(int(self.table.item(index.row(), 5).text()))
 
     def trash_selected_items(self, permanent=False):
         ids_to_del = []
@@ -3111,13 +4281,17 @@ class SpaceAnalyzerDialog(QDialog):
         super().__init__(parent)
         self.db_path = db_path
         self.scan_roots = ["/"] 
+        self.huge_threshold_mb = 500
         self.setWindowTitle("Space & Integrity Analyzer")
-        
-        # --- Increased width to 1350 to perfectly fit all 9 columns ---
         self.resize(1350, 700) 
         self.setMinimumSize(1100, 500)
         self.setWindowFlags(self.windowFlags() | Qt.WindowMaximizeButtonHint | Qt.WindowMinimizeButtonHint)
-        # ----------------------------------------------------------------------
+        
+        # --- THEME FIX: Match main app's theme dynamically ---
+        if parent and hasattr(parent, 'theme_combo'):
+            self.setStyleSheet(THEMES.get(parent.theme_combo.currentText(), THEMES["Dark"]))
+        else:
+            self.setStyleSheet(THEMES["Dark"])
         
         layout = QVBoxLayout(self)
 
@@ -3130,115 +4304,87 @@ class SpaceAnalyzerDialog(QDialog):
         folder_lay.addWidget(btn_choose)
         layout.addLayout(folder_lay)
         
-        # Setup Table (Now 9 Columns)
-        self.table = QTableWidget(0, 9)
-        self.table.setHorizontalHeaderLabels(["Select", "Type", "Name", "Location", "Ext", "Size", "Modified Date", "SHA-256", "ID"])
+        # Setup Table (11 Corrected Columns)
+        self.table = QTableWidget(0, 11)
+        self.table.setHorizontalHeaderLabels(["Select", "S.No.", "Type", "Name", "Location", "Ext", "Size", "Modified Date", "Tags", "SHA-256", "ID"])
         self.table.setSortingEnabled(True) 
         
-        self.table.setColumnWidth(0, 50)   # Select
-        self.table.setColumnWidth(1, 140)  # Type
-        self.table.setColumnWidth(2, 220)  # Name
-        self.table.setColumnWidth(3, 260)  # Location
-        self.table.setColumnWidth(4, 70)   # Ext
-        self.table.setColumnWidth(5, 90)   # Size
-        self.table.setColumnWidth(6, 140)  # Modified
-        self.table.setColumnWidth(7, 240)  # Hash
-        self.table.setColumnHidden(8, True)# ID
+        self.table.setColumnWidth(0, 50); self.table.setColumnWidth(1, 50); self.table.setColumnWidth(2, 140)
+        self.table.setColumnWidth(3, 220); self.table.setColumnWidth(4, 260); self.table.setColumnWidth(5, 70)
+        self.table.setColumnWidth(6, 90); self.table.setColumnWidth(7, 140); self.table.setColumnWidth(8, 120); self.table.setColumnWidth(9, 240)
+        self.table.setColumnHidden(1, True) # S.No hidden by default
+        self.table.setColumnHidden(10, True) # ID hidden
 
         self.table.verticalHeader().setVisible(False)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        
         self.table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self.show_context_menu)        
         
-        # ---Double click to open files seamlessly ---
+        # Header Menu Config
+        self.table.horizontalHeader().setContextMenuPolicy(Qt.CustomContextMenu)
+        self.table.horizontalHeader().customContextMenuRequested.connect(self.show_header_menu)
+        
         self.table.doubleClicked.connect(self.open_scanned_file)
-        
         layout.addWidget(self.table)
+        
+        # Load State
+        self.settings = QSettings("vmanOS", "SpaceAnalyzerSettings")
+        saved_state = self.settings.value("table_state")
+        if saved_state: self.table.horizontalHeader().restoreState(saved_state)
 
+    def closeEvent(self, event):
+        self.settings.setValue("table_state", self.table.horizontalHeader().saveState())
+        super().closeEvent(event)
         
-        # ----- Row 1: Scanning & Safe Tools -----
-        scan_lay = QHBoxLayout()
-        
-        self.btn_refresh = QPushButton("🔄 Scan Junk")
-        self.btn_refresh.clicked.connect(self.scan)
-        
-        self.btn_scan_hash = QPushButton("🧬 Exact Duplicates")
-        self.btn_scan_hash.clicked.connect(self.scan_hash_duplicates)
-        
-        self.btn_scan_versions = QPushButton("📝 Version Conflicts")
-        self.btn_scan_versions.setStyleSheet("color: #58a6ff; font-weight: bold;")
-        self.btn_scan_versions.clicked.connect(self.scan_version_conflicts)
-        
-        self.btn_scan_corrupt = QPushButton("⚠️ Data Anomalies")
-        self.btn_scan_corrupt.setStyleSheet("color: #e3b341; font-weight: bold;")
-        self.btn_scan_corrupt.clicked.connect(self.scan_corrupt_files)
+    def show_header_menu(self, pos):
+        menu = QMenu(self)
+        for col in range(self.table.columnCount()):
+            name = self.table.horizontalHeaderItem(col).text()
+            action = menu.addAction(f"Show {name}")
+            action.setCheckable(True)
+            action.setChecked(not self.table.isColumnHidden(col))
+            action.toggled.connect(lambda checked, c=col: self.table.setColumnHidden(c, not checked))
+        menu.exec(self.table.horizontalHeader().mapToGlobal(pos))
 
-        self.btn_mark_safe = QPushButton("🛡️ Mark Safe (Ignore Intentional Duplicates)")
-        self.btn_mark_safe.setStyleSheet("color: #3fb950; font-weight: bold;")
-        self.btn_mark_safe.clicked.connect(lambda: self.update_safety_status(True))
+    def set_huge_threshold(self):
+        val, ok = QInputDialog.getInt(self, "Threshold", "Enter huge file threshold (MB):", self.huge_threshold_mb, 10, 50000)
+        if ok: self.huge_threshold_mb = val
         
-        self.btn_unmark_safe = QPushButton("❌ Unmark Safe")
-        self.btn_unmark_safe.setStyleSheet("color: #e3b341;")
-        self.btn_unmark_safe.clicked.connect(lambda: self.update_safety_status(False))
-
-        scan_lay.addWidget(self.btn_refresh)
-        scan_lay.addWidget(self.btn_scan_hash)
-        scan_lay.addWidget(self.btn_scan_versions)
-        scan_lay.addWidget(self.btn_scan_corrupt)
-        scan_lay.addStretch() # Pushes Safe tools to the right
-        scan_lay.addWidget(self.btn_mark_safe)
-        scan_lay.addWidget(self.btn_unmark_safe)
-        layout.addLayout(scan_lay)
-
-        # ----- Row 2: Selection & Action Tools -----
-        sel_lay = QHBoxLayout()
+    def invert_checked(self):
+        for r in range(self.table.rowCount()):
+            it = self.table.item(r, 0) # Fixed to Column 0 (Checkbox)
+            if it: it.setCheckState(Qt.Unchecked if it.checkState() == Qt.Checked else Qt.Checked)
+            
+    def prompt_smart_rule(self):
+        rule, ok = QInputDialog.getItem(self, "Smart Selection", "Select Rule:", ["Keep Oldest", "Keep Newest", "Keep files in a specific Virtual Folder..."], 0, False)
+        if ok: 
+            self.combo_smart_select = QComboBox() 
+            self.combo_smart_select.addItem(rule)
+            self.apply_smart_selection()
+            
+    def bulk_tag_items(self, color):
+        ids = [int(self.table.item(r, 10).text()) for r in range(self.table.rowCount()) if self.table.item(r, 0).checkState() == Qt.Checked]
+        if not ids: return
+        with sqlite3.connect(self.db_path) as conn:
+            conn.cursor().executemany("UPDATE virtual_fs SET color_tag = ? WHERE id = ?", [(color if color != "None" else "", i) for i in ids])
+            conn.commit()
+        QMessageBox.information(self, "Complete", f"Applied Color Tag: {color} to {len(ids)} items.")
         
-        # Manual Selection Tools
-        self.btn_select_all = QPushButton("☑ Check All")
-        self.btn_select_all.clicked.connect(self.toggle_select_all)
+    def bulk_add_custom_tags(self):
+        ids = [int(self.table.item(r, 10).text()) for r in range(self.table.rowCount()) if self.table.item(r, 0).checkState() == Qt.Checked]
+        if not ids: return
+        tags, ok = QInputDialog.getText(self, "Bulk Apply Tags", "Enter tags separated by comma:")
+        if not ok or not tags.strip(): return
+        with sqlite3.connect(self.db_path) as conn:
+            cur = conn.cursor()
+            for db_id in ids:
+                old_tags = cur.execute("SELECT custom_tags FROM virtual_fs WHERE id=?", (db_id,)).fetchone()[0]
+                new_val = f"{old_tags}, {tags.strip()}".strip(", ") if old_tags else tags.strip()
+                cur.execute("UPDATE virtual_fs SET custom_tags = ? WHERE id = ?", (new_val, db_id))
+            conn.commit()
+        QMessageBox.information(self, "Complete", f"Tags applied to {len(ids)} items.")
         
-        self.btn_check_hl = QPushButton("✓ Check Highlighted")
-        self.btn_check_hl.clicked.connect(lambda: self.set_highlighted_state(Qt.Checked))
-        
-        self.btn_uncheck_hl = QPushButton("✗ Uncheck Highlighted")
-        self.btn_uncheck_hl.clicked.connect(lambda: self.set_highlighted_state(Qt.Unchecked))
-
-        # Smart Rule Engine UI
-        self.combo_smart_select = QComboBox()
-        self.combo_smart_select.addItems([
-            "Keep Oldest (Check Newest for deletion)",
-            "Keep Newest (Check Oldest for deletion)",
-            "Keep files in a specific Virtual Folder..."
-        ])
-        self.btn_apply_smart = QPushButton("Apply Rule")
-        self.btn_apply_smart.setStyleSheet("color: #58a6ff; font-weight: bold;")
-        self.btn_apply_smart.clicked.connect(self.apply_smart_selection)
-
-        # Action Tools
-        self.btn_view_safe = QPushButton("👁️ View Safe Files")
-        self.btn_view_safe.clicked.connect(self.view_safe_files)
-        
-        self.btn_apply_tag = QPushButton("🏷️ Assign Custom Tag")
-        self.btn_apply_tag.setStyleSheet("background-color: #1f6feb; font-weight: bold; color: white;")
-        self.btn_apply_tag.clicked.connect(self.assign_tags_selected)
-        
-        self.btn_delete = QPushButton("🗑️ Delete Checked")
-        self.btn_delete.setStyleSheet("background-color: #8b0000; font-weight: bold; color: white;")
-        self.btn_delete.clicked.connect(self.delete_selected)
-
-        sel_lay.addWidget(self.btn_select_all)
-        sel_lay.addWidget(self.btn_check_hl)
-        sel_lay.addWidget(self.btn_uncheck_hl)
-        sel_lay.addSpacing(1) 
-        sel_lay.addWidget(self.combo_smart_select)
-        sel_lay.addWidget(self.btn_apply_smart)
-        sel_lay.addStretch() # Pushes Action tools to the right
-        sel_lay.addWidget(self.btn_view_safe)
-        sel_lay.addWidget(self.btn_apply_tag)
-        sel_lay.addWidget(self.btn_delete)
-        layout.addLayout(sel_lay)
 
     def apply_smart_selection(self):
         rule = self.combo_smart_select.currentText()
@@ -3309,36 +4455,61 @@ class SpaceAnalyzerDialog(QDialog):
 
     def show_context_menu(self, pos):
         item = self.table.itemAt(pos)
-        if not item: return
-        row = item.row()
-        
-        typ = self.table.item(row, 1).text()
-        db_id = int(self.table.item(row, 8).text())
-        
         menu = QMenu(self)
         
-        # Ensure all conflict types trigger the Proof button!
-        if any(keyword in typ for keyword in ["Duplicate", "Version", "Paradox", "0-Byte"]):
-            act_proof = menu.addAction("⚖️ Compare / Show Proof")
-            menu.addSeparator()
-        else:
-            act_proof = None
+        scan_menu = menu.addMenu("🔍 Run Scanners")
+        scan_menu.addAction("🧹 Scan Junk Files", self.scan)
+        scan_menu.addAction("🧬 Scan Exact Duplicates", self.scan_hash_duplicates)
+        scan_menu.addAction("📝 Scan Version Conflicts", self.scan_version_conflicts)
+        scan_menu.addAction("⚠️ Scan Data Anomalies", self.scan_corrupt_files)
+        scan_menu.addSeparator()
+        scan_menu.addAction(f"⚙️ Set Huge File Threshold (Currently {self.huge_threshold_mb}MB)...", self.set_huge_threshold)
+        
+        sel_menu = menu.addMenu("☑ Selection")
+        sel_menu.addAction("☑ Check All", self.toggle_select_all)
+        sel_menu.addAction("✓ Check Highlighted", lambda: self.set_highlighted_state(Qt.Checked))
+        sel_menu.addAction("✗ Uncheck Highlighted", lambda: self.set_highlighted_state(Qt.Unchecked))
+        sel_menu.addAction("🔄 Invert Checked Items", self.invert_checked)
+        sel_menu.addAction("🧠 Apply Smart Rule...", self.prompt_smart_rule)
+        
+        tag_menu = menu.addMenu("🏷 Tags & Labels (For Checked)")
+        color_menu = tag_menu.addMenu("🎨 Set Color Tag")
+        for color in ["None", "Red", "Orange", "Gold", "Green", "Cyan", "Blue", "Purple", "Pink"]: 
+            color_menu.addAction(color, lambda checked=False, c=color: self.bulk_tag_items(c))
+        tag_menu.addAction("📝 Bulk Add Custom Tags...", self.bulk_add_custom_tags)
+        
+        act_menu = menu.addMenu("🛠 Actions")
+        act_menu.addAction("🛡️ Mark Checked as Safe", lambda: self.update_safety_status(True))
+        act_menu.addAction("❌ Unmark Checked as Safe", lambda: self.update_safety_status(False))
+        act_menu.addAction("👁️ View Safe Files", self.view_safe_files)
+        act_menu.addSeparator()
+        act_menu.addAction("🗑️ Delete Checked", self.delete_selected)
+        
+        menu.addSeparator()
+        
+        if item:
+            row = item.row()
+            typ = self.table.item(row, 2).text()
+            db_id = int(self.table.item(row, 10).text()) # Fixed to Column 10
             
-        act_open = menu.addAction("🚀 Open Native File")
-        act_loc = menu.addAction("📂 Open File Location")
-        
-        action = menu.exec(self.table.viewport().mapToGlobal(pos))
-        
-        if action == act_proof:
-            self.show_proof_dialog(row, typ, db_id)
-        elif action == act_open:
-            if self.parent(): self.parent().open_local_file_system(db_id)
-        elif action == act_loc:
-            if self.parent(): self.parent().open_file_location(db_id)
+            if any(keyword in typ for keyword in ["Duplicate", "Version", "Paradox", "0-Byte"]):
+                act_proof = menu.addAction("⚖️ Compare / Show Proof")
+            else: act_proof = None
+                
+            act_open = menu.addAction("🚀 Open Native File")
+            act_loc = menu.addAction("📂 Open File Location")
+            
+            action = menu.exec(self.table.viewport().mapToGlobal(pos))
+            
+            if action == act_proof: self.show_proof_dialog(row, typ, db_id)
+            elif action == act_open and self.parent(): self.parent().open_local_file_system(db_id)
+            elif action == act_loc and self.parent(): self.parent().open_file_location(db_id)
+        else:
+            menu.exec(self.table.viewport().mapToGlobal(pos))
 
     def show_proof_dialog(self, row, typ, db_id):
-        ext = self.table.item(row, 4).text()
-        sha = self.table.item(row, 7).text()
+        ext = self.table.item(row, 5).text() # Adjusted Ext index
+        sha = self.table.item(row, 9).text() # Adjusted Hash index
         
         with sqlite3.connect(self.db_path) as conn:
             cur = conn.cursor()
@@ -3350,27 +4521,23 @@ class SpaceAnalyzerDialog(QDialog):
         query_params = ()
         
         if "Exact" in typ and sha and sha not in ("Not Computed", ""):
-            # 1. Exact Hash Duplicates
             query = "SELECT id, name, parent_path, size, modified, sha256, real_path FROM virtual_fs WHERE sha256=? AND is_folder=0 AND in_trash=0"
             query_params = (sha,)
             
         elif "Duplicate" in typ:
-            # 2. Standard Junk Scan Duplicates (Matches by Size & Extension)
             query = "SELECT id, name, parent_path, size, modified, sha256, real_path FROM virtual_fs WHERE size=? AND extension=? AND is_folder=0 AND in_trash=0"
             query_params = (true_size, ext)
             
         elif "Version" in typ:
-            # 3. Version Conflicts (Matches by Name)
             query = "SELECT id, name, parent_path, size, modified, sha256, real_path FROM virtual_fs WHERE name=? AND is_folder=0 AND in_trash=0 ORDER BY modified DESC"
             query_params = (true_name,)
             
         elif "Paradox" in typ:
-            # 4. Hash Paradox (Matches by Name, Size, Modified Date)
             query = "SELECT id, name, parent_path, size, modified, sha256, real_path FROM virtual_fs WHERE name=? AND size=? AND modified=? AND is_folder=0 AND in_trash=0"
             query_params = (true_name, true_size, true_mod)
             
         elif "0-Byte" in typ:
-            QMessageBox.information(self, "Proof", "This file is exactly 0 bytes, indicating it is empty or structurally broken. No side-by-side comparison is needed.")
+            QMessageBox.information(self, "Proof", "This file is exactly 0 bytes. No side-by-side comparison is needed.")
             return
             
         else:
@@ -3453,10 +4620,10 @@ class SpaceAnalyzerDialog(QDialog):
         rows_to_remove = []
         ids_to_update = []
         for r in range(self.table.rowCount()):
-            # ID is now at index 8
+            # Column 0 is the Checkbox, Column 10 is the ID
             if self.table.item(r, 0).checkState() == Qt.Checked:
                 rows_to_remove.append(r)
-                ids_to_update.append(int(self.table.item(r, 8).text()))
+                ids_to_update.append(int(self.table.item(r, 10).text()))
                 
         if not ids_to_update: return
         
@@ -3471,32 +4638,19 @@ class SpaceAnalyzerDialog(QDialog):
         action = "Marked Safe" if is_safe else "Unmarked Safe"
         QMessageBox.information(self, action, f"{len(ids_to_update)} items updated.")
 
+    
     def get_path_conditions(self):
         cond = " OR ".join(["parent_path LIKE ?"] * len(self.scan_roots))
         params = tuple(f"{p}%" for p in self.scan_roots)
         return cond, params
 
-    def view_safe_files(self):
-        self.table.setSortingEnabled(False)
-        self.table.setRowCount(0)
-        cond, params = self.get_path_conditions()
-        
-        with sqlite3.connect(self.db_path) as conn:
-            cur = conn.cursor()
-            cur.execute(f"SELECT id, name, parent_path, extension, size, modified, sha256 FROM virtual_fs WHERE hash_verified=1 AND ({cond})", params)
-            files = cur.fetchall()
-            for f in files:
-                self._add_row_with_state("🛡️ Verified Safe", f[1], f[2], f[3] or "", f[4] or 0, f[5], f[6] or "", f[0], Qt.Unchecked)
-        
-        self.table.setSortingEnabled(True)
-        if self.table.rowCount() == 0: QMessageBox.information(self, "Result", "No files are currently marked as safe in these locations.")
-
     def scan(self):
         self.table.setSortingEnabled(False)
         self.table.setRowCount(0)
-        self.btn_refresh.setEnabled(False)
+        # Removed btn_refresh.setEnabled(False)
         
-        self.scanner = SpaceScannerThread(self.db_path, self.scan_roots, self)
+        huge_bytes = getattr(self, 'huge_threshold_mb', 500) * 1024 * 1024
+        self.scanner = SpaceScannerThread(self.db_path, self.scan_roots, huge_bytes, self)
         self.scanner.found.connect(self._add_row)
         
         self.prog_dlg = QProgressDialog(f"Scanning directories...", "Cancel", 0, 100, self)
@@ -3506,34 +4660,47 @@ class SpaceAnalyzerDialog(QDialog):
         self.prog_dlg.show()
         QApplication.processEvents()
         
-        # Correctly wire up all signals AND start the thread
         self.scanner.progress.connect(lambda v, t, txt: (self.prog_dlg.setValue(v), self.prog_dlg.setLabelText(txt)))
         self.prog_dlg.canceled.connect(self.scanner.cancel)
         self.scanner.finished_scan.connect(self.on_scan_finished)
         
-        self.scanner.start() # <--- This is what was missing!
+        self.scanner.start()
 
     def on_scan_finished(self):
         self.prog_dlg.close()
-        self.btn_refresh.setEnabled(True)
+        # Removed btn_refresh.setEnabled(True)
         self.table.setSortingEnabled(True)
+
+
+    def view_safe_files(self):
+        self.table.setSortingEnabled(False)
+        self.table.setRowCount(0)
+        cond, params = self.get_path_conditions()
+        with sqlite3.connect(self.db_path) as conn:
+            cur = conn.cursor()
+            cur.execute(f"SELECT id, name, parent_path, extension, size, modified, custom_tags, color_tag, sha256 FROM virtual_fs WHERE hash_verified=1 AND ({cond})", params)
+            for f in cur.fetchall():
+                self._add_row_with_state("🛡️ Verified Safe", f[1], f[2], f[3] or "", f[4] or 0, f[5], f[6] or "", f[7] or "", f[8] or "", f[0], Qt.Unchecked)
+        self.table.setSortingEnabled(True)
+        if self.table.rowCount() == 0: QMessageBox.information(self, "Result", "No files are currently marked as safe in these locations.")
 
     def scan_hash_duplicates(self):
         self.table.setSortingEnabled(False)
         self.table.setRowCount(0)
         cond, params = self.get_path_conditions()
-        
         with sqlite3.connect(self.db_path) as conn:
             cur = conn.cursor()
-            # FIX: Ensure Exact Hash scanner also respects intentional duplicates
             cur.execute(f"SELECT sha256, COUNT(*) as c FROM virtual_fs WHERE is_folder=0 AND in_trash=0 AND hash_verified=0 AND ({cond}) AND sha256 IS NOT NULL AND sha256 != '' GROUP BY sha256 HAVING c > 1", params)
             duplicates = cur.fetchall()
-            for sha, count in duplicates:
-                cur.execute(f"SELECT id, name, parent_path, extension, size, modified FROM virtual_fs WHERE sha256=? AND ({cond}) AND is_folder=0 AND in_trash=0 AND hash_verified=0", (sha,) + params)
-                files = cur.fetchall()
-                for idx, f in enumerate(files):
-                    chk_state = Qt.Checked if idx > 0 else Qt.Unchecked
-                    self._add_row_with_state("Exact Duplicate", f[1], f[2], f[3] or "", f[4] or 0, f[5], sha, f[0], chk_state)
+            prog = QProgressDialog("Scanning exact hashes...", "Cancel", 0, len(duplicates), self)
+            prog.setWindowModality(Qt.WindowModal); prog.show()
+            for i, (sha, count) in enumerate(duplicates):
+                if prog.wasCanceled(): break
+                prog.setValue(i); QApplication.processEvents()
+                cur.execute(f"SELECT id, name, parent_path, extension, size, modified, custom_tags, color_tag FROM virtual_fs WHERE sha256=? AND ({cond}) AND is_folder=0 AND in_trash=0 AND hash_verified=0", (sha,) + params)
+                for idx, f in enumerate(cur.fetchall()):
+                    self._add_row_with_state("Exact Duplicate", f[1], f[2], f[3] or "", f[4] or 0, f[5], f[6] or "", f[7] or "", sha, f[0], Qt.Checked if idx > 0 else Qt.Unchecked)
+            prog.close()
         self.table.setSortingEnabled(True)
         if self.table.rowCount() == 0: QMessageBox.information(self, "Result", "No exact SHA-256 duplicates found.")
 
@@ -3541,25 +4708,19 @@ class SpaceAnalyzerDialog(QDialog):
         self.table.setSortingEnabled(False)
         self.table.setRowCount(0)
         cond, params = self.get_path_conditions()
-        
         with sqlite3.connect(self.db_path) as conn:
             cur = conn.cursor()
-            # Find files with the exact same name but different hashes (Modified versions)
-            cur.execute(f"""
-                SELECT name FROM virtual_fs 
-                WHERE is_folder=0 AND in_trash=0 AND ({cond}) AND sha256 IS NOT NULL AND sha256 != '' AND hash_verified=0
-                GROUP BY name HAVING COUNT(DISTINCT sha256) > 1
-            """, params)
+            cur.execute(f"SELECT name FROM virtual_fs WHERE is_folder=0 AND in_trash=0 AND ({cond}) AND sha256 IS NOT NULL AND sha256 != '' AND hash_verified=0 GROUP BY name HAVING COUNT(DISTINCT sha256) > 1", params)
             names = cur.fetchall()
-            for (name,) in names:
-                cur.execute(f"SELECT id, name, parent_path, extension, size, modified, sha256 FROM virtual_fs WHERE name=? AND ({cond}) AND is_folder=0 AND in_trash=0 AND sha256 IS NOT NULL AND hash_verified=0 ORDER BY modified DESC", (name,) + params)
-                files = cur.fetchall()
-                for idx, f in enumerate(files):
-                    # Leave the newest file (index 0) unchecked, check the older versions for deletion
-                    chk_state = Qt.Unchecked if idx == 0 else Qt.Checked
-                    tag = "📝 Latest Version" if idx == 0 else "🕰️ Older Version"
-                    self._add_row_with_state(tag, f[1], f[2], f[3] or "", f[4] or 0, f[5], f[6] or "", f[0], chk_state)
-                    
+            prog = QProgressDialog("Scanning version conflicts...", "Cancel", 0, len(names), self)
+            prog.setWindowModality(Qt.WindowModal); prog.show()
+            for i, (name,) in enumerate(names):
+                if prog.wasCanceled(): break
+                prog.setValue(i); QApplication.processEvents()
+                cur.execute(f"SELECT id, name, parent_path, extension, size, modified, custom_tags, color_tag, sha256 FROM virtual_fs WHERE name=? AND ({cond}) AND is_folder=0 AND in_trash=0 AND sha256 IS NOT NULL AND hash_verified=0 ORDER BY modified DESC", (name,) + params)
+                for idx, f in enumerate(cur.fetchall()):
+                    self._add_row_with_state("📝 Latest Version" if idx == 0 else "🕰️ Older Version", f[1], f[2], f[3] or "", f[4] or 0, f[5], f[6] or "", f[7] or "", f[8] or "", f[0], Qt.Unchecked if idx == 0 else Qt.Checked)
+            prog.close()
         self.table.setSortingEnabled(True)
         if self.table.rowCount() == 0: QMessageBox.information(self, "Result", "No version conflicts found.")
 
@@ -3567,34 +4728,29 @@ class SpaceAnalyzerDialog(QDialog):
         self.table.setSortingEnabled(False)
         self.table.setRowCount(0)
         cond, params = self.get_path_conditions()
-        
         with sqlite3.connect(self.db_path) as conn:
             cur = conn.cursor()
-            
-            # Type A: The Metadata Paradox (Same Name, Size, and Date... but different Hash)
-            cur.execute(f"""
-                SELECT name, size, modified FROM virtual_fs 
-                WHERE is_folder=0 AND in_trash=0 AND ({cond}) AND sha256 IS NOT NULL AND sha256 != '' AND hash_verified=0
-                GROUP BY name, size, modified HAVING COUNT(DISTINCT sha256) > 1
-            """, params)
+            cur.execute(f"SELECT name, size, modified FROM virtual_fs WHERE is_folder=0 AND in_trash=0 AND ({cond}) AND sha256 IS NOT NULL AND sha256 != '' AND hash_verified=0 GROUP BY name, size, modified HAVING COUNT(DISTINCT sha256) > 1", params)
             paradoxes = cur.fetchall()
-            for name, size, modified in paradoxes:
-                cur.execute(f"SELECT id, name, parent_path, extension, size, modified, sha256 FROM virtual_fs WHERE name=? AND size=? AND modified=? AND ({cond}) AND is_folder=0 AND in_trash=0 AND hash_verified=0", (name, size, modified) + params)
+            prog = QProgressDialog("Scanning anomalies...", "Cancel", 0, len(paradoxes), self)
+            prog.setWindowModality(Qt.WindowModal); prog.show()
+            for i, (name, size, modified) in enumerate(paradoxes):
+                if prog.wasCanceled(): break
+                prog.setValue(i); QApplication.processEvents()
+                cur.execute(f"SELECT id, name, parent_path, extension, size, modified, custom_tags, color_tag, sha256 FROM virtual_fs WHERE name=? AND size=? AND modified=? AND ({cond}) AND is_folder=0 AND in_trash=0 AND hash_verified=0", (name, size, modified) + params)
                 for f in cur.fetchall():
-                    self._add_row_with_state("⚠️ Hash Paradox", f[1], f[2], f[3] or "", f[4], f[5], f[6] or "", f[0], Qt.Unchecked)
-
-            # Type B: 0-Byte Dead Files
-            cur.execute(f"SELECT id, name, parent_path, extension, size, modified, sha256 FROM virtual_fs WHERE size=0 AND is_folder=0 AND in_trash=0 AND ({cond}) AND hash_verified=0", params)
+                    self._add_row_with_state("⚠️ Hash Paradox", f[1], f[2], f[3] or "", f[4], f[5], f[6] or "", f[7] or "", f[8] or "", f[0], Qt.Unchecked)
+            prog.close()
+            cur.execute(f"SELECT id, name, parent_path, extension, size, modified, custom_tags, color_tag, sha256 FROM virtual_fs WHERE size=0 AND is_folder=0 AND in_trash=0 AND ({cond}) AND hash_verified=0", params)
             for f in cur.fetchall():
-                self._add_row_with_state("💀 0-Byte File", f[1], f[2], f[3] or "", 0, f[5], f[6] or "None", f[0], Qt.Checked)
-
+                self._add_row_with_state("💀 0-Byte File", f[1], f[2], f[3] or "", 0, f[5], f[6] or "", f[7] or "", f[8] or "None", f[0], Qt.Checked)
         self.table.setSortingEnabled(True)
         if self.table.rowCount() == 0: QMessageBox.information(self, "Result", "No corrupted or anomalous files found.")
 
-    def _add_row(self, typ, name, location, ext, size, modified, sha256, db_id):
-        self._add_row_with_state(typ, name, location, ext, size, modified, sha256, db_id, Qt.Unchecked)
+    def _add_row(self, typ, name, location, ext, size, modified, tags, color_tag, sha256, db_id):
+        self._add_row_with_state(typ, name, location, ext, size, modified, tags, color_tag, sha256, db_id, Qt.Unchecked)
 
-    def _add_row_with_state(self, typ, name, location, ext, size, modified, sha256, db_id, chk_state):
+    def _add_row_with_state(self, typ, name, location, ext, size, modified, tags, color_tag, sha256, db_id, chk_state):
         row = self.table.rowCount()
         self.table.insertRow(row)
         
@@ -3602,31 +4758,36 @@ class SpaceAnalyzerDialog(QDialog):
         chk.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
         chk.setCheckState(chk_state)
         
-        type_item = QTableWidgetItem(typ)
-        name_item = QTableWidgetItem(name)
-        loc_item = QTableWidgetItem(location)
-        ext_item = QTableWidgetItem(ext)
+        sno = QTableWidgetItem(); sno.setData(Qt.DisplayRole, row + 1)
         
-        # Leverage the custom sorting class here!
-        size_item = SizeTableWidgetItem(size or 0)
-        
-        date_item = QTableWidgetItem(str(modified))
-        hash_item = QTableWidgetItem(str(sha256))
-        id_item = QTableWidgetItem(str(db_id))
-
         self.table.setItem(row, 0, chk)
-        self.table.setItem(row, 1, type_item)
-        self.table.setItem(row, 2, name_item)
-        self.table.setItem(row, 3, loc_item)
-        self.table.setItem(row, 4, ext_item)
-        self.table.setItem(row, 5, size_item)
-        self.table.setItem(row, 6, date_item)
-        self.table.setItem(row, 7, hash_item)
-        self.table.setItem(row, 8, id_item)
-
+        self.table.setItem(row, 1, sno)
+        self.table.setItem(row, 2, QTableWidgetItem(typ))
+        self.table.setItem(row, 3, QTableWidgetItem(name))
+        self.table.setItem(row, 4, QTableWidgetItem(location))
+        self.table.setItem(row, 5, QTableWidgetItem(ext))
+        self.table.setItem(row, 6, SizeTableWidgetItem(size or 0))
+        self.table.setItem(row, 7, QTableWidgetItem(str(modified)))
+        self.table.setItem(row, 8, QTableWidgetItem(str(tags) if tags else ""))
+        self.table.setItem(row, 9, QTableWidgetItem(str(sha256) if sha256 else ""))
+        
+        id_item = QTableWidgetItem(); id_item.setData(Qt.DisplayRole, db_id)
+        self.table.setItem(row, 10, id_item)
+        
+        colors_map = {
+            "Red": QColor("#5c2121"), "Orange": QColor("#663c14"), "Gold": QColor("#5c4c21"), "Green": QColor("#215c2b"), 
+            "Cyan": QColor("#1b5e5e"), "Blue": QColor("#213c5c"), "Purple": QColor("#43215c"), "Pink": QColor("#5c2144")
+        }
+        if color_tag and color_tag in colors_map:
+            bg_brush = QBrush(colors_map[color_tag])
+            # FIX: Start at column 1 to avoid painting over the checkbox
+            for col in range(1, 11):
+                item = self.table.item(row, col)
+                if item: item.setBackground(bg_brush); item.setForeground(QBrush(QColor("white")))
+                
     def delete_selected(self):
-        # ID is at index 8
-        ids = [int(self.table.item(r, 8).text()) for r in range(self.table.rowCount()) if self.table.item(r, 0).checkState() == Qt.Checked]
+        # Column 0 is Checkbox, Column 10 is the ID
+        ids = [int(self.table.item(r, 10).text()) for r in range(self.table.rowCount()) if self.table.item(r, 0).checkState() == Qt.Checked]
         if not ids: return
         if QMessageBox.question(self, "Confirm", f"Permanently delete {len(ids)} flagged items?", QMessageBox.Yes | QMessageBox.No) == QMessageBox.Yes:
             with sqlite3.connect(self.db_path) as conn:
@@ -3641,8 +4802,7 @@ class SpaceAnalyzerDialog(QDialog):
                 self.table.removeRow(r)
                 
             QMessageBox.information(self, "Deletion Complete", f"Successfully permanently deleted {len(ids)} items from the VMan Database.")
-
-
+            
 class BulkOperationEngine(QDialog):
     def __init__(self, db_path, parent=None):
         super().__init__(parent)
@@ -3703,7 +4863,7 @@ class BulkOperationEngine(QDialog):
         self.txt_action_val = QLineEdit()
         self.txt_action_val.setPlaceholderText("Enter destination path or tag...")
         self.combo_action_color = QComboBox()
-        self.combo_action_color.addItems(["None", "Red", "Green", "Blue", "Gold"])
+        self.combo_action_color.addItems(["None", "Red", "Orange", "Gold", "Green", "Cyan", "Blue", "Purple", "Pink"])
         
         self.stack_action_val.addWidget(self.txt_action_val)
         self.stack_action_val.addWidget(self.combo_action_color)
@@ -3986,6 +5146,12 @@ class vmanVirtualManager(QMainWindow):
         self.apply_theme("Dark") 
         self.refresh_all()
         
+        # ADD THIS BLOCK to restore column sizes and visibility
+        saved_table_state = self.settings.value("main_table_state")
+        if saved_table_state:
+            self.file_table.horizontalHeader().restoreState(saved_table_state)
+            
+        
         ensure_dirs()
         ICONS_DIR.mkdir(parents=True, exist_ok=True)
         THUMBS_DIR.mkdir(parents=True, exist_ok=True)
@@ -4038,19 +5204,19 @@ class vmanVirtualManager(QMainWindow):
         if menu.exec(self.breadcrumb_scroll.mapToGlobal(pos)) == act_type:
             self.prompt_type_address()
 
-    def sys_log(self, message):
-        timestamp = datetime.now().strftime("%H:%M:%S")
-        self.log_console.appendPlainText(f"[{timestamp}] {message}")
-        self.log_console.moveCursor(QTextCursor.End)
+    def sys_log(self, message, level="INFO"):
+        if hasattr(self, 'log_dock'):
+            self.log_dock.log(message, level)
 
     def clear_cache(self): self.view_cache.clear()
 
     def _build_ui(self):
-        
+
         tb = QToolBar("Navigation")
         tb.setMovable(False)
         tb.setIconSize(QSize(20, 20))
-        self.addToolBar(tb)
+        tb.setMinimumHeight(40) 
+        self.addToolBar(Qt.TopToolBarArea, tb)
         
         self.act_back = QAction("◀", self)
         self.act_back.triggered.connect(self.nav_back)
@@ -4082,13 +5248,16 @@ class vmanVirtualManager(QMainWindow):
         act_load_ext = QAction("📂 Load DB...", self)
         act_load_ext.triggered.connect(self.load_external_db)
         
-        act_csv_lib = QAction("📚 Tag Library", self)
+        act_csv_lib = QAction("📚 Tags", self)
         act_csv_lib.setToolTip("Tag Library")
         act_csv_lib.triggered.connect(self.open_tag_library)
 
         act_set_storage = QAction("💾 Set Storage", self)
         act_set_storage.triggered.connect(self.set_storage_capacity)
 
+        self.act_search = QAction("🔍 Search", self)
+        self.act_search.triggered.connect(self.open_advanced_search)
+ 
         
         self.act_view_mode = QAction("🖼 Grid View", self)
         self.act_view_mode.triggered.connect(self.toggle_view_mode)
@@ -4109,8 +5278,9 @@ class vmanVirtualManager(QMainWindow):
         self.act_toggle_sidebar = QAction("📊 Inspector", self)
         self.act_toggle_sidebar.triggered.connect(self.toggle_sidebar)
         
-        act_toggle_log = QAction("📝 Console", self)
-        act_toggle_log.triggered.connect(lambda: self.log_dock.setVisible(not self.log_dock.isVisible()))
+        act_extra = QAction("🛠 Extra", self)
+        act_extra.setToolTip("Super User Tools: Disk Analysis, Network Center, Deep Inspector")
+        act_extra.triggered.connect(lambda: ExtraFeaturesDialog(self).exec())
         
         self.theme_combo = QComboBox()
         self.theme_combo.addItems(list(THEMES.keys()))
@@ -4128,15 +5298,17 @@ class vmanVirtualManager(QMainWindow):
         tb.addActions([act_analyzer, act_bulk_del, act_timeline, act_csv_lib, act_load_ext, act_set_storage])
         tb.addSeparator()
 
-
-        # --- ADDING THE GRID VIEW AND FAST MODE BUTTONS TO THE UI ---
-        tb.addActions([self.act_view_mode, self.act_toggle_sidebar, act_toggle_log, self.act_fast_mode])
+        # Replaced Inspector with Search, removed Fast Mode from here
+        tb.addActions([self.act_view_mode, self.act_search, act_extra])
         
         empty = QWidget()
         empty.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         tb.addWidget(empty)
         tb.addWidget(self.theme_combo)
         tb.addAction(act_help)
+        
+        # Add Fast Mode as the very last item on the right
+        tb.addAction(self.act_fast_mode)
         
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
@@ -4186,9 +5358,14 @@ class vmanVirtualManager(QMainWindow):
         self.file_table.openRequest.connect(self.open_selected)
         self.file_table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.file_table.customContextMenuRequested.connect(self.context_menu)
+        # ADD THESE TWO LINES:
+        self.file_table.horizontalHeader().setContextMenuPolicy(Qt.CustomContextMenu)
+        self.file_table.horizontalHeader().customContextMenuRequested.connect(self.show_main_header_menu)
+        
         self.view_stack.addWidget(self.file_table)
 
         self.file_grid = SandboxListView()
+        self.file_grid.setModelColumn(1)
         self.file_grid.filesDroppedOS.connect(self.on_files_dropped)
         self.file_grid.internalDrop.connect(self.execute_internal_drop)
         self.file_grid.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -4200,12 +5377,7 @@ class vmanVirtualManager(QMainWindow):
         
         vbox.addWidget(self.view_stack)
 
-        self.log_dock = QDockWidget("Live System Console", self)
-        self.log_dock.setAllowedAreas(Qt.BottomDockWidgetArea)
-        self.log_console = QPlainTextEdit()
-        self.log_console.setReadOnly(True)
-        self.log_console.setFont(QFont("Consolas", 9))
-        self.log_dock.setWidget(self.log_console)
+        self.log_dock = VManConsole(parent=self)
         self.addDockWidget(Qt.BottomDockWidgetArea, self.log_dock)
         self.log_dock.hide()
 
@@ -4282,7 +5454,7 @@ class vmanVirtualManager(QMainWindow):
         self.ed_sha.setPlaceholderText("Not Computed")
         
         self.ed_tag = QComboBox()
-        self.ed_tag.addItems(["None", "Red", "Green", "Blue", "Gold"])
+        self.ed_tag.addItems(["None", "Red", "Orange", "Gold", "Green", "Cyan", "Blue", "Purple", "Pink"])
         self.btn_save_ed = QPushButton("Apply Properties")
         self.btn_save_ed.clicked.connect(self.save_properties_editor)
         self.btn_calc_hash = QPushButton("Compute & Store SHA-256")
@@ -4365,7 +5537,7 @@ class vmanVirtualManager(QMainWindow):
         items = []
         model = self.file_table.model()
         for r in range(model.rowCount()):
-            data = model.data(model.index(r, 0), Qt.UserRole)
+            data = model.data(model.index(r, 1), Qt.UserRole)
             if data and data[0] == "file":
                 items.append(data)
         
@@ -4428,6 +5600,8 @@ class vmanVirtualManager(QMainWindow):
         QMessageBox.information(self, "Multi-Selection Properties", f"<b>Selected Items:</b> {len(items)}<br><br><b>Total Folders:</b> {folders}<br><b>Total Files:</b> {files}<br><b>Combined Size:</b> {human_size(total_size)}")
 
     def cmd_delete_physical(self, items):
+        if not items: return
+        
         safe_files_exist = False
         with sqlite3.connect(self.db.path) as conn:
             cur = conn.cursor()
@@ -4442,17 +5616,28 @@ class vmanVirtualManager(QMainWindow):
             QMessageBox.warning(self, "Protected Files", "One or more selected items are marked as 'Safe' and cannot be deleted physically.\n\nPlease unmark them in the Space Analyzer first.")
             return
 
-        warning_dlg = PhysicalDeleteWarningDialog(len(items), self)
+        # --- SMART COUNTING LOGIC ---
+        file_count = sum(1 for typ, _, _ in items if typ == "file")
+        folder_count = sum(1 for typ, _, _ in items if typ == "folder")
+        
+        msg_parts = []
+        if file_count > 0: msg_parts.append(f"{file_count} FILE(S)")
+        if folder_count > 0: msg_parts.append(f"{folder_count} FOLDER(S)")
+        target_str = " AND ".join(msg_parts)
+
+        # Call YOUR custom flashing dialog, passing the smart string
+        warning_dlg = PhysicalDeleteWarningDialog(target_str, self)
         if warning_dlg.exec() != QDialog.Accepted:
             return
         
         deleted = 0
         
-        # --- NEW: Freeze-Free Progress Dialog ---
-        prog = QProgressDialog(f"Preparing to delete {len(items)} items...", "Cancel", 0, len(items), self)
+        # --- Freeze-Free Progress Dialog ---
+        prog = QProgressDialog(f"Preparing to delete {target_str.lower()}...", "Cancel", 0, len(items), self)
         prog.setWindowTitle("Physical Deletion")
         prog.setWindowModality(Qt.WindowModal)
         prog.show()
+        
         
         with sqlite3.connect(self.db.path) as conn:
             cur = conn.cursor()
@@ -4461,7 +5646,7 @@ class vmanVirtualManager(QMainWindow):
                 if db_id == -1: continue
                 
                 # Keep UI responsive and show exactly what is being deleted
-                prog.setLabelText(f"Deleting physical data for: {path}")
+                prog.setLabelText(f"Deleting physical data for:\n{path}")
                 prog.setValue(i)
                 QApplication.processEvents()
                 
@@ -4474,7 +5659,10 @@ class vmanVirtualManager(QMainWindow):
                 for (rpath,) in real_paths:
                     if os.path.exists(rpath):
                         try:
-                            shutil.rmtree(rpath) if os.path.isdir(rpath) else os.remove(rpath)
+                            if os.path.isdir(rpath):
+                                shutil.rmtree(rpath) 
+                            else:
+                                os.remove(rpath)
                             deleted += 1
                         except Exception as e:
                             print(f"Failed to delete {rpath}: {e}")
@@ -4487,9 +5675,11 @@ class vmanVirtualManager(QMainWindow):
         prog.setValue(len(items))
         prog.close()
         
-        self.clear_cache(); self.refresh_all(); self.status.showMessage(f"Physically deleted {deleted} items from disk.")
-        QMessageBox.information(self, "Physical Deletion Complete", f"Successfully deleted {deleted} physical files directly from your Hard Drive / OS.")
-
+        self.clear_cache()
+        self.refresh_all()
+        self.status.showMessage(f"Physically deleted {deleted} items from disk.")
+        QMessageBox.information(self, "Physical Deletion Complete", f"Successfully deleted {deleted} physical items directly from your Hard Drive / OS.")
+        
     def cmd_map_parent_drive(self, item):
         db_id = item[2]
         if db_id == -1: return
@@ -4526,18 +5716,35 @@ class vmanVirtualManager(QMainWindow):
         term = text.lower()
         if self.view_stack.currentIndex() == 0:
             for row in range(self.file_table.model().rowCount()):
-                name = self.file_table.model().data(self.file_table.model().index(row, 0), Qt.DisplayRole)
+                name = self.file_table.model().data(self.file_table.model().index(row, 1), Qt.DisplayRole)
                 self.file_table.setRowHidden(row, term not in str(name).lower())
         else:
             for row in range(self.file_grid.model().rowCount()):
-                name = self.file_grid.model().data(self.file_grid.model().index(row, 0), Qt.DisplayRole)
+                name = self.file_grid.model().data(self.file_grid.model().index(row, 1), Qt.DisplayRole)
                 self.file_grid.setRowHidden(row, term not in str(name).lower())
-
+                
     def apply_theme(self, theme_name=None):
         if theme_name is None: theme_name = self.theme_combo.currentText()
-        self.setStyleSheet(THEMES.get(theme_name, THEMES["Dark"]))
+        
+        # 1. Strip the old style to prevent layout/margin caching
+        QApplication.instance().setStyleSheet("")
+        
+        # 2. Apply the new style globally to the ENTIRE app, so all dialogs (Timeline, Jobs) update instantly
+        css = THEMES.get(theme_name, THEMES["Dark"])
+        QApplication.instance().setStyleSheet(css)
+        
         self.is_dark_mode = "Light" not in theme_name
-        self.update_statistics() 
+        
+        # 3. Force the UI to repaint and flush any visual artifacts
+        self.style().unpolish(self)
+        self.style().polish(self)
+        self.update()
+        
+        self.update_statistics()
+        
+        # Update Search Window Theme instantly if it is open
+        if hasattr(self, 'search_instance') and self.search_instance:
+            self.search_instance.apply_theme()
         
     def toggle_view_mode(self):
         self.view_stack.setCurrentIndex(1 if self.view_stack.currentIndex() == 0 else 0)
@@ -4596,20 +5803,20 @@ class vmanVirtualManager(QMainWindow):
     def refresh_tree(self):
         self.folder_tree.clear()
         db_label = Path(self.active_db_path).name if self.active_db_path != str(DB_FILE) else "Main System DB"
-        sys_root = QTreeWidgetItem(self.folder_tree, [f"💽 {db_label}"]); sys_root.setData(0, Qt.UserRole, "/"); sys_root.setIcon(0, self.style().standardIcon(QStyle.SP_DirHomeIcon)); sys_root.setExpanded(True)
+        sys_root = QTreeWidgetItem(self.folder_tree, [f"{db_label}"]); sys_root.setData(0, Qt.UserRole, "/"); sys_root.setIcon(0, self.style().standardIcon(QStyle.SP_DirHomeIcon)); sys_root.setExpanded(True)
         QTreeWidgetItem(sys_root, ["⭐ Favorites"]).setData(0, Qt.UserRole, "fav://")
         QTreeWidgetItem(sys_root, ["🗑 Trash Bin"]).setData(0, Qt.UserRole, "trash://")
-        smart = QTreeWidgetItem(sys_root, ["💡 Dynamic Smart Views"]); smart.setIcon(0, self.style().standardIcon(QStyle.SP_FileDialogDetailedView)); smart.setExpanded(True)
+        smart = QTreeWidgetItem(sys_root, ["Dynamic Smart Views"]); smart.setIcon(0, self.style().standardIcon(QStyle.SP_FileDialogDetailedView)); smart.setExpanded(True)
         QTreeWidgetItem(smart, ["🏷️ By Custom Tags"]).setData(0, Qt.UserRole, "tags://")
         QTreeWidgetItem(smart, ["🗂 Stat: Year ➔ Month ➔ Folder"]).setData(0, Qt.UserRole, "y_m_f://")
         for proto, cols in SMART_PROTOCOLS.items():
             if proto == "tags://": continue
             QTreeWidgetItem(smart, [f"🗂 {' ➔ '.join([c.capitalize() for c in cols])}"]).setData(0, Qt.UserRole, proto)
-        compiled_root = QTreeWidgetItem(self.folder_tree, ["📦 Switch Database..."]); compiled_root.setIcon(0, self.style().standardIcon(QStyle.SP_DriveHDIcon)); compiled_root.setExpanded(True)
+        compiled_root = QTreeWidgetItem(self.folder_tree, ["Switch Database..."]); compiled_root.setIcon(0, self.style().standardIcon(QStyle.SP_DriveHDIcon)); compiled_root.setExpanded(True)
         if self.active_db_path != str(DB_FILE):
             node = QTreeWidgetItem(compiled_root, ["⬅ Return to Main DB"]); node.setData(0, Qt.UserRole, "db://main"); node.setIcon(0, self.style().standardIcon(QStyle.SP_ArrowBack))
         for view_db in VIEWS_DIR.glob("*.db"):
-            node = QTreeWidgetItem(compiled_root, [view_db.stem]); node.setData(0, Qt.UserRole, f"db://{view_db.name}"); node.setIcon(0, self.style().standardIcon(QStyle.SP_FileIcon))
+            node = QTreeWidgetItem(compiled_root, [view_db.stem]); node.setData(0, Qt.UserRole, f"db://{view_db.name}"); node.setIcon(0, self.style().standardIcon(QStyle.SP_DriveFDIcon))
 
     def refresh_all(self):
         self.refresh_tree()
@@ -4708,17 +5915,24 @@ class vmanVirtualManager(QMainWindow):
     def _render_chunk(self):
         if not self.render_queue:
             self.render_timer.stop()
-            # UPDATED: Expanded to 7 highly detailed columns
-            shared_model = vmanTableModel(["Name", "Ext", "Size", "Modified", "Type", "Location", "Tag"], self.table_rows_buffer)
-            self.file_table.setModel(shared_model); self.file_grid.setModel(shared_model)
+            # 1. ADD S.No. to the headers
+            shared_model = vmanTableModel(["S.No.", "Name", "Ext", "Size", "Modified", "Type", "Location", "Labels"], self.table_rows_buffer)
             
-            # Adjusted column widths for the new data
-            self.file_table.setColumnWidth(0, 260) # Name
-            self.file_table.setColumnWidth(1, 60)  # Ext
-            self.file_table.setColumnWidth(2, 90)  # Size
-            self.file_table.setColumnWidth(3, 140) # Modified
-            self.file_table.setColumnWidth(4, 120) # Type
-            self.file_table.setColumnWidth(5, 350) # Location
+            # 2. Assign the model to both views
+            self.file_table.setModel(shared_model)
+            self.file_grid.setModel(shared_model)
+            
+            # ---> FIX: Force Grid View back to Column 1 immediately after setting the new model!
+            self.file_grid.setModelColumn(1)
+            
+            # 3. Adjust widths for the new 8-column layout
+            self.file_table.setColumnWidth(0, 50)  # S.No.
+            self.file_table.setColumnWidth(1, 260) # Name
+            self.file_table.setColumnWidth(2, 60)  # Ext
+            self.file_table.setColumnWidth(3, 90)  # Size
+            self.file_table.setColumnWidth(4, 140) # Modified
+            self.file_table.setColumnWidth(5, 120) # Type
+            self.file_table.setColumnWidth(6, 350) # Location
             
             self.file_table.setUpdatesEnabled(True); self.file_grid.setUpdatesEnabled(True)
             if self.render_progress: self.render_progress.close()
@@ -4729,14 +5943,23 @@ class vmanVirtualManager(QMainWindow):
 
         chunk = self.render_queue[:CHUNK_SIZE]; self.render_queue = self.render_queue[CHUNK_SIZE:]
         dir_icon = self.style().standardIcon(QStyle.SP_DirIcon)
+        
+        cur = self.db.conn.cursor()
 
         for item in chunk:
+            db_id = item[0]
+            tags_res = cur.execute("SELECT custom_tags FROM virtual_fs WHERE id=?", (db_id,)).fetchone()
+            t_str = tags_res[0] if tags_res and tags_res[0] else ""
+
+            # Calculate Serial Number
+            s_no = len(self.table_rows_buffer) + 1
+
             if len(item) == 8:
                 db_id, pp, f_name, c_tag, sec_n, is_h, count, size = item
                 v_path = f"{pp}{f_name}/" if not f_name.endswith("/") else f"{pp}{f_name}"
                 disp_name = sec_n if (self.show_secondary_names and sec_n) else (f"{f_name}\n({sec_n})" if sec_n else f"{f_name}")
                 
-                self.table_rows_buffer.append({"display": [disp_name, "", human_size(size), "N/A", f"Virtual Folder ({count})", pp, c_tag], "sort_keys": [(0, natural_sort_key(f_name)), (0, ""), (0, size), (0, ""), (0, count), (0, natural_sort_key(pp)), (0, c_tag)], "user_data": ("folder", v_path, db_id), "color_tag": c_tag, "is_hidden": is_h, "icon": dir_icon})
+                self.table_rows_buffer.append({"display": [str(s_no), disp_name, "", human_size(size), "N/A", f"Virtual Folder ({count})", pp, t_str], "sort_keys": [(0, s_no), (0, natural_sort_key(f_name)), (0, ""), (0, size), (0, ""), (0, count), (0, natural_sort_key(pp)), (0, t_str)], "user_data": ("folder", v_path, db_id), "color_tag": c_tag, "is_hidden": is_h, "icon": dir_icon})
             else:
                 db_id, n, s, ext, rp, mod, c_tag, sec_n, is_h = item[:9]
                 icon = self._get_native_icon(rp, False, ext, db_id)
@@ -4744,30 +5967,33 @@ class vmanVirtualManager(QMainWindow):
                 ext_str = str(ext) if ext else ""
                 disp_name = sec_n if (self.show_secondary_names and sec_n) else (f"{n}\n({sec_n})" if sec_n else f"{n}")
                 
-                # Replace the file append
-                self.table_rows_buffer.append({"display": [disp_name, ext_str, human_size(s_val), str(mod), "Virtual File", str(rp) if rp else "", c_tag], "sort_keys": [(1, natural_sort_key(n)), (1, ext_str.lower()), (1, s_val), (1, str(mod)), (1, "Virtual File"), (1, natural_sort_key(rp) if rp else ""), (1, c_tag)], "user_data": ("file", str(rp), db_id), "color_tag": c_tag, "is_hidden": is_h, "icon": icon})
+                self.table_rows_buffer.append({"display": [str(s_no), disp_name, ext_str, human_size(s_val), str(mod), "Virtual File", str(rp) if rp else "", t_str], "sort_keys": [(1, s_no), (1, natural_sort_key(n)), (1, ext_str.lower()), (1, s_val), (1, str(mod)), (1, "Virtual File"), (1, natural_sort_key(rp) if rp else ""), (1, t_str)], "user_data": ("file", str(rp), db_id), "color_tag": c_tag, "is_hidden": is_h, "icon": icon})
 
         if self.render_progress: self.render_progress.setValue(self.render_progress.maximum() - len(self.render_queue))
-
+        
     def _trigger_preview(self, typ, path, db_id, name):
         if db_id == -1: return 
         self.btn_save_ed.setProperty("db_id", db_id); self.btn_save_ed.setProperty("is_folder", typ == "folder")
         if HAS_MULTIMEDIA and hasattr(self, 'player'): self.player.stop()
         self.preview_image.clear(); self.preview_text.clear()
         
-        row = self.db.conn.cursor().execute("SELECT real_path, size, extension, modified, secondary_name, custom_tags, sha256 FROM virtual_fs WHERE id = ?", (db_id,)).fetchone()
+        # 1. Fetch parent_path and name to build the EXACT Virtual Path
+        row = self.db.conn.cursor().execute("SELECT parent_path, name, real_path, size, extension, modified, secondary_name, custom_tags, sha256 FROM virtual_fs WHERE id = ?", (db_id,)).fetchone()
         if not row: return
-        real_path, size, ext, mod, sec_n, custom_tags, sha256_val = row
+        parent_path, f_name, real_path, size, ext, mod, sec_n, custom_tags, sha256_val = row
         
-        self.ed_v_path.setText(path) # -> FIXED: Virtual path is now populated!
+        # 2. Construct the true Virtual Path so you can copy-paste it
+        actual_v_path = f"{parent_path}{f_name}/" if typ == "folder" else f"{parent_path}{f_name}"
+        self.ed_v_path.setText(actual_v_path)
+        
         self.ed_secondary.setText(str(sec_n) if sec_n else "")
         self.ed_custom_tags.setText(str(custom_tags) if custom_tags else "")
         self.ed_sha.setText(str(sha256_val) if sha256_val else "")
         
         if typ == "folder": 
             self.preview_stack.setCurrentIndex(1)
-            self.ed_target.setText(f"Virtual Container: {path}")
-            self.preview_text.setPlainText(f"Directory Data:\n{path}")
+            self.ed_target.setText(f"Virtual Container: {actual_v_path}")
+            self.preview_text.setPlainText(f"Directory Data:\n{actual_v_path}")
             self.btn_calc_hash.setEnabled(False)
             return
             
@@ -4789,17 +6015,17 @@ class vmanVirtualManager(QMainWindow):
                 self.preview_stack.setCurrentIndex(1); self.preview_text.setPlainText(f"File: {name}\nTarget: {real_path}\nSize: {human_size(size)}\nModified: {mod}")
         else: 
             self.preview_stack.setCurrentIndex(1); self.preview_text.setPlainText(f"Virtual File: {name}\nDisconnected or missing local file.")
-
+            
     def on_image_loaded(self, path, image):
         if image and not image.isNull() and image.width() > 0: self.preview_image.setPixmap(QPixmap.fromImage(image))
         else: self.preview_image.clear(); self.preview_text.setPlainText("Image preview failed to load."); self.preview_stack.setCurrentIndex(1)
 
     def on_file_click(self, index: QModelIndex):
-        if self.file_table.model() and self.file_table.model().data(self.file_table.model().index(index.row(), 0), Qt.UserRole):
-            data = self.file_table.model().data(self.file_table.model().index(index.row(), 0), Qt.UserRole)
+        if self.file_table.model() and self.file_table.model().data(self.file_table.model().index(index.row(), 1), Qt.UserRole):
+            data = self.file_table.model().data(self.file_table.model().index(index.row(), 1), Qt.UserRole)
             if data[2] == -1: return 
-            name = self.file_table.model().data(self.file_table.model().index(index.row(), 0), Qt.DisplayRole)
-            self.ed_name.setText(str(name).split('\n')[0]); self.ed_tag.setCurrentIndex(max(0, self.ed_tag.findText(self.file_table.model().data(self.file_table.model().index(index.row(), 0), Qt.UserRole + 1))))
+            name = self.file_table.model().data(self.file_table.model().index(index.row(), 1), Qt.DisplayRole)
+            self.ed_name.setText(str(name).split('\n')[0]); self.ed_tag.setCurrentIndex(max(0, self.ed_tag.findText(self.file_table.model().data(self.file_table.model().index(index.row(), 1), Qt.UserRole + 1))))
             self._trigger_preview(data[0], data[1], data[2], name)
 
     def on_grid_click(self, index: QModelIndex):
@@ -4879,11 +6105,11 @@ class vmanVirtualManager(QMainWindow):
         playlist, start_index = [], 0
         model = self.file_table.model()
         for r in range(model.rowCount()):
-            data = model.data(model.index(r, 0), Qt.UserRole); name = model.data(model.index(r, 0), Qt.DisplayRole)
+            data = model.data(model.index(r, 1), Qt.UserRole); name = model.data(model.index(r, 1), Qt.DisplayRole)
             if data and data[0] == "file" and data[1] and os.path.exists(data[1]):
                 playlist.append({'path': data[1], 'name': name.split('\n')[0], 'ext': os.path.splitext(data[1])[1].lower()})
                 if data[2] == target_db_id: start_index = len(playlist) - 1
-
+                
         # Launch a new viewer and store it in the active list to allow multiple windows
         new_viewer = vmanViewer(playlist, start_index, self)
         if not hasattr(self, 'active_viewers'): self.active_viewers = []
@@ -4958,15 +6184,21 @@ class vmanVirtualManager(QMainWindow):
         items_to_export = self._get_selected_items()
         if not items_to_export:
             model = self.file_table.model()
-            for r in range(model.rowCount()): items_to_export.append(model.data(model.index(r, 0), Qt.UserRole))
-
+            for r in range(model.rowCount()): items_to_export.append(model.data(model.index(r, 1), Qt.UserRole))
+            
         if not items_to_export: return QMessageBox.warning(self, "Export", "The current view is empty.")
             
-        dest_dir = QFileDialog.getExistingDirectory(self, "Select OS Destination to Materialize")
+        # Using the Smart Collision Checker
+        dest_dir = self._get_export_dest_with_check(items_to_export, "Select OS Destination to Materialize")
         if not dest_dir: return
         
         self.export_dlg = QProgressDialog(f"Materializing {len(items_to_export)} selections to physical OS...", "Cancel", 0, len(items_to_export), self)
-        self.export_dlg.setWindowModality(Qt.WindowModal); self.export_dlg.show()
+        self.export_dlg.setWindowTitle("Exporting to OS")
+        self.export_dlg.setFixedSize(600, 160)
+        label = self.export_dlg.findChild(QLabel)
+        if label: label.setWordWrap(True)
+        self.export_dlg.setWindowModality(Qt.WindowModal)
+        self.export_dlg.show()
         
         self.mat_thread = MaterializeThread(str(self.db.path), items_to_export, dest_dir, self)
         self.mat_thread.progress.connect(lambda c,t,m: (self.export_dlg.setValue(int((c/max(1,t))*100)), self.export_dlg.setLabelText(m)))
@@ -4974,7 +6206,7 @@ class vmanVirtualManager(QMainWindow):
         self.mat_thread.finished.connect(lambda p: (self.export_dlg.close(), QMessageBox.information(self, "Success", f"Structure materialized at:\n{p}"), self.sys_log("Materialized Virtual Structure to OS.")))
         self.mat_thread.error.connect(lambda e: (self.export_dlg.close(), QMessageBox.critical(self, "Error", f"Failed:\n{e}")))
         self._register_worker(self.mat_thread); self.mat_thread.start()
-
+        
     def export_csv(self, sel_items):
         csv_path, _ = QFileDialog.getSaveFileName(self, "Export Rich CSV Manifest", "", "CSV Files (*.csv)")
         if not csv_path: return
@@ -5010,8 +6242,20 @@ class vmanVirtualManager(QMainWindow):
 
     def _get_selected_items(self):
         if self.view_stack.currentIndex() == 0:
-            return [self.file_table.model().data(self.file_table.model().index(idx.row(), 0), Qt.UserRole) for idx in self.file_table.selectionModel().selectedRows() if self.file_table.model().data(self.file_table.model().index(idx.row(), 0), Qt.UserRole)]
+            return [self.file_table.model().data(self.file_table.model().index(idx.row(), 1), Qt.UserRole) for idx in self.file_table.selectionModel().selectedRows() if self.file_table.model().data(self.file_table.model().index(idx.row(), 1), Qt.UserRole)]
         return [self.file_grid.model().data(idx, Qt.UserRole) for idx in self.file_grid.selectionModel().selectedIndexes() if self.file_grid.model().data(idx, Qt.UserRole)]
+        
+    def show_main_header_menu(self, pos):
+        menu = QMenu(self)
+        for col in range(self.file_table.horizontalHeader().count()):
+            col_name = self.file_table.model().headerData(col, Qt.Horizontal)
+            if col_name:
+                action = menu.addAction(f"Show {col_name}")
+                action.setCheckable(True)
+                action.setChecked(not self.file_table.isColumnHidden(col))
+                action.toggled.connect(lambda checked, c=col: self.file_table.setColumnHidden(c, not checked))
+                
+        menu.exec(self.file_table.horizontalHeader().mapToGlobal(pos))
 
     def context_menu(self, pos, is_grid=False):
         menu = QMenu(self)
@@ -5054,8 +6298,9 @@ class vmanVirtualManager(QMainWindow):
                     open_menu.addAction("🚀 Open Native System App", lambda: self.open_local_file_system(sel_items[0][2]))
                     open_menu.addAction("📂 Show in OS Explorer", lambda: self.open_file_location(sel_items[0][2]))
                     open_menu.addAction("🎞 Open in vman Viewer (Ctrl+O)", self.open_selected_vman)
-                open_menu.addAction("📋 Copy Virtual Path", lambda: QApplication.clipboard().setText(sel_items[0][1]))
-            
+                
+                open_menu.addAction("📋 Copy Virtual Path", lambda: self.copy_vpath_to_clipboard(sel_items[0][2], sel_items[0][0]))
+                
             # --- CLIPBOARD ---
             menu.addAction("Copy (Ctrl+C)", self.cmd_copy)
             menu.addAction("Cut (Ctrl+X)", self.cmd_cut)
@@ -5075,7 +6320,7 @@ class vmanVirtualManager(QMainWindow):
             # --- TAGS ---
             tag_menu = menu.addMenu("🏷 Tags & Labels")
             color_menu = tag_menu.addMenu("🎨 Set Color Tag")
-            for color in ["None", "Red", "Green", "Blue", "Gold"]: 
+            for color in ["None", "Red", "Orange", "Gold", "Green", "Cyan", "Blue", "Purple", "Pink"]: 
                 color_menu.addAction(color, lambda checked=False, c=color: self.bulk_tag_items(c, sel_items))
             tag_menu.addAction("📝 Bulk Add Custom Tags...", lambda: self.bulk_add_custom_tags(sel_items))
 
@@ -5092,7 +6337,9 @@ class vmanVirtualManager(QMainWindow):
             export_menu = menu.addMenu("📤 Export & Extract")
             export_menu.addAction(f"💾 Materialize {len(sel_items)} Items to OS", lambda: self.materialize_to_os(sel_items))
             export_menu.addAction(f"📤 Export {len(sel_items)} Items to OS Location...", self.export_virtual_to_os)
-            export_menu.addAction("📦 Export Selected to ZIP...", lambda: self.export_to_zip(sel_items))
+            export_menu.addAction("📦 Create Dummy (Sparse) Replica of Selected...", lambda: self.export_dummy_replica(sel_items))
+            export_menu.addAction("📄 Create Zero-Byte Replica of Selected...", lambda: self.export_zero_byte_replica(sel_items))
+            export_menu.addAction("🗜️ Export Selected to ZIP...", lambda: self.export_to_zip(sel_items))
             export_menu.addAction("📊 Export View to CSV", lambda: self.export_csv(sel_items))
             
             # --- PROPERTIES ---
@@ -5122,6 +6369,13 @@ class vmanVirtualManager(QMainWindow):
         
         menu.addAction("⚙️ Compile View to Isolated DB", self.compile_current_view)
 
+        # --- WINDOW VIEWS ---
+        menu.addSeparator()
+        view_menu = menu.addMenu("🖥️ Window Views")
+        view_menu.addAction("📝 Toggle Console", lambda: self.log_dock.setVisible(not self.log_dock.isVisible()))
+        view_menu.addAction("🗂️ Toggle Data Engine View", lambda: self.tree_dock.setVisible(not self.tree_dock.isVisible()))
+        view_menu.addAction("📊 Toggle Inspector", lambda: self.right_dock.setVisible(not self.right_dock.isVisible()))
+        
         # 5. Paste Action (Always available if conditions met)
         act_paste = QAction("📋 Paste (Ctrl+V)", self)
         act_paste.triggered.connect(self.cmd_paste)
@@ -5159,6 +6413,19 @@ class vmanVirtualManager(QMainWindow):
                 cur.execute("UPDATE virtual_fs SET custom_tags = ? WHERE id = ?", (new_val, db_id))
             conn.commit()
         self.clear_cache(); self.load_directory(self.current_prefix); self.sys_log(f"Bulk applied custom tags '{tags}' to {len(sel_items)} items.")
+
+    def copy_vpath_to_clipboard(self, db_id, typ):
+        if db_id == -1: return
+        try:
+            with sqlite3.connect(self.db.path) as conn:
+                res = conn.cursor().execute("SELECT parent_path, name FROM virtual_fs WHERE id=?", (db_id,)).fetchone()
+                if res:
+                    # Constructs the perfect 100% accurate virtual path
+                    v_path = f"{res[0]}{res[1]}/" if typ == "folder" else f"{res[0]}{res[1]}"
+                    QApplication.clipboard().setText(v_path)
+                    self.status.showMessage("Virtual path copied to clipboard.", 3000)
+        except Exception as e:
+            QMessageBox.warning(self, "Copy Error", str(e))
 
     def cmd_copy(self):
         items = self._get_selected_items()
@@ -5501,14 +6768,21 @@ class vmanVirtualManager(QMainWindow):
     def export_to_zip(self, items_to_export):
         zip_path, _ = QFileDialog.getSaveFileName(self, "Compile to ZIP", "", "ZIP Files (*.zip)")
         if zip_path:
-            self.export_dlg = QProgressDialog("Compiling ZIP...", "Cancel", 0, 100, self); self.export_dlg.setWindowModality(Qt.WindowModal); self.export_dlg.show()
+            self.export_dlg = QProgressDialog("Compiling ZIP...", "Cancel", 0, 100, self)
+            self.export_dlg.setWindowTitle("Exporting to ZIP")
+            self.export_dlg.setFixedSize(600, 160)
+            label = self.export_dlg.findChild(QLabel)
+            if label: label.setWordWrap(True)
+            self.export_dlg.setWindowModality(Qt.WindowModal)
+            self.export_dlg.show()
+            
             self.zip_thread = ExportZipThread(str(self.db.path), items_to_export, zip_path, self)
             self.zip_thread.progress.connect(lambda c,t,m: self.export_dlg.setValue(int((c/max(1,t))*100)) if self.export_dlg else None)
             self.export_dlg.canceled.connect(self.zip_thread.cancel)
             self.zip_thread.finished.connect(lambda p: (self.export_dlg.close() if self.export_dlg else None, QMessageBox.information(self, "Success", f"ZIP created:\n{p}"), self.sys_log(f"Exported View to Zip: {Path(p).name}")))
             self.zip_thread.error.connect(lambda e: (self.export_dlg.close() if self.export_dlg else None, QMessageBox.critical(self, "Error", f"Failed:\n{e}")))
             self._register_worker(self.zip_thread); self.zip_thread.start()
-
+            
     def _register_worker(self, worker: QThread): 
         self._workers.append(worker); worker.finished.connect(lambda: self._cleanup_worker(worker))
         
@@ -5517,6 +6791,9 @@ class vmanVirtualManager(QMainWindow):
         except Exception: pass
 
     def closeEvent(self, ev):
+        # Save columns mathematically before exiting
+        self.settings.setValue("main_table_state", self.file_table.horizontalHeader().saveState())
+        
         if HAS_MULTIMEDIA and hasattr(self, 'player'): self.player.stop()
         if self.render_timer.isActive(): self.render_timer.stop()
         for w in list(self._workers):
@@ -5704,23 +6981,210 @@ class vmanVirtualManager(QMainWindow):
                 
     def materialize_to_os(self, items):
         if not items: return
-        dest_dir = QFileDialog.getExistingDirectory(self, "Select Physical OS Destination")
+        
+        # Using the Smart Collision Checker
+        dest_dir = self._get_export_dest_with_check(items, "Select Physical OS Destination")
         if not dest_dir: return
 
         self.mat_dlg = QProgressDialog("Analyzing structure for export...", "Cancel", 0, 100, self)
-        self.mat_dlg.setWindowModality(Qt.WindowModal); self.mat_dlg.show()
+        self.mat_dlg.setWindowTitle("Materializing Files")
+        self.mat_dlg.setFixedSize(600, 160)
+        label = self.mat_dlg.findChild(QLabel)
+        if label: label.setWordWrap(True)
+        self.mat_dlg.setWindowModality(Qt.WindowModal)
+        self.mat_dlg.show()
 
         self.mat_thread = MaterializeThread(self.active_db_path, items, dest_dir, self)
         self.mat_thread.progress.connect(lambda v, t, m: (self.mat_dlg.setMaximum(t), self.mat_dlg.setValue(v), self.mat_dlg.setLabelText(m)))
         self.mat_dlg.canceled.connect(self.mat_thread.cancel)
         self.mat_thread.finished.connect(lambda count: (self.mat_dlg.close(), QMessageBox.information(self, "Materialize Complete", f"Successfully exported {count} files to the OS.")))
         self.mat_thread.error.connect(lambda err: (self.mat_dlg.close(), QMessageBox.warning(self, "Export Error", err)))
-        self._register_worker(self.mat_thread); self.mat_thread.start()                
+        self._register_worker(self.mat_thread); self.mat_thread.start()
+        
+    def _get_export_dest_with_check(self, items, title):
+        """Asks for destination and checks if files/folders already exist to prevent blind overwrites."""
+        while True:
+            dest_dir = QFileDialog.getExistingDirectory(self, title)
+            if not dest_dir: return None
+            
+            collision = False
+            with sqlite3.connect(self.active_db_path) as conn:
+                for typ, path_val, db_id in items:
+                    base_name = ""
+                    if typ == "folder":
+                        base_name = path_val.strip('/').split('/')[-1] if path_val.strip('/') else ""
+                    elif db_id != -1:
+                        res = conn.execute("SELECT name FROM virtual_fs WHERE id=?", (db_id,)).fetchone()
+                        if res: base_name = res[0]
+                    
+                    if base_name:
+                        safe_name = re.sub(r'[\\/*?:"<>|]', '_', str(base_name))
+                        if os.path.exists(os.path.join(dest_dir, safe_name)):
+                            collision = True
+                            break
+                            
+            if collision:
+                msg = QMessageBox(self)
+                msg.setIcon(QMessageBox.Warning)
+                msg.setWindowTitle("Overwrite Warning")
+                msg.setText(f"One or more items already exist in:\n{dest_dir}")
+                msg.setInformativeText("Do you want to OVERWRITE them, or choose another location?")
                 
+                btn_over = msg.addButton("Overwrite", QMessageBox.AcceptRole)
+                btn_another = msg.addButton("Choose Another Location", QMessageBox.ActionRole)
+                msg.addButton("Cancel", QMessageBox.RejectRole)
+                msg.exec()
+                
+                if msg.clickedButton() == btn_over:
+                    return dest_dir       # User chose to overwrite
+                elif msg.clickedButton() == btn_another:
+                    continue              # Loops back to open the folder picker again
+                else:
+                    return None           # User clicked Cancel
+            else:
+                return dest_dir           # No collision, safe to proceed
+                
+    def export_dummy_replica(self, items):
+        if not items: return
+        # Using the new smart checker that prompts on collision!
+        dest_dir = self._get_export_dest_with_check(items, "Select Physical OS Destination for Dummy Replicas")
+        if not dest_dir: return
+        
+
+        # --- FILESYSTEM SPARSE SUPPORT TEST ---
+        # We must ensure the drive supports sparse files to prevent massive SSD wear.
+        test_file = Path(dest_dir) / ".vman_sparse_test.tmp"
+        sparse_supported = True
+        fail_reason = "Unknown Error"
+
+        try:
+            if sys.platform == "win32":
+                with open(test_file, "wb") as f: pass
+                # Attempt to set sparse flag. Will fail on FAT32/exFAT.
+                res = subprocess.run(["fsutil", "sparse", "setflag", str(test_file)], capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW)
+                if res.returncode != 0:
+                    sparse_supported = False
+                    fail_reason = "Your target drive format (e.g., FAT32 or exFAT) does not support Windows Sparse Files."
+            else:
+                # Unix/Mac Test: Truncate to 50MB and check if OS wrote physical sectors.
+                with open(test_file, "wb") as f: f.truncate(50 * 1024 * 1024)
+                st = os.stat(test_file)
+                # st_blocks represents physical 512-byte blocks. If it allocated more than 1000 blocks, it's writing zeros!
+                if hasattr(st, 'st_blocks') and st.st_blocks > 1000:
+                    sparse_supported = False
+                    fail_reason = "Your target drive format does not support native sparse files. Continuing would cause extreme SSD wear."
+        except Exception as e:
+            sparse_supported = False
+            fail_reason = f"System test failed: {str(e)}"
+        finally:
+            if test_file.exists(): test_file.unlink()
+
+        # If it fails, give the user the exact reason and abort.
+        # --- FILESYSTEM SPARSE SUPPORT TEST ---
+        if not sparse_supported:
+            msg = f"Cannot create Dummy Replicas here.\n\nREASON: {fail_reason}\n\nPlease select an NTFS drive (Windows) or APFS/ext4 drive (Mac/Linux) to safely create these fake files without SSD wear.\n\nAlternatively, use the 'Create Zero-Byte Replica' option."
+            QMessageBox.warning(self, "Unsupported Filesystem", msg)
+            return
+
+        # --- UPDATED PROGRESS DIALOG (FIXED SIZE & WORD WRAP) ---
+        self.mat_dlg = QProgressDialog("Analyzing structure for sparse replication...", "Cancel", 0, 100, self)
+        self.mat_dlg.setWindowTitle("Creating Dummy Replicas")
+        
+        # 1. Lock the size so it NEVER shape-shifts
+        self.mat_dlg.setFixedSize(600, 160)
+        
+        # 2. Force the internal label to wrap long file paths to the next line
+        label = self.mat_dlg.findChild(QLabel)
+        if label:
+            label.setWordWrap(True)
+            
+        self.mat_dlg.setWindowModality(Qt.WindowModal)
+        self.mat_dlg.show()
+
+        self.dummy_rep_thread = DummyReplicaThread(self.active_db_path, items, dest_dir, zero_byte_mode=False, parent=self)
+        self.dummy_rep_thread.progress.connect(lambda v, t, m: (self.mat_dlg.setMaximum(t), self.mat_dlg.setValue(v), self.mat_dlg.setLabelText(m)))
+        self.mat_dlg.canceled.connect(self.dummy_rep_thread.cancel)
+        self.dummy_rep_thread.finished.connect(lambda count: (self.mat_dlg.close(), QMessageBox.information(self, "Replica Complete", f"Successfully created {count} zero-space sparse file replicas."), self.sys_log(f"Created Dummy Replicas for {count} files.")))
+        self.dummy_rep_thread.error.connect(lambda err: (self.mat_dlg.close(), QMessageBox.warning(self, "Replica Error", err)))
+        self._register_worker(self.dummy_rep_thread)
+        self.dummy_rep_thread.start()
+    
+    def export_zero_byte_replica(self, items):
+        if not items: return
+        # Using the new smart checker that prompts on collision!
+        dest_dir = self._get_export_dest_with_check(items, "Select Physical OS Destination for 0-Byte Replicas")
+        if not dest_dir: return
+
+        # --- UPDATED PROGRESS DIALOG (FIXED SIZE & WORD WRAP) ---
+        self.mat_dlg = QProgressDialog("Creating 0-byte structural replica...", "Cancel", 0, 100, self)
+        self.mat_dlg.setWindowTitle("Creating Zero-Byte Replicas")
+        
+        # 1. Lock the size so it NEVER shape-shifts
+        self.mat_dlg.setFixedSize(600, 160)
+        
+        # 2. Force the internal label to wrap long file paths to the next line
+        label = self.mat_dlg.findChild(QLabel)
+        if label:
+            label.setWordWrap(True)
+            
+        self.mat_dlg.setWindowModality(Qt.WindowModal)
+        self.mat_dlg.show()
+
+        # Note the zero_byte_mode=True flag
+        self.dummy_rep_thread = DummyReplicaThread(self.active_db_path, items, dest_dir, zero_byte_mode=True, parent=self)
+        self.dummy_rep_thread.progress.connect(lambda v, t, m: (self.mat_dlg.setMaximum(t), self.mat_dlg.setValue(v), self.mat_dlg.setLabelText(m)))
+        self.mat_dlg.canceled.connect(self.dummy_rep_thread.cancel)
+        self.dummy_rep_thread.finished.connect(lambda count: (self.mat_dlg.close(), QMessageBox.information(self, "Replica Complete", f"Successfully created {count} zero-byte files."), self.sys_log(f"Created Zero-Byte Replicas for {count} files.")))
+        self.dummy_rep_thread.error.connect(lambda err: (self.mat_dlg.close(), QMessageBox.warning(self, "Replica Error", err)))
+        self._register_worker(self.dummy_rep_thread)
+        self.dummy_rep_thread.start()  
+ 
+    def open_advanced_search(self):
+        from search import AdvancedSearchWindow
+        
+        # Require an active database to search
+        if not hasattr(self, 'active_db_path') or not self.active_db_path:
+            return QMessageBox.warning(self, "No Database", "Please load a database first.")
+            
+        # Create or update the Window
+        if not hasattr(self, 'search_instance') or self.search_instance is None:
+            self.search_instance = AdvancedSearchWindow(self.active_db_path, self)
+        else:
+            self.search_instance.active_db = self.active_db_path
+            
+        # Display Window
+        self.search_instance.show()
+        self.search_instance.raise_()
+        self.search_instance.activateWindow()
         
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     app.setApplicationName(APP_TITLE)
     win = vmanVirtualManager()
+   
+    
+    #------splash----
+    # 2. Initialize and show the splash screen
+    splash = PremiumSplash()
+    splash.start_fade_in()
+    
+    # Optional: If you want to show it loading for a couple of seconds visually
+    splash.update_text("Booting Core Engine...")
+    app.processEvents()
+    time.sleep(0.5) 
+    
+    splash.update_text("Loading Databases...")
+    app.processEvents()
+    time.sleep(0.5)
+
+    splash.update_text("Starting UI...")
+    app.processEvents()
+
+    # 3. Initialize your main window
+    win = vmanVirtualManager()
+    splash.start_fade_out()
+    #------splash----
+    
+    
     win.show()
     sys.exit(app.exec())
