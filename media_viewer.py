@@ -1336,6 +1336,9 @@ class vmanViewer(QDialog):
             self.player.positionChanged.connect(self._check_loop)
             self.player.positionChanged.connect(lambda pos: self.wave_vis.update_pos(pos, self.player.duration()))
             
+            # FIX: Hook into media status to trigger auto-play
+            self.player.mediaStatusChanged.connect(self._on_media_status_changed)
+            
         self.stack.addWidget(self.media_container) # 3
         self.stack.addWidget(self.vert_view)       # 4
         self.stack.addWidget(self.md_view)         # 5
@@ -1392,6 +1395,7 @@ class vmanViewer(QDialog):
         self.btn_cp_repeat = QPushButton("🔁") 
         self.btn_cp_repeat.setCheckable(True) 
         self.btn_cp_shuffle = QPushButton("🔀")
+        self.btn_cp_shuffle.setCheckable(True) # FIX: Make button stateful
         
         # NEW: Dedicated Zoom buttons replacing Shuffle/Repeat for Images
         self.btn_cp_z_in = QPushButton("🔍+")
@@ -1401,8 +1405,8 @@ class vmanViewer(QDialog):
         self.btn_cp_flip.clicked.connect(self._flip_img_horiz)
         self.btn_cp_rot.clicked.connect(self._rot_img_cw)
         self.btn_cp_ab.clicked.connect(self._set_ab_loop)
-        self.btn_cp_shuffle.clicked.connect(self._shuffle_current_playlist) 
-        if HAS_MULTIMEDIA: self.btn_cp_repeat.clicked.connect(self._toggle_repeat)
+        self.btn_cp_shuffle.toggled.connect(self._toggle_shuffle) 
+        if HAS_MULTIMEDIA: self.btn_cp_repeat.toggled.connect(self._toggle_repeat)
         self.btn_cp_z_in.clicked.connect(lambda: self._apply_general_zoom(1.15))
         self.btn_cp_z_out.clicked.connect(lambda: self._apply_general_zoom(1/1.15))
         
@@ -1436,6 +1440,7 @@ class vmanViewer(QDialog):
         
         if HAS_MULTIMEDIA:
             self.player.positionChanged.connect(self._update_slider)
+            
             self.player.durationChanged.connect(self.cp_slider.setMaximum)
             self.cp_slider.sliderMoved.connect(self.player.setPosition)
             self.cp_slider.sliderReleased.connect(self._on_seek_recorded)
@@ -2162,7 +2167,11 @@ class vmanViewer(QDialog):
             self.player.setLoops(QMediaPlayer.Infinite if checked else 1)
             self.btn_cp_repeat.setStyleSheet("color: #3b82f6;" if checked else "color: #ccc;")
             self._show_toast("🔁 Repeat: ON" if checked else "🔁 Repeat: OFF")
-
+            
+            # FIX: Mutual exclusivity - turn off shuffle if repeat is turned on
+            if checked and self.btn_cp_shuffle.isChecked():
+                self.btn_cp_shuffle.setChecked(False)
+                
     def _update_deck_buttons(self):
         idx = self.stack.currentIndex()
         is_media = (idx == self.IDX_MEDIA)
@@ -2213,13 +2222,54 @@ class vmanViewer(QDialog):
             QTimer.singleShot(25, apply_ui_scroll)
         
         
-    def _shuffle_current_playlist(self):
+    def _toggle_shuffle(self, checked):
         if not self.active_playlist: return
+        
         current_item = self.active_playlist[self.current_index]
-        random.shuffle(self.active_playlist)
-        self.current_index = self.active_playlist.index(current_item)
+        
+        if checked:
+            # Save original order
+            self.unshuffled_playlist = self.active_playlist.copy()
+            
+            # FIX: Better shuffle logic - put current item first, shuffle the rest!
+            # This guarantees the "next" button plays a truly random song.
+            rem_list = self.active_playlist.copy()
+            rem_list.pop(self.current_index)
+            random.shuffle(rem_list)
+            
+            self.active_playlist = [current_item] + rem_list
+            self.current_index = 0
+            
+            self.btn_cp_shuffle.setStyleSheet("color: #3b82f6;")
+            self._show_toast("🔀 Shuffle: ON")
+            
+            # FIX: Mutual exclusivity - turn off repeat if shuffle is turned on
+            if getattr(self, 'btn_cp_repeat', None) and self.btn_cp_repeat.isChecked():
+                self.btn_cp_repeat.setChecked(False)
+        else:
+            # Restore original order
+            if hasattr(self, 'unshuffled_playlist'):
+                self.active_playlist = self.unshuffled_playlist.copy()
+                try:
+                    self.current_index = self.active_playlist.index(current_item)
+                except ValueError:
+                    self.current_index = 0
+            self.btn_cp_shuffle.setStyleSheet("color: #ccc;")
+            self._show_toast("🔀 Shuffle: OFF")
+            
         self._restore_title()
-        self._show_toast("🔀 Playlist Shuffled!")
+        if getattr(self, 'is_webpage_mode', False):
+            self.vert_view.load_playlist(self.active_playlist)
+            self.vert_view.scroll_to_index(self.current_index)
+
+    def _on_media_status_changed(self, status):
+        # FIX: Automatically play the next media file when current finishes!
+        if status == QMediaPlayer.MediaStatus.EndOfMedia:
+            if self.player.loops() == 1: # Only proceed if Repeat is OFF
+                if self.current_index < len(self.active_playlist) - 1:
+                    self._next_item()
+                else:
+                    self._show_toast("End of Playlist")
     
     def load_settings(self):
         if os.path.exists(self.settings_file):
@@ -2836,7 +2886,13 @@ class vmanViewer(QDialog):
                 if not items:
                     QMessageBox.warning(self, "Error", "No media matches your filter sequence.")
                     return
-                self.active_playlist = items # Directly assign the pre-filtered items!
+                
+                # FIX: Maintain Shuffle state for Pre-Decided lists
+                self.unshuffled_playlist = items.copy()
+                if getattr(self, 'btn_cp_shuffle', None) and self.btn_cp_shuffle.isChecked():
+                    random.shuffle(items)
+                    
+                self.active_playlist = items
                 self.current_filter = "PRE-DECIDED"
                 self.current_index = 0
                 self._load_current_item()
@@ -2859,15 +2915,20 @@ class vmanViewer(QDialog):
             'AUDIO': ['.mp3', '.wav', '.ogg', '.flac'],
             'DOCS': ['.txt', '.csv', '.json', '.xml', '.py', '.md', '.log', '.ini', '.sh', '.cpp', '.c', '.h', '.pdf']
         }
-        if filter_type == "ALL": self.active_playlist = self.master_playlist
+        if filter_type == "ALL": self.active_playlist = self.master_playlist.copy()
         else: self.active_playlist = [i for i in self.master_playlist if i.get('ext', '').lower() in exts.get(filter_type, [])]
+        
+        # FIX: Maintain Shuffle state when changing filters
+        self.unshuffled_playlist = self.active_playlist.copy()
+        if getattr(self, 'btn_cp_shuffle', None) and self.btn_cp_shuffle.isChecked():
+            random.shuffle(self.active_playlist)
         
         if reset_index:
             self.current_index = 0
             
         self._load_current_item()
         self._show_controls()
-        if self.is_webpage_mode:
+        if getattr(self, 'is_webpage_mode', False):
             self.vert_view.load_playlist(self.active_playlist)
 
     def _set_vis_mode(self, mode):
